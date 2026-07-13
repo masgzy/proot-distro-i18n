@@ -36,6 +36,7 @@ import json
 import os
 import re
 import socket
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -48,6 +49,10 @@ from proot_distro.helpers.download import (
     is_plaintext_http_tls_error,
     retry_http,
     _tune_socket,
+    TunedHTTPSConnection,
+    TunedHTTPConnection,
+    TunedHTTPSHandler,
+    TunedHTTPHandler,
 )
 
 
@@ -80,38 +85,8 @@ AUTH_URL = "https://auth.docker.io/token"
 # （Linux）或动态窗口上限以内。setsockopt 会静默截断到允许的最大值，
 # 不会报错。
 #
-# _tune_socket 定义在 helpers/download.py 中，供 transport.py 和
-# download.py 共用，避免循环导入。
-
-
-class _TunedHTTPSConnection(http.client.HTTPSConnection):
-    """建立连接后自动调优 socket 参数的 HTTPS 连接。"""
-
-    def connect(self):
-        super().connect()
-        _tune_socket(self.sock)
-
-
-class _TunedHTTPConnection(http.client.HTTPConnection):
-    """建立连接后自动调优 socket 参数的 HTTP 连接。"""
-
-    def connect(self):
-        super().connect()
-        _tune_socket(self.sock)
-
-
-class _TunedHTTPSHandler(urllib.request.HTTPSHandler):
-    """使用调优连接的 HTTPS handler。"""
-
-    def https_open(self, req):
-        return self.do_open(_TunedHTTPSConnection, req, context=self._context)
-
-
-class _TunedHTTPHandler(urllib.request.HTTPHandler):
-    """使用调优连接的 HTTP handler。"""
-
-    def http_open(self, req):
-        return self.do_open(_TunedHTTPConnection, req)
+# _tune_socket 和调优连接类定义在 helpers/download.py 中，
+# 供 transport.py 和 download.py 共用，避免循环导入。
 
 
 def _ua() -> dict:
@@ -144,16 +119,16 @@ def _build_opener(insecure: bool):
 
     *insecure* 变体额外安装跳过证书校验的 HTTPS handler，使
     ``--allow-insecure`` 下能到达不受信任证书的 HTTPS 端点。
-    无论何种模式，HTTP/HTTPS 连接都会在建立后调优 socket 参数
+    无论何种模式，HTTP/HTTPS 连接都会在 TCP 握手前调优 socket 参数
     （SO_RCVBUF、TCP_NODELAY），以提升下载吞吐量。
     """
     if insecure:
-        https_handler = _TunedHTTPSHandler(context=insecure_ssl_context())
+        https_handler = TunedHTTPSHandler(context=insecure_ssl_context())
     else:
-        https_handler = _TunedHTTPSHandler()
+        https_handler = TunedHTTPSHandler()
     handlers = [
         AuthStrippingRedirectHandler,
-        _TunedHTTPHandler(),
+        TunedHTTPHandler(),
         https_handler,
     ]
     return urllib.request.build_opener(*handlers)

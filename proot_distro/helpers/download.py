@@ -24,6 +24,7 @@
 # backup/restore code paths.
 
 import hashlib
+import http.client
 import os
 import socket
 import ssl
@@ -59,7 +60,12 @@ _SOCKET_RCVBUF = 1 << 21
 
 
 def _tune_socket(sock) -> None:
-    """连接建立后调优 TCP socket 参数以提升下载吞吐量。"""
+    """在 TCP 连接建立前/后调优 socket 参数以提升下载吞吐量。
+
+    关键：SO_RCVBUF 应在 connect() 之前设置，使 TCP SYN 包能携带
+    更大的窗口缩放选项。如果连接已建立，后续 ACK 仍会广告更大的窗口，
+    但窗口缩放因子已固定。
+    """
     if sock is None:
         return
     try:
@@ -74,6 +80,77 @@ def _tune_socket(sock) -> None:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _SOCKET_RCVBUF)
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# 调优的 HTTP/HTTPS 连接和 handler
+# ---------------------------------------------------------------------------
+# 在 TCP 握手前设置 SO_RCVBUF，使 SYN 包携带更大的窗口缩放选项。
+# transport.py 的 _build_opener() 也使用这些类。
+
+class TunedHTTPSConnection(http.client.HTTPSConnection):
+    """在 TCP 握手前调优 socket 参数的 HTTPS 连接。"""
+
+    def connect(self):
+        sock = socket.create_connection(
+            (self.host, self.port),
+            self.timeout,
+            self.source_address,
+        )
+        _tune_socket(sock)
+        if self._tunnel_host:
+            self.sock = sock
+            self._tunnel()
+        self.sock = self._context.wrap_socket(
+            sock, server_hostname=self.host,
+        )
+
+
+class TunedHTTPConnection(http.client.HTTPConnection):
+    """在 TCP 握手前调优 socket 参数的 HTTP 连接。"""
+
+    def connect(self):
+        sock = socket.create_connection(
+            (self.host, self.port),
+            self.timeout,
+            self.source_address,
+        )
+        _tune_socket(sock)
+        if self._tunnel_host:
+            self.sock = sock
+            self._tunnel()
+        else:
+            self.sock = sock
+
+
+class TunedHTTPSHandler(urllib.request.HTTPSHandler):
+    """使用调优连接的 HTTPS handler。"""
+
+    def https_open(self, req):
+        return self.do_open(TunedHTTPSConnection, req, context=self._context)
+
+
+class TunedHTTPHandler(urllib.request.HTTPHandler):
+    """使用调优连接的 HTTP handler。"""
+
+    def http_open(self, req):
+        return self.do_open(TunedHTTPConnection, req)
+
+
+def build_tuned_opener(insecure: bool = False) -> urllib.request.OpenerDirector:
+    """构建带 TCP 调优的 URL opener。
+
+    供 download_file() 等通用下载场景使用。transport.py 有自己的
+    opener 构建（额外含 Auth 跨域剥离），但底层连接类相同。
+    """
+    if insecure:
+        https_handler = TunedHTTPSHandler(context=insecure_ssl_context())
+    else:
+        https_handler = TunedHTTPSHandler()
+    return urllib.request.build_opener(
+        TunedHTTPHandler(),
+        https_handler,
+    )
 
 
 def insecure_ssl_context() -> ssl.SSLContext:
@@ -243,21 +320,13 @@ def download_file(
     req = urllib.request.Request(
         url, headers={"User-Agent": f"{PROGRAM_NAME}/{PROGRAM_VERSION}"},
     )
-    context = insecure_ssl_context() if insecure else None
     host = urllib.parse.urlparse(url).netloc or url
 
     def _attempt():
         with atomic_replace(dest) as tmp:
-            with urllib.request.urlopen(req, context=context, timeout=timeout) as resp, \
+            op = build_tuned_opener(insecure)
+            with op.open(req, timeout=timeout) as resp, \
                     open(tmp, "wb", buffering=1 << 20) as fh:
-                # 调优 socket 参数以提升下载吞吐量
-                sock = getattr(resp, 'fp', None)
-                if sock is not None:
-                    raw = getattr(sock, 'raw', None)
-                    if raw is not None:
-                        _sock = getattr(raw, '_sock', None) or getattr(raw, 'sock', None)
-                        if _sock is not None:
-                            _tune_socket(_sock)
                 total = int(resp.headers.get("Content-Length", 0))
                 downloaded = 0
                 while True:

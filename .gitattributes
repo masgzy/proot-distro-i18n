@@ -1,0 +1,24 @@
+# 统一换行符：仓库内一律 LF，检出时不自动转换
+* text=auto eol=lf
+
+# Python 文件强制 LF
+*.py text eol=lf
+
+# shell 补全脚本强制 LF
+*.bash text eol=lf
+*.fish text eol=lf
+_proot-distro text eol=lf
+
+# 翻译文件
+*.po text eol=lf
+*.mo binary
+
+# YAML / TOML / Markdown
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+
+# 图片保持二进制
+*.png binary
+*.jpg binary
