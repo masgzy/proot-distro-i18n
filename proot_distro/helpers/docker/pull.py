@@ -188,17 +188,16 @@ def _fetch_config_blob(
 
 
 def _get_download_workers() -> int:
-    """Return the number of concurrent download threads.
+    """返回并发下载线程数。
 
-    Reads ``PD_PARALLEL_DOWNLOADS`` (default 4). Values ≤ 1 fall back to
-    serial download. Capped at 8 to avoid overwhelming the registry or
-    the local filesystem with too many concurrent writes.
+    读取 ``PD_PARALLEL_DOWNLOADS`` 环境变量（默认 6）。值 ≤ 1 时回退到
+    串行下载。上限 8，避免过多并发写入压垮镜像源或本地文件系统。
     """
     val = os.environ.get("PD_PARALLEL_DOWNLOADS", "")
     try:
         n = int(val)
     except (ValueError, TypeError):
-        return 4
+        return 6
     return max(1, min(n, 8))
 
 
