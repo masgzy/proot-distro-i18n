@@ -1,0 +1,33 @@
+name: "Bug 报告"
+description: "报告 proot-distro 使用中遇到的问题"
+title: "[Bug]: "
+labels: ["bug report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        这是 PRoot Distro 的 bug 追踪器——一个用于管理发行版安装的 PRoot 辅助工具。请按所选的工单类型正确使用。
+
+        维护者可能在信息不足或问题属于用户操作失误时直接关闭 bug 报告。
+
+        > [!IMPORTANT]
+        > 发行版本身的 bug 报告将被驳回
+  - type: textarea
+    attributes:
+      label: 问题描述
+      description: |
+        清晰简洁地描述问题。可以附上日志、截图、屏幕录像等有助于理解问题的材料。
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: 复现步骤
+      description: |
+        导致问题出现的具体操作步骤。
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: 预期行为
+      description: |
+        你认为应该发生什么？

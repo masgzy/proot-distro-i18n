@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "proot-distro-i18n"
+version = "5.4.1"
+description = "PRoot-Distro 的中文汉化版，附带镜像源管理与性能优化。"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "GPL-3.0-only"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.urls]
+'Homepage' = 'https://github.com/masgzy/proot-distro-i18n'
+'Repository' = 'https://github.com/masgzy/proot-distro-i18n'
+'Issue Tracker' = 'https://github.com/masgzy/proot-distro-i18n/issues'
+
+[project.scripts]
+proot-distro = "proot_distro.cli:main"
+pd = "proot_distro.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["proot_distro*"]
+
+[tool.setuptools.package-data]
+"proot_distro" = [
+    "completions/*",
+    "locales/*/LC_MESSAGES/*.mo",
+    "locales/*/LC_MESSAGES/*.po",
+]
+
+# 安装方式：通过 GitHub 仓库分发
+# pip install git+https://github.com/masgzy/proot-distro-i18n.git
+# 或 git clone 后 pip install .
+[tool.setuptools.data-files]
+"share/bash-completion/completions" = ["proot_distro/completions/proot-distro.bash"]
+"share/zsh/site-functions" = ["proot_distro/completions/_proot-distro"]
+"share/fish/vendor_completions.d" = ["proot_distro/completions/proot-distro.fish"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "live: hits the network or executes proot; skipped unless RUN_LIVE_TESTS=1 is set",
+]

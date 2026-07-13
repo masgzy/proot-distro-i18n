@@ -1,0 +1,332 @@
+#compdef proot-distro pd
+#
+# proot-distro 与 pd 的 Zsh 补全
+#
+# 安装:
+#   cp _proot-distro /usr/share/zsh/site-functions/_proot-distro
+# 或当前用户，加到 $fpath 中的目录:
+#   mkdir -p ~/.local/share/zsh/site-functions
+#   cp _proot-distro ~/.local/share/zsh/site-functions/_proot-distro
+#   # 加到 ~/.zshrc: fpath=(~/.local/share/zsh/site-functions $fpath)
+
+# ---------------------------------------------------------------------------
+# 辅助: 列出已安装的容器
+# ---------------------------------------------------------------------------
+_proot_distro_containers() {
+    local dir
+    if _proot_distro_is_termux; then
+        dir="${TERMUX__PREFIX:-/data/data/com.termux/files/usr}/var/lib/proot-distro/containers"
+    else
+        dir="${XDG_DATA_HOME:-${HOME}/.local/share}/proot-distro/containers"
+    fi
+    local -a containers
+    if [[ -d "${dir}" ]]; then
+        local d
+        for d in "${dir}"/*/; do
+            [[ -d "${d}rootfs" ]] && containers+=("${d:t}")
+        done
+    fi
+    _describe '容器' containers
+}
+
+# ---------------------------------------------------------------------------
+# 辅助: 列出内置镜像源 ID（供 mirror 子命令补全）
+# ---------------------------------------------------------------------------
+_proot_distro_mirrors() {
+    local -a mirrors
+    mirrors=(
+        daocloud 1panel-live 1ms xuanyuan xuanyuan-run
+        netease tencent docker-cn docker-hub
+    )
+    _describe '镜像源' mirrors
+}
+
+# ---------------------------------------------------------------------------
+# Termux/Android 检测 — 与 constants.py 中的 _detect_termux() 保持一致。
+# 三个独立指标中至少两个匹配时返回 0 (true)。
+# ---------------------------------------------------------------------------
+_proot_distro_is_termux() {
+    local score=0
+    [[ -f /system/build.prop || -d /data/app ]] && ((score++))
+    [[ -n "${TERMUX_APP__APP_VERSION_NAME}" || -n "${TERMUX_VERSION}" ]] && ((score++))
+    local prefix="${TERMUX__PREFIX:-/data/data/com.termux/files/usr}"
+    [[ -r "${prefix}" && -x "${prefix}" ]] && ((score++))
+    (( score >= 2 ))
+}
+
+# ---------------------------------------------------------------------------
+# 主补全函数
+# ---------------------------------------------------------------------------
+_proot_distro() {
+    local curcontext="${curcontext}" state state_descr line
+    typeset -A opt_args
+
+    _arguments -C \
+        '(-h --help)'{-h,--help}'[显示帮助]' \
+        '1:command:->command' \
+        '*:: :->args'
+
+    case "${state}" in
+        command)
+            local -a subcommands
+            subcommands=(
+                'install:从 Docker 镜像或本地归档安装容器'
+                'remove:删除已安装的容器'
+                'rename:重命名容器'
+                'reset:从原始镜像重新安装容器'
+                'login:在容器内打开 shell'
+                'list:列出已安装的容器'
+                'ps:列出活跃的容器会话'
+                'kill:停止活跃的容器会话'
+                'backup:把容器备份为 tar 归档'
+                'restore:从 tar 归档恢复容器'
+                'clear-cache:清空下载缓存'
+                'copy:在宿主与容器之间复制文件'
+                'sync:在宿主与容器之间同步文件'
+                'run:在容器中运行镜像的 entrypoint/cmd'
+                'build:从 Dockerfile 构建 OCI 镜像'
+                'push:把本地构建的镜像推送到仓库'
+                'mirror:管理 Docker registry 镜像源'
+                'help:显示帮助'
+            )
+            _describe '命令' subcommands
+            ;;
+
+        args)
+            local cmd="${words[1]}"
+            curcontext="${curcontext%:*:*}:proot-distro-${cmd}:"
+
+            case "${cmd}" in
+
+                # -----------------------------------------------------------
+                install)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[显示帮助]' \
+                        '(-n --name)'{-n,--name}'[以自定义容器名安装]:名称' \
+                        '(-a --architecture)'{-a,--architecture}'[目标 CPU 架构]:架构:(aarch64 arm i686 riscv64 x86_64)' \
+                        '--allow-insecure[允许从仅 HTTP（不安全）的仓库拉取]' \
+                        '(-q --quiet)'{-q,--quiet}'[抑制非错误输出]' \
+                        '1:Docker 镜像或本地归档:_files'
+                    ;;
+
+                # -----------------------------------------------------------
+                remove)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[显示帮助]' \
+                        '(-v --verbose -q --quiet)'{-v,--verbose}'[打印每个被删除的文件]' \
+                        '(-v --verbose -q --quiet)'{-q,--quiet}'[抑制非错误输出]' \
+                        '1:容器:_proot_distro_containers'
+                    ;;
+
+                # -----------------------------------------------------------
+                rename)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[显示帮助]' \
+                        '(-q --quiet)'{-q,--quiet}'[抑制非错误输出]' \
+                        '1:原容器:_proot_distro_containers' \
+                        '2:新容器名'
+                    ;;
+
+                # -----------------------------------------------------------
+                reset)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[显示帮助]' \
+                        '(-q --quiet)'{-q,--quiet}'[抑制非错误输出]' \
+                        '1:容器:_proot_distro_containers'
+                    ;;
+
+                # -----------------------------------------------------------
+                login)
+                    local -a _login_args
+                    _login_args=(
+                        '(-h --help)'{-h,--help}'[显示帮助]'
+                        '(-u --user)'{-u,--user}'[以该用户身份运行（默认\: root）]:用户'
+                        '(-P --redirect-ports)'{-P,--redirect-ports}'[重定向 1024 以下端口]'
+                        '--shared-home[把 home 挂载进容器]'
+                        '--shared-tmp[与宿主共享 /tmp]'
+                        '--shared-x11[共享 X11 socket（/tmp/.X11-unix）]'
+                        '*'{-b,--bind}'[把 PATH\[:DEST\] bind 挂载进容器]:路径:_files'
+                        '--emulator[QEMU 用户模式模拟器二进制路径]:路径:_files'
+                        '--kernel[伪内核版本字符串]:字符串'
+                        '--hostname[容器内可见的 hostname]:字符串'
+                        '(-w --work-dir)'{-w,--work-dir}'[初始工作目录]:路径:_directories'
+                        '*'{-e,--env}'[设置环境变量]:VAR=VALUE'
+                        '(-d --detach)'{-d,--detach}'[在后台启动会话]'
+                        '--get-proot-cmd[打印 proot 命令行后退出]'
+                        '1:容器:_proot_distro_containers'
+                        '*:内部命令:_command_names -e'
+                    )
+                    _proot_distro_is_termux && _login_args+=(
+                        '(--isolated --minimal)--isolated[隔离模式]'
+                        '(--isolated --minimal)--minimal[精简隔离模式]'
+                        '--no-link2symlink[禁用 proot link2symlink 扩展]'
+                        '--no-sysvipc[禁用 SysV IPC 模拟]'
+                        '--no-kill-on-exit[会话结束时不清子进程]'
+                    )
+                    _arguments -s "${_login_args[@]}"
+                    ;;
+
+                # -----------------------------------------------------------
+                list)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[显示帮助]' \
+                        '(-q --quiet)'{-q,--quiet}'[抑制非错误输出]'
+                    ;;
+
+                # -----------------------------------------------------------
+                ps)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[显示帮助]' \
+                        '(-q --quiet)'{-q,--quiet}'[仅打印 PID，每行一个]'
+                    ;;
+
+                # -----------------------------------------------------------
+                kill)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[显示帮助]' \
+                        '(-s --signal)'{-s,--signal}'[替代 SIGTERM 的信号]:信号:(TERM KILL HUP INT QUIT USR1 USR2)' \
+                        '--all[停止所有活跃会话]' \
+                        '1:PID 或容器:_proot_distro_containers'
+                    ;;
+
+                # -----------------------------------------------------------
+                backup)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[显示帮助]' \
+                        '(-v --verbose -q --quiet)'{-v,--verbose}'[打印每个归档的文件]' \
+                        '(-v --verbose -q --quiet)'{-q,--quiet}'[抑制非错误输出]' \
+                        '(-o --output)'{-o,--output}'[把归档写入 FILE 而非 stdout]:文件:_files' \
+                        '(-c --compress)'{-c,--compress}'[压缩算法]:类型:(gzip bzip2 xz none)' \
+                        '1:容器:_proot_distro_containers'
+                    ;;
+
+                # -----------------------------------------------------------
+                restore)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[显示帮助]' \
+                        '(-v --verbose -q --quiet)'{-v,--verbose}'[打印每个解压的文件]' \
+                        '(-v --verbose -q --quiet)'{-q,--quiet}'[抑制非错误输出]' \
+                        '1:归档:_files -g "*.tar *.tar.gz *.tgz *.tar.bz2 *.tbz2 *.tar.xz *.txz"'
+                    ;;
+
+                # -----------------------------------------------------------
+                clear-cache)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[显示帮助]' \
+                        '(-v --verbose -q --quiet)'{-v,--verbose}'[列出删除的文件]' \
+                        '(-v --verbose -q --quiet)'{-q,--quiet}'[抑制非错误输出]'
+                    ;;
+
+                # -----------------------------------------------------------
+                copy)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[显示帮助]' \
+                        '(-v --verbose -q --quiet)'{-v,--verbose}'[打印每个复制的文件]' \
+                        '(-v --verbose -q --quiet)'{-q,--quiet}'[抑制非错误输出]' \
+                        '(-m --move)'{-m,--move}'[移动而非复制]' \
+                        '(-r --recursive)'{-r,--recursive}'[递归复制目录]' \
+                        '1:源（宿主路径或 container\:path）:_files' \
+                        '2:目标（宿主路径或 container\:path）:_files'
+                    ;;
+
+                # -----------------------------------------------------------
+                sync)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[显示帮助]' \
+                        '(-v --verbose -q --quiet)'{-v,--verbose}'[打印每个同步的文件]' \
+                        '(-v --verbose -q --quiet)'{-q,--quiet}'[抑制非错误输出]' \
+                        '(-c --checksum)'{-c,--checksum}'[用 CRC32 校验和替代大小+mtime]' \
+                        '(-d --delete)'{-d,--delete}'[删除目标中源里没有的项]' \
+                        '1:源（宿主路径或 container\:path）:_files' \
+                        '2:目标（宿主路径或 container\:path）:_files'
+                    ;;
+
+                # -----------------------------------------------------------
+                run)
+                    local -a _run_args
+                    _run_args=(
+                        '(-h --help)'{-h,--help}'[显示帮助]'
+                        '(-u --user)'{-u,--user}'[以该用户身份运行（默认\: root）]:用户'
+                        '(-P --redirect-ports)'{-P,--redirect-ports}'[重定向 1024 以下端口]'
+                        '--shared-home[把 home 挂载进容器]'
+                        '--shared-tmp[与宿主共享 /tmp]'
+                        '--shared-x11[共享 X11 socket（/tmp/.X11-unix）]'
+                        '*'{-b,--bind}'[把 PATH\[:DEST\] bind 挂载进容器]:路径:_files'
+                        '--emulator[QEMU 用户模式模拟器二进制路径]:路径:_files'
+                        '--kernel[伪内核版本字符串]:字符串'
+                        '--hostname[容器内可见的 hostname]:字符串'
+                        '(-w --work-dir)'{-w,--work-dir}'[初始工作目录]:路径:_directories'
+                        '*'{-e,--env}'[设置环境变量]:VAR=VALUE'
+                        '(-d --detach)'{-d,--detach}'[在后台启动会话]'
+                        '--get-proot-cmd[打印 proot 命令行后退出]'
+                        '1:容器:_proot_distro_containers'
+                        '*:参数'
+                    )
+                    _proot_distro_is_termux && _run_args+=(
+                        '(--isolated --minimal)--isolated[隔离模式]'
+                        '(--isolated --minimal)--minimal[精简隔离模式]'
+                        '--no-link2symlink[禁用 proot link2symlink 扩展]'
+                        '--no-sysvipc[禁用 SysV IPC 模拟]'
+                        '--no-kill-on-exit[会话结束时不清子进程]'
+                    )
+                    _arguments -s "${_run_args[@]}"
+                    ;;
+
+                # -----------------------------------------------------------
+                build)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[显示帮助]' \
+                        '(-f --file)'{-f,--file}'[Dockerfile 路径（- 从 stdin 读）]:文件:_files' \
+                        '*'{-t,--tag}'[要赋予的镜像引用（可重复）]:引用' \
+                        '*--build-arg[设置构建期 ARG（可重复）]:K=V' \
+                        '(-a --architecture)'{-a,--architecture}'[目标 CPU 架构]:架构:(aarch64 arm i686 riscv64 x86_64)' \
+                        '--target[在指定 stage 后停止]:stage' \
+                        '--emulator[QEMU 用户模式模拟器二进制路径]:路径:_files' \
+                        '*'{-o,--output}'[把 OCI tarball 写入 FILE（可重复）]:文件:_files' \
+                        '--install-as[构建后以容器 NAME 安装]:名称:_proot_distro_containers' \
+                        '--no-cache[禁用构建步骤缓存]' \
+                        '(-v --verbose -q --quiet)'{-v,--verbose}'[回显每条指令并流式输出 RUN]' \
+                        '(-v --verbose -q --quiet)'{-q,--quiet}'[抑制非错误输出]' \
+                        '1:构建上下文目录:_directories'
+                    ;;
+
+                # -----------------------------------------------------------
+                push)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[显示帮助]' \
+                        '(-q --quiet)'{-q,--quiet}'[抑制非错误输出]' \
+                        '(-a --architecture)'{-a,--architecture}'[目标 CPU 架构]:架构:(aarch64 arm i686 riscv64 x86_64)' \
+                        '--allow-insecure[允许推送到仅 HTTP 或未验证 TLS 的仓库]' \
+                        '1:镜像引用'
+                    ;;
+
+                # -----------------------------------------------------------
+                mirror)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[显示帮助]' \
+                        '(-t --timeout)'{-t,--timeout}'[探测超时（秒，默认 6）]:秒' \
+                        '--allow-insecure[允许 HTTPS 跳过证书校验]' \
+                        '--use-best[test 后自动切换到最快源]' \
+                        '--no-use[test 后不提示也不切换]' \
+                        '(-q --quiet)'{-q,--quiet}'[安静模式]' \
+                        '1:子动作:(ls list test use set unset clear off show)' \
+                        '2:ID 或 URL:_proot_distro_mirrors'
+                    ;;
+
+                # -----------------------------------------------------------
+                help)
+                    local -a topics
+                    topics=(
+                        install remove rename reset login list ps kill
+                        backup restore clear-cache copy sync run
+                        build push mirror
+                    )
+                    _describe '主题' topics
+                    ;;
+
+            esac
+            ;;
+    esac
+}
+
+_proot_distro "$@"

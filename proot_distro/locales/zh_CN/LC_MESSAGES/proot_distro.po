@@ -1,0 +1,657 @@
+# proot-distro Chinese (Simplified) translation
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: proot-distro 5.0+\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: zh_CN\n"
+
+msgid "{kind} '{name}' is not valid. {NAME_RULE_HINT}"
+msgstr "{kind} '{name}' 无效。{NAME_RULE_HINT}"
+
+msgid "invalid container name '{name}' in spec '{spec}'."
+msgstr "spec '{spec}' 中的容器名 '{name}' 无效。"
+
+msgid "container '{name}' does not exist."
+msgstr "容器 '{name}' 不存在。"
+
+msgid "destination path escapes the container directory."
+msgstr "目标路径越过了容器目录边界。"
+
+msgid "proot utility does not exist on your system."
+msgstr "系统中未安装 proot 工具。"
+
+msgid "unknown command '{first}'."
+msgstr "未知命令 '{first}'。"
+
+msgid "unrecognized option"
+msgstr "无法识别的选项"
+
+msgid "unexpected argument"
+msgstr "多余的参数"
+
+msgid "{kind}: '{bad}'."
+msgstr "{kind}: '{bad}'。"
+
+msgid "unknown command '{command}'."
+msgstr "未知命令 '{command}'。"
+
+msgid "Would you like to install it now? [y/N] "
+msgstr "是否立即安装？[y/N] "
+
+msgid "failed to install proot: {exc}"
+msgstr "安装 proot 失败: {exc}"
+
+msgid "Warning"
+msgstr "警告"
+
+msgid "should not be executed as root user. Do not send bug reports about messed up Termux environment, lost data and bricked devices."
+msgstr "不应以 root 用户身份运行。请勿就 Termux 环境损坏、数据丢失或设备变砖等问题提交 bug 报告。"
+
+msgid "Install it with: "
+msgstr "使用以下命令安装: "
+
+msgid "Install it manually with: "
+msgstr "使用以下命令手动安装: "
+
+msgid "should not be executed under PRoot."
+msgstr "不应在 PRoot 内运行。"
+
+msgid "{label} '{name}' is busy{hint}."
+msgstr "{label} '{name}' 被占用{hint}。"
+
+msgid "emulator '{emu_path}' is not found or not executable."
+msgstr "找不到模拟器 '{emu_path}' 或它不可执行。"
+
+msgid "Empty URL"
+msgstr "URL 为空"
+
+msgid "HTTP {code} OK"
+msgstr "HTTP {code} 正常"
+
+msgid "HTTP {code}"
+msgstr "HTTP {code}"
+
+msgid "Network error: {reason}"
+msgstr "网络错误: {reason}"
+
+msgid "Connection timeout ({timeout}s)"
+msgstr "连接超时 ({timeout}s)"
+
+msgid "Low-level error: {reason}"
+msgstr "底层错误: {reason}"
+
+msgid "User custom"
+msgstr "用户自定义"
+
+msgid "HTTP {code} (auth required)"
+msgstr "HTTP {code} (需要鉴权)"
+
+msgid "Error"
+msgstr "错误"
+
+msgid "Finished downloading ({size})."
+msgstr "下载完成 ({size})。"
+
+msgid "Authenticating with registry{_arg0}..."
+msgstr "正在向仓库鉴权{_arg0}..."
+
+msgid "Fetching manifest for '{image_ref}'..."
+msgstr "正在获取 '{image_ref}' 的清单..."
+
+msgid "Fetching {arch} manifest..."
+msgstr "正在获取 {arch} 清单..."
+
+msgid "{short_id}: Applying layer {index}/{n_layers}..."
+msgstr "{short_id}: 正在应用层 {index}/{n_layers}..."
+
+msgid "Image '{image_ref}' ({arch}) is cached."
+msgstr "镜像 '{image_ref}' ({arch}) 已缓存。"
+
+msgid "No cached manifest found for '{image_ref}' ({arch})."
+msgstr "未找到 '{image_ref}' ({arch}) 的缓存清单。"
+
+msgid "COPY --from='{image_ref}': fetching external image..."
+msgstr "COPY --from='{image_ref}': 正在拉取外部镜像..."
+
+msgid "Pulling base image '{image_ref}' ({arch})..."
+msgstr "正在拉取基础镜像 '{image_ref}' ({arch})..."
+
+msgid "container '{container_name}' is not installed."
+msgstr "容器 '{container_name}' 未安装。"
+
+msgid "Removing rootfs of '{container_name}'..."
+msgstr "正在移除 '{container_name}' 的 rootfs..."
+
+msgid "{_arg0}No containers are installed.{_arg1}"
+msgstr "{_arg0}尚未安装任何容器。{_arg1}"
+
+msgid "{_arg0}Installed containers:{_arg1}"
+msgstr "{_arg0}已安装的容器:{_arg1}"
+
+msgid "  {_arg0}* {_arg1}{name}{_arg3}"
+msgstr "  {_arg0}* {_arg1}{name}{_arg3}"
+
+msgid "Finished removing the container."
+msgstr "容器删除完成。"
+
+msgid "Removing container '{container_name}'..."
+msgstr "正在移除容器 '{container_name}'..."
+
+msgid "Removed: '{path}'"
+msgstr "已删除: '{path}'"
+
+msgid "No live session processes to signal."
+msgstr "没有正在运行的会话进程可发送信号。"
+
+msgid "no permission to signal PID {pid}."
+msgstr "无权限向 PID {pid} 发送信号。"
+
+msgid "Finished installation."
+msgstr "安装完成。"
+
+msgid "container name can't be empty."
+msgstr "容器名不能为空。"
+
+msgid "Installing from URL '{url}' as '{install_name}'..."
+msgstr "正在从 URL '{url}' 安装为 '{install_name}'..."
+
+msgid "Installing '{display_ref}' as '{install_name}'..."
+msgstr "正在将 '{display_ref}' 安装为 '{install_name}'..."
+
+msgid "Extracting rootfs from archive..."
+msgstr "正在从归档中解压 rootfs..."
+
+msgid "Updating '/etc/resolv.conf'..."
+msgstr "正在更新 '/etc/resolv.conf'..."
+
+msgid "Updating '/etc/hosts'..."
+msgstr "正在更新 '/etc/hosts'..."
+
+msgid "Aborted by user."
+msgstr "已被用户中断。"
+
+msgid "Failed to install: {exc}"
+msgstr "安装失败: {exc}"
+
+msgid "Warning: could not remove partial container: {exc}"
+msgstr "警告: 无法删除未完成的容器: {exc}"
+
+msgid "Downloading archive..."
+msgstr "正在下载归档..."
+
+msgid "Registering Android-specific UIDs and GIDs..."
+msgstr "正在注册 Android 特有的 UID 与 GID..."
+
+msgid "Warning: could not write manifest.json: {exc}"
+msgstr "警告: 无法写入 manifest.json: {exc}"
+
+msgid "Switch to {name} ({mid}, {lat_hint})? [Y/n] "
+msgstr "切换到 {name} ({mid}, {lat_hint})? [Y/n] "
+
+msgid "ID"
+msgstr "ID"
+
+msgid "Name"
+msgstr "名称"
+
+msgid "Region"
+msgstr "区域"
+
+msgid "URL"
+msgstr "URL"
+
+msgid "Note"
+msgstr "备注"
+
+msgid "Mirror switched: {name} ({url})"
+msgstr "已切换镜像源: {name} ({url})"
+
+msgid "PD_REGISTRY_URL={url} is set and overrides the config file. Run `unset PD_REGISTRY_URL` (or `export PD_REGISTRY_URL=`) to let `mirror use` take effect."
+msgstr "PD_REGISTRY_URL={url} 已设置并覆盖配置文件。请执行 `unset PD_REGISTRY_URL` (或 `export PD_REGISTRY_URL=`) 让 `mirror use` 生效。"
+
+msgid "Probing mirrors to filter unreachable ones (timeout {timeout}s)..."
+msgstr "正在探测以过滤不可达镜像源 (超时 {timeout}s)..."
+
+msgid "Status"
+msgstr "状态"
+
+msgid "Latency"
+msgstr "延迟"
+
+msgid "Detail"
+msgstr "详情"
+
+msgid "PD_REGISTRY_URL is set to {url}; `mirror use` would be ignored. Run `unset PD_REGISTRY_URL` first to take effect."
+msgstr "PD_REGISTRY_URL 已设置为 {url}；`mirror use` 将被忽略。请先执行 `unset PD_REGISTRY_URL` 再切换。"
+
+msgid "Switched to fastest mirror: {name} ({url})"
+msgstr "已切换到最快镜像: {name} ({url})"
+
+msgid "Fastest mirror: {name} ({url}). Use `--use-best` to switch automatically."
+msgstr "最快镜像: {name} ({url})。使用 `--use-best` 自动切换。"
+
+msgid "latency OK"
+msgstr "延迟正常"
+
+msgid "Skipped. Mirror config unchanged."
+msgstr "已跳过。镜像源配置未变更。"
+
+msgid "No mirror specified. Usage: `{cmd} mirror use <ID|URL>`"
+msgstr "未指定镜像源。用法: `{cmd} mirror use <ID|URL>`"
+
+msgid "Custom mirror set: {url}"
+msgstr "已设置自定义镜像源: {url}"
+
+msgid "Unknown mirror ID: '{token}'. Use `{cmd}` to list available mirrors."
+msgstr "未知镜像源 ID: '{token}'。使用 `{cmd}` 查看可用列表。"
+
+msgid "Mirror config cleared, falling back to default ({default})."
+msgstr "已清除镜像源配置，回退到默认 ({default})。"
+
+msgid "No mirror configured, nothing to clear."
+msgstr "当前未配置镜像源，无需清除。"
+
+msgid "Built-in mirrors"
+msgstr "内置镜像源"
+
+msgid "Config file: "
+msgstr "配置文件: "
+
+msgid "Legend: ★ = active. Use `{cmd}` to switch."
+msgstr "说明: ★ = 当前激活。使用 `{cmd}` 切换。"
+
+msgid "Probing {n} mirrors concurrently (timeout {timeout}s)..."
+msgstr "正在并发探测 {n} 个镜像源 (超时 {timeout}s)..."
+
+msgid "No mirror is reachable. Check your network."
+msgstr "所有镜像源均不可达，请检查网络。"
+
+msgid "Probing {name} ({url})..."
+msgstr "正在探测 {name} ({url})..."
+
+msgid "OK"
+msgstr "正常"
+
+msgid "Effective: "
+msgstr "生效源: "
+
+msgid "env override"
+msgstr "环境变量覆盖"
+
+msgid "PD_REGISTRY_URL is set; `mirror use`/`unset` will not take effect until it is unset."
+msgstr "PD_REGISTRY_URL 已设置；在取消设置之前 `mirror use`/`unset` 不会生效。"
+
+msgid "Env override: "
+msgstr "环境变量覆盖: "
+
+msgid "Filter: "
+msgstr "过滤: "
+
+msgid "reachable only ({n}/{total})"
+msgstr "仅可达 ({n}/{total})"
+
+msgid "No reachable mirrors found."
+msgstr "未找到可达的镜像源。"
+
+msgid "Probe results (sorted by latency)"
+msgstr "探测结果 (按延迟升序)"
+
+msgid "Reachable: {ok}/{total}"
+msgstr "可用: {ok}/{total}"
+
+msgid "Probing custom URL: {url}..."
+msgstr "正在探测自定义 URL: {url}..."
+
+msgid "Unknown mirror ID or URL: '{target}'. Use `{cmd}` to list available mirrors."
+msgstr "未知镜像源 ID 或 URL: '{target}'。使用 `{cmd}` 查看可用列表。"
+
+msgid "FAIL"
+msgstr "失败"
+
+msgid "not set (using default: {default})"
+msgstr "未设置 (使用默认: {default})"
+
+msgid "Unknown mirror sub-action: '{action}'. Available: ls, test, use, unset, show"
+msgstr "未知 mirror 子动作: '{action}'。可用: ls, test, use, unset, show"
+
+msgid "Dockerfile path cannot be empty."
+msgstr "Dockerfile 路径不能为空。"
+
+msgid "--install-as value cannot be empty."
+msgstr "--install-as 的值不能为空。"
+
+msgid "build context '{build_dir}' is not a directory."
+msgstr "构建上下文 '{build_dir}' 不是目录。"
+
+msgid "required file '{dockerfile}' does not exist."
+msgstr "所需文件 '{dockerfile}' 不存在。"
+
+msgid "no instructions in Dockerfile."
+msgstr "Dockerfile 中没有任何指令。"
+
+msgid "Installing built image as '{install_name}'..."
+msgstr "正在以 '{install_name}' 安装构建好的镜像..."
+
+msgid "output file path cannot be empty."
+msgstr "输出文件路径不能为空。"
+
+msgid "cannot read Dockerfile: {exc}"
+msgstr "无法读取 Dockerfile: {exc}"
+
+msgid "syntax error in Dockerfile: {exc}"
+msgstr "Dockerfile 中有语法错误: {exc}"
+
+msgid "unknown architecture '{override_arch}'."
+msgstr "未知架构 '{override_arch}'。"
+
+msgid "Build complete."
+msgstr "构建完成。"
+
+msgid "Build failed: {exc}"
+msgstr "构建失败: {exc}"
+
+msgid "Cannot write manifest cache for '{t}': {exc}"
+msgstr "无法为 '{t}' 写入清单缓存: {exc}"
+
+msgid "Writing OCI archive to '{out_abs}'..."
+msgstr "正在写入 OCI 归档到 '{out_abs}'..."
+
+msgid "Cannot write '{out_file}': {exc}"
+msgstr "无法写入 '{out_file}': {exc}"
+
+msgid "Synchronizing files..."
+msgstr "正在同步文件..."
+
+msgid "Source: '{src_path}'"
+msgstr "源: '{src_path}'"
+
+msgid "Destination: '{dest_path}'"
+msgstr "目标: '{dest_path}'"
+
+msgid "Finished synchronizing."
+msgstr "同步完成。"
+
+msgid "source directory '{src}' is not readable."
+msgstr "源目录 '{src}' 不可读。"
+
+msgid "Cannot make '{parent}' writable: {exc}"
+msgstr "无法将 '{parent}' 设为可写: {exc}"
+
+msgid "Cannot set write permission on '{path}': {exc}"
+msgstr "无法对 '{path}' 设置写权限: {exc}"
+
+msgid "Cannot create directory '{dst_path}': {exc}"
+msgstr "无法创建目录 '{dst_path}': {exc}"
+
+msgid "Cannot create symlink '{dst_path}': {exc}"
+msgstr "无法创建符号链接 '{dst_path}': {exc}"
+
+msgid "Cannot write to '{dst_path}': {exc}"
+msgstr "无法写入 '{dst_path}': {exc}"
+
+msgid "Cannot replace '{dst_path}': {exc}"
+msgstr "无法替换 '{dst_path}': {exc}"
+
+msgid "Cannot delete '{path}': {exc}"
+msgstr "无法删除 '{path}': {exc}"
+
+msgid "Cannot remove '{path}': {exc}"
+msgstr "无法移除 '{path}': {exc}"
+
+msgid "source path '{src}' does not exist."
+msgstr "源路径 '{src}' 不存在。"
+
+msgid "Cannot remove existing path '{dst_path}': {exc}"
+msgstr "无法移除已存在的路径 '{dst_path}': {exc}"
+
+msgid "Cannot create destination '{dest_path}': {exc}"
+msgstr "无法创建目标 '{dest_path}': {exc}"
+
+msgid "({del_n}/{del_total}) Delete: {path}"
+msgstr "({del_n}/{del_total}) 删除: {path}"
+
+msgid "Warning: cannot stat '{abs_path}': {exc}"
+msgstr "警告: 无法 stat '{abs_path}': {exc}"
+
+msgid "{_arg0}{_arg1}{_arg2}"
+msgstr "{_arg0}{_arg1}{_arg2}"
+
+msgid "{_arg0}No active sessions.{_arg1}"
+msgstr "{_arg0}没有活跃会话。{_arg1}"
+
+msgid "{_arg0}* detached session{_arg1}"
+msgstr "{_arg0}* 后台会话{_arg1}"
+
+msgid "Backing up '{container_name}'..."
+msgstr "正在备份 '{container_name}'..."
+
+msgid "Fixing file permissions in rootfs..."
+msgstr "正在修复 rootfs 内的文件权限..."
+
+msgid "Archiving the container..."
+msgstr "正在打包容器..."
+
+msgid "container '{container_name}' does not exist."
+msgstr "容器 '{container_name}' 不存在。"
+
+msgid "Will write backup data to '{output_path}'."
+msgstr "备份数据将写入 '{output_path}'。"
+
+msgid "Will write backup data to stdout."
+msgstr "备份数据将写入标准输出。"
+
+msgid "Finished backing up."
+msgstr "备份完成。"
+
+msgid "Adding: '{arc}'"
+msgstr "添加: '{arc}'"
+
+msgid "Failed to create backup archive: {exc}"
+msgstr "创建备份归档失败: {exc}"
+
+msgid "Restoring container from the backup..."
+msgstr "正在从备份恢复容器..."
+
+msgid "Finished restoring the container '{restore_name}'."
+msgstr "已恢复容器 '{restore_name}'。"
+
+msgid "file '{archive}' does not exist."
+msgstr "文件 '{archive}' 不存在。"
+
+msgid "path '{archive}' is a directory."
+msgstr "路径 '{archive}' 是一个目录。"
+
+msgid "file '{archive}' is not readable."
+msgstr "文件 '{archive}' 不可读。"
+
+msgid "Extracting: '{member_name}'"
+msgstr "解压: '{member_name}'"
+
+msgid "Failed to restore container: {exc}"
+msgstr "恢复容器失败: {exc}"
+
+msgid "Destination: {restore_name}"
+msgstr "目标: {restore_name}"
+
+msgid "Finished copying files."
+msgstr "文件复制完成。"
+
+msgid "paths '.' and '..' are not allowed as copy destination."
+msgstr "不允许将 '.' 或 '..' 作为复制目标路径。"
+
+msgid "cannot copy '{src}' because the path does not exist."
+msgstr "无法复制 '{src}'，因为该路径不存在。"
+
+msgid "source path '{src_path}' is not readable."
+msgstr "源路径 '{src_path}' 不可读。"
+
+msgid "Creating directory '{dest_dir}'..."
+msgstr "正在创建目录 '{dest_dir}'..."
+
+msgid "Copying: '{src}' -> '{dst}'"
+msgstr "复制: '{src}' -> '{dst}'"
+
+msgid "Moving files..."
+msgstr "正在移动文件..."
+
+msgid "Copying files, this may take a while..."
+msgstr "正在复制文件，可能需要一些时间..."
+
+msgid "Error: {exc}"
+msgstr "错误: {exc}"
+
+msgid "Cannot create directory '{dest_dir}': {exc}"
+msgstr "无法创建目录 '{dest_dir}': {exc}"
+
+msgid "Moving: '{src_path}' -> '{dest_path}'"
+msgstr "移动: '{src_path}' -> '{dest_path}'"
+
+msgid "Copying: '{src_path}' -> '{dest_path}'"
+msgstr "复制: '{src_path}' -> '{dest_path}'"
+
+msgid "Indexing OCI archive..."
+msgstr "正在索引 OCI 归档..."
+
+msgid "Push complete."
+msgstr "推送完成。"
+
+msgid "image reference is not specified (e.g. 'myrepo/myapp:1.0')."
+msgstr "未指定镜像引用 (例如 'myrepo/myapp:1.0')。"
+
+msgid "Network error: {exc}"
+msgstr "网络错误: {exc}"
+
+msgid "cannot read manifest.json for '{container_name}': {exc}"
+msgstr "无法读取 '{container_name}' 的 manifest.json: {exc}"
+
+msgid "Clearing cache..."
+msgstr "正在清理缓存..."
+
+msgid "Reclaimed {size} of disk space."
+msgstr "回收了 {size} 磁盘空间。"
+
+msgid "Cache is empty."
+msgstr "缓存为空。"
+
+msgid "Removing: '{path}'"
+msgstr "正在删除: '{path}'"
+
+msgid "Renaming '{orig}' to '{new}'..."
+msgstr "正在将 '{orig}' 重命名为 '{new}'..."
+
+msgid "Finished renaming the container."
+msgstr "容器重命名完成。"
+
+msgid "original and new names must differ."
+msgstr "原名称与新名称必须不同。"
+
+msgid "container '{orig}' is not installed."
+msgstr "容器 '{orig}' 未安装。"
+
+msgid "container '{new}' already exists."
+msgstr "容器 '{new}' 已存在。"
+
+msgid "Failed to rename container: {exc}"
+msgstr "重命名容器失败: {exc}"
+
+msgid "{_arg0}PID:     {_arg1}{pid}{_arg3}"
+msgstr "{_arg0}PID:     {_arg1}{pid}{_arg3}"
+
+msgid "{_arg0}Command: {_arg1}{_arg2}{_arg3}"
+msgstr "{_arg0}命令: {_arg1}{_arg2}{_arg3}"
+
+msgid "no user '{user_spec}' defined in /etc/passwd."
+msgstr "/etc/passwd 中未定义用户 '{user_spec}'。"
+
+msgid "failed to retrieve UID for user '{user_spec}'."
+msgstr "获取用户 '{user_spec}' 的 UID 失败。"
+
+msgid "no group '{group_spec}' defined in /etc/group."
+msgstr "/etc/group 中未定义组 '{group_spec}'。"
+
+msgid "bind specification cannot be empty."
+msgstr "bind 挂载规范不能为空。"
+
+msgid "bind source path cannot be empty in '--bind={bnd}'."
+msgstr "'--bind={bnd}' 中的 bind 源路径不能为空。"
+
+msgid "binding destination must be an absolute path, got '{dst}'."
+msgstr "bind 目标必须是绝对路径，实际为 '{dst}'。"
+
+msgid "Migrating legacy container '{container_name}'..."
+msgstr "正在迁移旧版容器 '{container_name}'..."
+
+msgid "Migration complete."
+msgstr "迁移完成。"
+
+msgid "用法"
+msgstr "用法"
+
+msgid "描述"
+msgstr "描述"
+
+msgid "PRoot-Distro 是 proot 用户空间模拟器（chroot、mount --bind、binfmt_misc）的封装工具。它提供了一种便捷的方式来管理 Linux 容器，并借助 Docker registry 支持提供任意发行版。"
+msgstr "PRoot-Distro 是 proot 用户空间模拟器（chroot、mount --bind、binfmt_misc）的封装工具。它提供了一种便捷的方式来管理 Linux 容器，并借助 Docker registry 支持提供任意发行版。"
+
+msgid "命令"
+msgstr "命令"
+
+msgid "获取帮助"
+msgstr "获取帮助"
+
+msgid "运行 '{cmd} <command> --help' 查看任意命令的详情。
+
+完整文档: https://github.com/termux/proot-distro/blob/master/README.md"
+msgstr ""
+
+msgid "快速开始"
+msgstr "快速开始"
+
+msgid "通用发行版镜像的使用非常直观。下面以 Ubuntu 24.04 为例:"
+msgstr "通用发行版镜像的使用非常直观。下面以 Ubuntu 24.04 为例:"
+
+msgid "某些镜像针对特定用途预配置，内含启动脚本。常见于服务器软件:"
+msgstr "某些镜像针对特定用途预配置，内含启动脚本。常见于服务器软件:"
+
+msgid "Docker Hub 上非官方提供的镜像需指定组织或用户名:"
+msgstr "Docker Hub 上非官方提供的镜像需指定组织或用户名:"
+
+msgid "不再需要某个容器时，用以下命令删除:"
+msgstr "不再需要某个容器时，用以下命令删除:"
+
+msgid "可以在 Docker Hub (https://hub.docker.com/) 或互联网其他地方发现现有镜像。也可以用 '{cmd} build' 从 Dockerfile 自建镜像。"
+msgstr "可以在 Docker Hub (https://hub.docker.com/) 或互联网其他地方发现现有镜像。也可以用 '{cmd} build' 从 Dockerfile 自建镜像。"
+
+msgid "数据位置"
+msgstr "数据位置"
+
+msgid "故障排查"
+msgstr "故障排查"
+
+msgid "如果你的终端（主题）与颜色显示不兼容，设置以下环境变量:"
+msgstr "如果你的终端（主题）与颜色显示不兼容，设置以下环境变量:"
+
+msgid "拉取私有 Docker/OCI 镜像时，在运行 install 之前以 'username:password' 格式通过 PD_DOCKER_AUTH 设置凭据:"
+msgstr "拉取私有 Docker/OCI 镜像时，在运行 install 之前以 'username:password' 格式通过 PD_DOCKER_AUTH 设置凭据:"
+
+msgid "镜像源拉取失败时，可用 '{cmd} mirror' 子命令切换源:
+
+{cmd} mirror test       # 并发探测所有内置镜像源
+{cmd} mirror use <ID>   # 切换到指定镜像源
+{cmd} mirror show       # 查看当前生效 URL"
+msgstr ""
+
+msgid "工具问题请反馈至 https://github.com/termux/proot-distro/issues"
+msgstr "工具问题请反馈至 https://github.com/termux/proot-distro/issues"
+
+msgid "Aliases"
+msgstr "Aliases"
+
+msgid "别名"
+msgstr "别名"
+
+msgid "PD_PROOT_BIN '{override}' is not found or not executable."
+msgstr "PD_PROOT_BIN '{override}' 不存在或不可执行。"
