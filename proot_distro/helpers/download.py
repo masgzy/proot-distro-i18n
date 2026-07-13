@@ -25,6 +25,7 @@
 
 import hashlib
 import os
+import socket
 import ssl
 import time
 import urllib.error
@@ -51,6 +52,28 @@ __all__ = (
 
 
 _insecure_ctx: ssl.SSLContext | None = None
+
+
+# TCP 接收缓冲区大小：2 MiB。详见 transport.py 中的说明。
+_SOCKET_RCVBUF = 1 << 21
+
+
+def _tune_socket(sock) -> None:
+    """连接建立后调优 TCP socket 参数以提升下载吞吐量。"""
+    if sock is None:
+        return
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _SOCKET_RCVBUF)
+    except OSError:
+        pass
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _SOCKET_RCVBUF)
+    except OSError:
+        pass
 
 
 def insecure_ssl_context() -> ssl.SSLContext:
@@ -226,11 +249,19 @@ def download_file(
     def _attempt():
         with atomic_replace(dest) as tmp:
             with urllib.request.urlopen(req, context=context, timeout=timeout) as resp, \
-                    open(tmp, "wb") as fh:
+                    open(tmp, "wb", buffering=1 << 20) as fh:
+                # 调优 socket 参数以提升下载吞吐量
+                sock = getattr(resp, 'fp', None)
+                if sock is not None:
+                    raw = getattr(sock, 'raw', None)
+                    if raw is not None:
+                        _sock = getattr(raw, '_sock', None) or getattr(raw, 'sock', None)
+                        if _sock is not None:
+                            _tune_socket(_sock)
                 total = int(resp.headers.get("Content-Length", 0))
                 downloaded = 0
                 while True:
-                    chunk = resp.read(262144)
+                    chunk = resp.read(1 << 20)
                     if not chunk:
                         break
                     fh.write(chunk)

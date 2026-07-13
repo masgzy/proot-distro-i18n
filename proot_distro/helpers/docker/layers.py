@@ -25,6 +25,7 @@
 import hashlib
 import os
 import socket
+import time
 import urllib.error
 import urllib.request
 
@@ -169,7 +170,8 @@ def download_blob(
                             break
                         hasher.update(chunk)
 
-            with open(part, mode) as fh:
+            with open(part, mode, buffering=1 << 20) as fh:
+                dl_start = time.monotonic()
                 while True:
                     try:
                         chunk = resp.read(_CHUNK_SIZE)
@@ -197,6 +199,15 @@ def download_blob(
 
         # 成功 —— 原子地将 .part 提升为最终路径。
         os.replace(part, dest)
+
+        # 记录下载速度（不含续传已有的部分）
+        dl_elapsed = time.monotonic() - dl_start
+        dl_bytes = downloaded - existing
+        if dl_elapsed > 0 and dl_bytes > 0:
+            speed = dl_bytes / dl_elapsed
+            log_info(f"{short_id}: 下载完成 "
+                     f"({fmt_size(dl_bytes)}，{fmt_size(int(speed))}/s)")
+
         return dest
 
     try:
@@ -204,6 +215,7 @@ def download_blob(
             _attempt,
             what=f"Downloading layer {short_id}",
             max_retries=_BLOB_MAX_RETRIES,
+            retry_delay=3,
         )
     finally:
         if not quiet:

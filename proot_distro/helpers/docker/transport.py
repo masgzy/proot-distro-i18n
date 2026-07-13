@@ -31,9 +31,11 @@
 #     tells us where to redeem it for a Bearer token.
 
 import base64
+import http.client
 import json
 import os
 import re
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -45,6 +47,7 @@ from proot_distro.helpers.download import (
     is_cert_verification_error,
     is_plaintext_http_tls_error,
     retry_http,
+    _tune_socket,
 )
 
 
@@ -55,6 +58,60 @@ from proot_distro.helpers.download import (
 from proot_distro.mirrors import resolve_registry_url as _resolve_registry_url
 
 AUTH_URL = "https://auth.docker.io/token"
+
+
+# ---------------------------------------------------------------------------
+# TCP socket 调优
+# ---------------------------------------------------------------------------
+#
+# Python 的 urllib.request 默认使用操作系统的 TCP 接收缓冲区大小，
+# 通常只有 8-64 KiB。在高延迟连接（如中国到海外镜像源，RTT 150-300ms）
+# 上，这严重限制吞吐量：
+#
+#   最大吞吐量 ≈ SO_RCVBUF / RTT
+#   8 KiB / 200ms  =  40 KB/s
+#   64 KiB / 200ms = 320 KB/s
+#   2 MiB / 200ms  = 10 MB/s  ← 我们的目标
+#
+# 将 SO_RCVBUF 设为 2 MiB 后，即使在 300ms RTT 的连接上也能达到
+# 7 MB/s 的单连接吞吐量，多线程并发后轻松超过 10 MB/s。
+#
+# 注意：操作系统可能将 SO_RCVBUF 限制在 /proc/sys/net/core/rmem_max
+# （Linux）或动态窗口上限以内。setsockopt 会静默截断到允许的最大值，
+# 不会报错。
+#
+# _tune_socket 定义在 helpers/download.py 中，供 transport.py 和
+# download.py 共用，避免循环导入。
+
+
+class _TunedHTTPSConnection(http.client.HTTPSConnection):
+    """建立连接后自动调优 socket 参数的 HTTPS 连接。"""
+
+    def connect(self):
+        super().connect()
+        _tune_socket(self.sock)
+
+
+class _TunedHTTPConnection(http.client.HTTPConnection):
+    """建立连接后自动调优 socket 参数的 HTTP 连接。"""
+
+    def connect(self):
+        super().connect()
+        _tune_socket(self.sock)
+
+
+class _TunedHTTPSHandler(urllib.request.HTTPSHandler):
+    """使用调优连接的 HTTPS handler。"""
+
+    def https_open(self, req):
+        return self.do_open(_TunedHTTPSConnection, req, context=self._context)
+
+
+class _TunedHTTPHandler(urllib.request.HTTPHandler):
+    """使用调优连接的 HTTP handler。"""
+
+    def http_open(self, req):
+        return self.do_open(_TunedHTTPConnection, req)
 
 
 def _ua() -> dict:
@@ -83,17 +140,22 @@ class AuthStrippingRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 def _build_opener(insecure: bool):
-    """Build an opener that strips Auth across hosts.
+    """构建带 Auth 跨域剥离 + socket 调优的 opener。
 
-    The *insecure* variant additionally installs an HTTPS handler whose SSL
-    context skips certificate verification, so HTTPS endpoints presenting an
-    untrusted certificate can be reached under ``--allow-insecure``.
+    *insecure* 变体额外安装跳过证书校验的 HTTPS handler，使
+    ``--allow-insecure`` 下能到达不受信任证书的 HTTPS 端点。
+    无论何种模式，HTTP/HTTPS 连接都会在建立后调优 socket 参数
+    （SO_RCVBUF、TCP_NODELAY），以提升下载吞吐量。
     """
-    handlers = [AuthStrippingRedirectHandler]
     if insecure:
-        handlers.append(
-            urllib.request.HTTPSHandler(context=insecure_ssl_context())
-        )
+        https_handler = _TunedHTTPSHandler(context=insecure_ssl_context())
+    else:
+        https_handler = _TunedHTTPSHandler()
+    handlers = [
+        AuthStrippingRedirectHandler,
+        _TunedHTTPHandler(),
+        https_handler,
+    ]
     return urllib.request.build_opener(*handlers)
 
 
