@@ -36,15 +36,14 @@
 #     archive is also `docker load`-compatible.
 
 import hashlib
-import json
 import os
 import tarfile
 
-from proot_distro.atomic import atomic_replace
+from proot_distro.atomic import atomic_write
 from proot_distro.helpers.docker import (
-    layer_cache_path,
-    manifest_cache_path,
     parse_image_ref,
+    open_required_layer,
+    save_manifest_cache,
 )
 from proot_distro.helpers.docker.media import (
     OCI_CONFIG_MEDIA,
@@ -107,28 +106,22 @@ def build_manifest_and_config(image_config, layers, arch_name):
 
 
 # ---------------------------------------------------------------------------
-# Variant A — store the manifest in dlcache so install can find it
+# Variant A — store the manifest in the manifest cache so install can find it
 # ---------------------------------------------------------------------------
 
 def store_in_cache(image_ref, arch_name_pd, manifest, image_config):
     """Write the manifest into MANIFEST_CACHE_DIR for offline install.
 
     `arch_name_pd` is the proot-distro arch (aarch64, x86_64, …). The
-    cache key matches what helpers/docker.manifest_cache_path uses
-    so that a subsequent `install <image_ref>` reads it on the
-    fully-offline branch of pull_image().
+    write goes through helpers/docker.save_manifest_cache so a built
+    image is indistinguishable from a pulled one — same cache key, same
+    payload shape — and a subsequent `install <image_ref>` reads it on
+    the fully-offline branch of pull_image().
     """
     _, repo, _ = parse_image_ref(image_ref)
-    path = manifest_cache_path(image_ref, arch_name_pd)
-    payload = {
-        "manifest": manifest,
-        "repo": repo,
-        "image_config": image_config,
-    }
-    with atomic_replace(path) as tmp:
-        with open(tmp, "w") as fh:
-            json.dump(payload, fh, indent=2, sort_keys=True)
-    return path
+    return save_manifest_cache(
+        image_ref, arch_name_pd, manifest, repo, image_config
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -206,8 +199,8 @@ def write_oci_archive(out_path, manifest, image_config, image_ref):
         _build_docker_manifest(manifest, config_digest_hex, image_ref)
     )
 
-    with atomic_replace(os.path.abspath(out_path)) as tmp:
-        with tarfile.open(tmp, mode) as tf:
+    with atomic_write(os.path.abspath(out_path)) as tmp_fh:
+        with tarfile.open(fileobj=tmp_fh, mode=mode) as tf:
             # oci-layout first so our own install probe detects the
             # OCI format on the first member it sees.
             _add_bytes(tf, "oci-layout", oci_layout_bytes)
@@ -221,13 +214,18 @@ def write_oci_archive(out_path, manifest, image_config, image_ref):
             )
             for layer in manifest["layers"]:
                 hex_digest = layer["digest"].split(":", 1)[1]
-                src = layer_cache_path(layer["digest"])
-                if not os.path.isfile(src):
-                    raise RuntimeError(
-                        f"Layer blob {layer['digest']} is missing from the "
-                        f"cache; cannot package OCI archive."
-                    )
-                _add_file(tf, src, f"blobs/sha256/{hex_digest}")
+                # The archive is content-addressed for whoever loads it,
+                # so a blob is packed only if it still hashes to the name
+                # the manifest gives it.
+                # The descriptor the check was made on, so the bytes
+                # packed are the bytes that were hashed.
+                src_fd = open_required_layer(
+                    layer["digest"], what="Layer blob"
+                )
+                try:
+                    _add_fd(tf, src_fd, f"blobs/sha256/{hex_digest}")
+                finally:
+                    os.close(src_fd)
 
 
 def _build_docker_manifest(manifest, config_digest_hex, image_ref):
@@ -270,8 +268,9 @@ def _add_bytes(tf, arcname, data):
     tf.addfile(tinfo, io.BytesIO(data))
 
 
-def _add_file(tf, src_path, arcname):
-    st = os.stat(src_path)
+def _add_fd(tf, src_fd, arcname):
+    """Add the open file *src_fd* to *tf* under *arcname*."""
+    st = os.fstat(src_fd)
     tinfo = tarfile.TarInfo(arcname)
     tinfo.size = st.st_size
     tinfo.mode = 0o644
@@ -280,5 +279,5 @@ def _add_file(tf, src_path, arcname):
     tinfo.gid = 0
     tinfo.uname = ""
     tinfo.gname = ""
-    with open(src_path, "rb") as fh:
-        tf.addfile(tinfo, fh)
+    os.lseek(src_fd, 0, os.SEEK_SET)
+    tf.addfile(tinfo, open(src_fd, "rb", closefd=False))

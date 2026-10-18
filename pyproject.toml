@@ -4,8 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "proot-distro-i18n"
-version = "5.4.1"
-description = "PRoot-Distro 的中文汉化版，附带镜像源管理与性能优化。"
+version = "5.10.0"
+description = "PRoot-Distro 的中文汉化版（基于官方 v5.10.0），附带镜像源管理与下载提速。"
+
 readme = "README.md"
 requires-python = ">=3.9"
 license = "GPL-3.0-only"

@@ -26,8 +26,8 @@
 #
 # A small _PdArgumentParser subclass exists so per-command parsers can
 # stamp their canonical command name onto each instance — the value
-# is consumed by the runtime error handler in cli.py to render the
-# right help page when argparse rejects an argument.
+# is consumed by its own error() override to render the right help
+# page when argparse rejects an argument.
 
 import argparse
 import sys
@@ -37,14 +37,19 @@ from proot_distro.message import msg, crit_error
 
 
 class _PdArgumentParser(argparse.ArgumentParser):
-    """Argparse subclass that defers errors to the CLI dispatcher."""
+    """Argparse subclass that reports a parse error as our own message.
+
+    Instead of argparse's usage dump, error() prints the message through
+    crit_error(), then the help page of the command named by
+    `_pd_command` (when one was stamped), and exits with status 1.
+    """
 
     _pd_command: "str | None" = None
 
     def error(self, message: str) -> None:
-        # Late import to avoid an import cycle: parser.py is imported by
-        # cli.py, and the per-command help renderer indirectly imports
-        # cli.py via HELP_COMMANDS's references.
+        # Imported here rather than at module level: the help pages are
+        # needed only on this error path, so building a parser does not
+        # pay for loading them.
         from proot_distro.commands.help import HELP_COMMANDS
 
         msg()
@@ -56,10 +61,12 @@ class _PdArgumentParser(argparse.ArgumentParser):
 
 
 # Maps each canonical command to required (arg_name, error_message) pairs.
+# Commands whose positional means different things depending on a flag
+# refine this through required_args_for().
 REQUIRED_ARGS = {
     "install": [("image_ref", "Docker image reference is not specified"
                  " (e.g. 'ubuntu:24.04').")],
-    "remove":  [("container_name", "container name is not specified.")],
+    "remove":  [("target", "container name is not specified.")],
     "rename":  [("orig_name", "the original container name is not specified."),
                 ("new_name",  "the new container name is not specified.")],
     "reset":   [("container_name", "container name is not specified.")],
@@ -72,7 +79,23 @@ REQUIRED_ARGS = {
     "run":     [("container_name", "container name is not specified.")],
     "push":    [("image_ref", "image reference is not specified"
                  " (e.g. 'myrepo/myapp:1.0').")],
+    "search":  [("query", "search query is not specified"
+                 " (e.g. 'ubuntu').")],
 }
+
+
+def required_args_for(canonical: str, args) -> list:
+    """Return the required (arg_name, error_message) pairs for a command.
+
+    Same data as REQUIRED_ARGS, except that a command whose positional
+    changes meaning with a flag gets the message matching what the user
+    actually asked for — `remove --image` wants an image reference, not
+    a container name.
+    """
+    if canonical == "remove" and getattr(args, "image", False):
+        return [("target", "image reference is not specified"
+                 " (e.g. 'ubuntu:24.04').")]
+    return REQUIRED_ARGS.get(canonical, [])
 
 
 # Aliases for the canonical command names. Resolved by the CLI before
@@ -86,6 +109,7 @@ ALIAS_TO_CANONICAL = {
     "clear": "clear-cache", "cl": "clear-cache",
     "cp": "copy",
     "mir": "mirror", "mr": "mirror",
+    "s": "search", "se": "search",
     "h": "help", "he": "help", "hel": "help",
 }
 
@@ -148,6 +172,7 @@ def build_parser() -> _PdArgumentParser:
     sub.add_parser("help", aliases=["hel", "he", "h"], add_help=False)
 
     _install(sub)
+    _search(sub)
     _remove(sub)
     _rename(sub)
     _reset(sub)
@@ -191,10 +216,28 @@ def _install(sub):
     p.add_argument("-h", "--help", action="store_true")
 
 
+def _search(sub):
+    p = sub.add_parser("search", aliases=["se", "s"], add_help=False)
+    p._pd_command = "search"
+    p.add_argument("query", nargs="?", default=None, metavar="QUERY")
+    # Left as a string: the command validates it so a bad value reports
+    # what is wrong with it (too small, too large, not a number) rather
+    # than argparse's bare "invalid int value".
+    p.add_argument("-l", "--limit", metavar="N")
+    p.add_argument("-q", "--quiet", action="store_true")
+    p.add_argument("-h", "--help", action="store_true")
+
+
 def _remove(sub):
     p = sub.add_parser("remove", aliases=["rm"], add_help=False)
     p._pd_command = "remove"
-    p.add_argument("container_name", nargs="?", default=None)
+    p.add_argument(
+        "target", nargs="?", default=None, metavar="CONTAINER|IMAGE"
+    )
+    p.add_argument("-i", "--image", action="store_true")
+    p.add_argument(
+        "-a", "--architecture", dest="override_arch", metavar="ARCH",
+    )
     vq = p.add_mutually_exclusive_group()
     vq.add_argument("-v", "--verbose", action="store_true")
     vq.add_argument("-q", "--quiet", action="store_true")
@@ -231,6 +274,7 @@ def _login(sub):
 def _list(sub):
     p = sub.add_parser("list", aliases=["li", "ls"], add_help=False)
     p._pd_command = "list"
+    p.add_argument("-i", "--image", action="store_true")
     p.add_argument("-h", "--help", action="store_true")
     p.add_argument("-q", "--quiet", action="store_true")
 
@@ -242,7 +286,10 @@ def _backup(sub):
     p.add_argument("-o", "--output", metavar="FILE")
     p.add_argument(
         "-c", "--compress", dest="compression",
-        choices=["gzip", "bzip2", "xz", "none"], metavar="TYPE",
+        # zstd stays a valid choice even where the interpreter cannot
+        # write it, so command_backup can explain why rather than leave
+        # argparse to answer with a bare "invalid choice".
+        choices=["gzip", "bzip2", "xz", "zstd", "none"], metavar="TYPE",
     )
     vq = p.add_mutually_exclusive_group()
     vq.add_argument("-v", "--verbose", action="store_true")
@@ -265,6 +312,8 @@ def _clear_cache(sub):
         "clear-cache", aliases=["clear", "cl"], add_help=False
     )
     p._pd_command = "clear-cache"
+    p.add_argument("--orphan", action="store_true")
+    p.add_argument("--build-cache", dest="build_cache", action="store_true")
     vq = p.add_mutually_exclusive_group()
     vq.add_argument("-v", "--verbose", action="store_true")
     vq.add_argument("-q", "--quiet", action="store_true")

@@ -33,18 +33,22 @@ import tempfile
 from contextlib import ExitStack
 from types import SimpleNamespace
 
+from proot_distro import dirfd, statedir
 from proot_distro.commands.install import command_install
 
 from proot_distro.constants import (
     PROGRAM_NAME,
     RUNTIME_DIR,
 )
-from proot_distro.paths import container_rootfs
-from proot_distro.message import C, msg, log_info, log_error, crit_error
+from proot_distro.paths import container_is_installed
+from proot_distro.message import (
+    C, msg, log_info, log_error, crit_error, quote_error, quote_path,
+)
 from proot_distro.locking import BuildLock
 from proot_distro.arch import get_device_cpu_arch, normalize_arch
 from proot_distro.helpers.dockerfile import (
     DockerfileSyntaxError,
+    MAX_DOCKERFILE_BYTES,
     parse_dockerfile,
 )
 from proot_distro.helpers.build_engine import (
@@ -57,7 +61,9 @@ from proot_distro.helpers.oci_writer import (
     store_in_cache,
     write_oci_archive,
 )
-from proot_distro.helpers.docker import ARCH_TO_DOCKER
+from proot_distro.helpers.docker import (
+    ARCH_TO_DOCKER, InvalidReference, parse_tag_reference, with_explicit_tag,
+)
 from proot_distro.names import is_valid_name, require_valid_name
 from proot_distro.progress import fmt_size
 from proot_distro.i18n import _
@@ -66,6 +72,24 @@ from proot_distro.i18n import _
 # ---------------------------------------------------------------------------
 # Top-level command
 # ---------------------------------------------------------------------------
+
+def _read_dockerfile(dockerfile: str):
+    """The Dockerfile's bytes, or None when there are more than the cap.
+
+    "-" is stdin, read as bytes like the file so both decode the same
+    way (the parser normalises line endings itself). One byte more than
+    MAX_DOCKERFILE_BYTES is read and its presence is the refusal, so the
+    bound is on what arrives rather than on a size the file declares.
+    """
+    if dockerfile == "-":
+        data = sys.stdin.buffer.read(MAX_DOCKERFILE_BYTES + 1)
+    else:
+        with open(dockerfile, "rb") as fh:
+            data = fh.read(MAX_DOCKERFILE_BYTES + 1)
+    if len(data) > MAX_DOCKERFILE_BYTES:
+        return None
+    return data
+
 
 def command_build(args):
     """Implements `proot-distro build`."""
@@ -117,14 +141,17 @@ def command_build(args):
 
     # ----- read + parse Dockerfile -----
     try:
-        if dockerfile == "-":
-            text = sys.stdin.read()
-        else:
-            with open(dockerfile, "rb") as fh:
-                text = fh.read().decode("utf-8", errors="replace")
+        raw = _read_dockerfile(dockerfile)
     except OSError as exc:
         crit_error(_("cannot read Dockerfile: {exc}", exc = exc))
         sys.exit(1)
+    if raw is None:
+        crit_error(
+            f"Dockerfile is larger than {MAX_DOCKERFILE_BYTES} bytes; "
+            f"refusing to read it."
+        )
+        sys.exit(1)
+    text = raw.decode("utf-8", errors="replace")
 
     try:
         _directives, instructions = parse_dockerfile(text)
@@ -158,7 +185,7 @@ def command_build(args):
     if install_as:
         require_valid_name(install_as, kind="--install-as value")
 
-        if os.path.isdir(container_rootfs(install_as)):
+        if container_is_installed(install_as):
             crit_error(
                 f"container '{install_as}' defined by --install-as already "
                 f"exists. Use '{PROGRAM_NAME} remove {install_as}' first or "
@@ -177,17 +204,19 @@ def command_build(args):
             sys.exit(1)
         tags = [derived]
 
+    # Docker's reference grammar, not a check of the alias alone: the tag
+    # becomes the manifest-cache key, the build lock, the name `push`
+    # uploads under and the RepoTags an --output archive carries. The old
+    # check looked at the last component only, so `../../x:1` was taken
+    # (with `..` for a registry) and `localhost:5000/app` refused.
     for t in tags:
-        if not _is_valid_tag(t):
-            crit_error(
-                f"tag '{t}' is not valid. A tag must start with an "
-                f"alphanumeric character and contain only letters, "
-                f"digits, underscores, dots, hyphens, slashes, or a "
-                f"single colon for the version."
-            )
+        try:
+            parse_tag_reference(t)
+        except InvalidReference as exc:
+            crit_error(f"tag '{quote_path(t)}' is not valid: {exc}.")
             sys.exit(1)
 
-    tags = [_with_explicit_tag(t) for t in tags]
+    tags = [with_explicit_tag(t) for t in tags]
     primary_tag = tags[0]
 
     # ----- refuse to overwrite existing output files -----
@@ -213,34 +242,42 @@ def command_build(args):
             lock_stack.enter_context(lock)
 
         # ----- run the build -----
-        build_tmp = os.path.join(RUNTIME_DIR, "build-tmp")
-        try:
-            os.makedirs(build_tmp, exist_ok=True)
-        except OSError:
-            build_tmp = None
-        tmp_root = tempfile.mkdtemp(prefix="pd-build-", dir=build_tmp)
-
-        engine = BuildEngine(
-            build_dir=build_dir,
-            tmp_root=tmp_root,
-            target_arch_pd=target_arch,
-            user_build_args=build_args,
-            target_stage=target_stage,
-            verbose=verbose,
-            quiet=quiet,
-            no_cache=no_cache,
-            emulator=emulator,
-        )
+        tmp_root, tmp_root_fd = _make_build_tmp()
 
         # Single try/except/finally covers the whole post-setup work so
         # KeyboardInterrupt during any phase (engine, cache write, OCI
         # archive write, install-as) is reported cleanly and tmp_root is
-        # always removed.
+        # always removed. The engine is built inside it because it owns
+        # the stage descriptors, which have to be released even if it
+        # never gets as far as running.
+        engine = None
         try:
+            engine = BuildEngine(
+                build_dir=build_dir,
+                tmp_root=tmp_root,
+                tmp_root_fd=tmp_root_fd,
+                target_arch_pd=target_arch,
+                user_build_args=build_args,
+                target_stage=target_stage,
+                verbose=verbose,
+                quiet=quiet,
+                no_cache=no_cache,
+                emulator=emulator,
+            )
             try:
                 final_stage = engine.run(instructions)
             except BuildError as exc:
-                log_error(_("Build failed: {exc}", exc = exc))
+                # A BuildError interpolates names raw, and the ones it
+                # reports on come from the image or from an ADD'd archive
+                # (see copy_step._materialise_files).
+                log_error(_("Build failed: {exc}", exc = quote_error(exc)))
+                sys.exit(1)
+            except OSError as exc:
+                # The engine's own walks report per-entry failures and
+                # carry on; one that reaches here is the walk losing its
+                # footing — a directory moved out from under it while a
+                # step's leftovers were still running (dirfd.Levels).
+                log_error(_("Build failed: {exc}", exc = quote_error(exc)))
                 sys.exit(1)
 
             # ----- assemble manifest + image_config -----
@@ -300,12 +337,88 @@ def command_build(args):
             log_error(_("Aborted by user."))
             sys.exit(1)
         finally:
-            shutil.rmtree(tmp_root, ignore_errors=True)
+            # Stage rootfs trees are assembled from images and mutated by
+            # RUN steps, so their depth and their modes are not ours to
+            # assume. shutil.rmtree(ignore_errors=True) swallowed an
+            # OSError but not the RecursionError a deep one raised, and
+            # could not chmod its way into a sealed directory either.
+            # The parent is walked down to for the same reason it was
+            # walked down to when the scratch root was created.
+            #
+            # The stages' descriptors go with it: they are what every
+            # host-side step addressed the tree through, and they are
+            # this build's for exactly as long as the tree is.
+            if engine is not None:
+                engine.close()
+            try:
+                os.close(tmp_root_fd)
+            except OSError:
+                pass
+            statedir.remove_state_tree(tmp_root)
 
 
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+def _make_build_tmp():
+    """Create the scratch root a build assembles its stages in. (path, fd).
+
+    RUNTIME_DIR/build-tmp is a predictable name inside the state tree, and
+    tempfile.mkdtemp(dir=...) resolves it: a guest that left
+    `build-tmp -> <host dir>` behind -- the runtime tree is under the
+    $TERMUX_PREFIX bound read-write into every non-isolated container --
+    had every stage rootfs, every spooled ADD and every packed layer
+    assembled inside that host directory, and the cleanup at the end of
+    the build remove what it found there. The directory is walked down to
+    with O_NOFOLLOW and the scratch root created with mkdirat off the
+    descriptor that walk validated; what is made *inside* it is this
+    process's own, since the name is fresh and the mode is 0700.
+
+    A runtime tree that cannot hold one falls back to the system
+    temporary directory, which is what the previous `build_tmp = None`
+    did.
+
+    The descriptor comes back with the path because the *contents* of
+    the scratch root are named too: each stage's directory and rootfs,
+    the ADD spool, a COPY --from image's throwaway tree. Composing those
+    onto the path and opening them left every one of them re-resolvable
+    by anything running as the invoking user -- which is what a RUN
+    step's leftovers are. The caller owns the descriptor and closes it
+    when the run is over.
+    """
+    build_tmp = os.path.join(RUNTIME_DIR, "build-tmp")
+    try:
+        dir_fd = statedir.open_state_dir(build_tmp, create=True)
+    except OSError:
+        return _fallback_build_tmp()
+    try:
+        name = f"pd-build-{os.getpid()}.{os.urandom(4).hex()}"
+        os.mkdir(name, 0o700, dir_fd=dir_fd)
+        # Off the descriptor that walk validated, so what comes back
+        # names the directory just created and not whatever the name
+        # leads to by the time anything under it is used.
+        run_fd = dirfd.opendir_at(dir_fd, name)
+    except OSError:
+        return _fallback_build_tmp()
+    finally:
+        os.close(dir_fd)
+    return os.path.join(build_tmp, name), run_fd
+
+
+def _fallback_build_tmp():
+    """The scratch root in the system temp dir, when the state tree fails.
+
+    mkdtemp() makes a fresh 0700 directory of its own, so opening it by
+    name is opening what this process just created.
+    """
+    path = tempfile.mkdtemp(prefix="pd-build-")
+    try:
+        return path, dirfd.opendir(path)
+    except OSError:
+        shutil.rmtree(path, ignore_errors=True)
+        raise
+
 
 def _parse_build_args(raw):
     out = {}
@@ -320,42 +433,33 @@ def _parse_build_args(raw):
 
 
 def _derive_tag_from_path(build_dir, dockerfile):
-    """Pick a default tag based on the build context basename."""
+    """Pick a default tag based on the build context basename.
+
+    Made to fit the reference grammar rather than merely checked against
+    it: lowercase, anything outside [a-z0-9._-] turned into '-', a run of
+    separators Docker does not allow ('._', '_-', '___') collapsed into one
+    '-' as runs of '-' always were, and none left at either end. A
+    directory called `app_` or `my._app` used to produce a tag no registry
+    would take.
+    """
     base = os.path.basename(os.path.abspath(build_dir).rstrip("/"))
     if not base or base in (".", ".."):
         if dockerfile and dockerfile != "-":
             base = os.path.basename(os.path.dirname(os.path.abspath(dockerfile)))
-    base = base.lower()
-    base = re.sub(r"[^a-z0-9_.\-]", "-", base).strip("-")
-    base = re.sub(r"-+", "-", base)
-    if not base or not is_valid_name(base):
+    base = re.sub(r"[^a-z0-9_.\-]", "-", base.lower())
+    base = re.sub(
+        r"[._-]+",
+        lambda m: (m.group() if re.fullmatch(r"[._]|__|-+", m.group())
+                   else "-"),
+        base,
+    )
+    base = re.sub(r"-+", "-", base).strip("._-")
+    tag = f"{base}:latest"
+    try:
+        parse_tag_reference(tag)
+    except InvalidReference:
         return ""
-    return f"{base}:latest"
-
-
-def _with_explicit_tag(tag):
-    """Append ':latest' if `tag`'s last path component lacks a tag part."""
-    last = tag.split("/")[-1]
-    return tag if ":" in last else tag + ":latest"
-
-
-def _is_valid_tag(tag):
-    # Allow registry-style prefixes (host/path/name:tag) without
-    # mandating registry validation; insist only that the local alias
-    # we'd derive is sane.
-    if not tag:
-        return False
-    if ":" in tag:
-        name_part, tag_part = tag.rsplit(":", 1)
-        if not tag_part:
-            return False
-        # Tag part: starts with alphanumeric, then word chars + dot/dash.
-        if not re.match(r"^[A-Za-z0-9][\w.\-]*$", tag_part):
-            return False
-    else:
-        name_part = tag
-    last = name_part.split("/")[-1]
-    return is_valid_name(last)
+    return tag if is_valid_name(base) else ""
 
 
 def _install_as_container(install_name, image_ref, target_arch, quiet):

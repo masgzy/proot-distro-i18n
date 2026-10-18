@@ -23,20 +23,53 @@
 # restore can faithfully reconstruct the container directory. Compression
 # is determined by file extension or by --compress flag. Progress is
 # written to stderr so it doesn't corrupt piped archive data on stdout.
+#
+# The container directory is opened once -- through paths.open_container_pair(),
+# the same O_NOFOLLOW walk the installed check makes -- and everything below
+# it is named as (dir_fd, entry). The three passes used to reopen
+# containers/<name> by path, which is guest-writable on Termux, so a session
+# that re-pointed it after the check had the permission pass chmod, and the
+# archiver pack, a host directory of its choosing under the container's name.
+#
+# The rootfs is walked through directory descriptors (see proot_distro.dirfd),
+# never by path. `backup` holds only a *shared* lock, so a `login` session
+# can be running against the same container while the archive is written,
+# and every path-based step here was two acts on two possibly-different
+# files: _fix_permissions() stat'ed a name and then chmod'ed it, and the
+# archiver lstat'ed a name and then opened it. A guest that swaps a
+# directory or a regular file for a symlink in between had the chmod land
+# on a host file and the host file's bytes packed into the archive under an
+# innocent name. Carrying (dir_fd, name) instead means every call names an
+# inode the walk itself opened with O_NOFOLLOW.
+#
+# The three passes -- relax permissions, measure, archive -- each walk the
+# tree with _walk_tree(), which visits an entry before descending into it.
+# That ordering is what lets the first pass chmod a directory it is about
+# to enter, so a chmod-000 subtree is now reachable at all: os.walk() gave
+# up on one silently and left its contents out of the backup.
 
 import os
 import stat
 import sys
 import tarfile
 
-from proot_distro.l2s import resolve_l2s_target
-from proot_distro.message import log_info, log_error, crit_error
+from proot_distro import dirfd
+from proot_distro.compress import (
+    ZSTD_AVAILABLE, open_tar_writer, unavailable_msg, unsupported_msg,
+)
+from proot_distro.l2s import open_l2s_backing, resolve_l2s_target
+from proot_distro.message import (
+    log_info, log_error, crit_error, quote_error, quote_path, warn,
+)
 from proot_distro.progress import (
     REDRAW_THRESHOLD_BYTES, clear_bar, draw_bytes_bar,
 )
 from proot_distro.locking import ContainerLock
 from proot_distro.names import require_valid_name
-from proot_distro.paths import container_manifest, container_rootfs
+from proot_distro.paths import (
+    container_is_installed, container_manifest, container_rootfs,
+    open_container_pair,
+)
 from proot_distro.i18n import _
 
 
@@ -50,17 +83,20 @@ _COMPRESS_EXTS = (
     ('.txz',      'xz'),
     ('.tar.lzma', 'xz'),
     ('.tlzma',    'xz'),
+    ('.tar.zst',  'zst'),
+    ('.tzst',     'zst'),
     ('.tar',      ''),
 )
 
 # Extensions that look like compression requests but are not supported.
-_UNSUPPORTED_EXTS = ('.tar.zst', '.tzst', '.tar.lz4', '.tar.lz')
+_UNSUPPORTED_EXTS = ('.tar.lz4', '.tar.lz')
 
 # Maps --compress argument values to tarfile compression identifiers.
 _COMPRESSION_ARG_MAP = {
     'gzip':  'gz',
     'bzip2': 'bz2',
     'xz':    'xz',
+    'zstd':  'zst',
     'none':  '',
 }
 
@@ -68,56 +104,133 @@ _COMPRESSION_ARG_MAP = {
 def _compression_mode(filename: str) -> str:
     """Return the tarfile compression suffix for *filename*'s extension.
 
-    Raises ValueError for recognised-but-unsupported formats.
+    Raises ValueError for recognised-but-unsupported formats — which
+    includes zstd on an interpreter that cannot write it, since the
+    extension is what asked for the format.
     Falls back to uncompressed ('') for unknown extensions.
     """
     low = filename.lower()
     for ext, comp in _COMPRESS_EXTS:
         if low.endswith(ext):
+            if comp == 'zst' and not ZSTD_AVAILABLE:
+                raise ValueError(unsupported_msg(f"output format '{ext}'"))
             return comp
     for ext in _UNSUPPORTED_EXTS:
         if low.endswith(ext):
-            raise ValueError(f"Compression format '{ext}' is not supported.")
+            raise ValueError(f"compression format '{ext}' is not supported.")
     return ''
 
 
-def _iter_entries(root: str, arcroot: str, skip_top_level=()):
-    """Yield *(src_path, arcname)* for every entry under *root*.
+def _listing(dir_fd: int) -> list:
+    """Sorted entry names of the directory dir_fd refers to; [] on failure."""
+    try:
+        return dirfd.listdir_at(dir_fd)
+    except OSError:
+        return []
 
-    Symlinks to subdirectories are yielded as single entries; os.walk is
-    prevented from descending into them. All sibling entries are sorted.
 
-    *skip_top_level* is a collection of directory names that should be
-    omitted when they appear directly under *root* (no descent, no
-    yielded entry). Used to exclude proot's `.l2s/` backing store
-    whose contents are inlined into symlinks elsewhere in the tree.
+def _walk_tree(parent_fd, name, arcname, path, visit, skip=()):
+    """Visit *name* under parent_fd and everything below it, depth first.
+
+    ``visit(dir_fd, entry, arcname, path, st)`` is called for the entry
+    itself before anything it contains, so a directory member always
+    precedes what it holds — which is what `restore` needs, and what lets
+    the permission pass relax a directory just before this walk enters it.
+
+    Every call is addressed as (directory fd, single name); *path* comes
+    along only because resolve_l2s_target() has to know where a symlink sat
+    to make sense of a relative target, and it is never opened by name —
+    open_l2s_backing() re-walks it from a descriptor on the rootfs.
+
+    Directories are carried on an explicit stack rather than by recursion:
+    how deep the tree goes is the guest's choice, and one past the
+    interpreter's limit would end the backup in a RecursionError. How many
+    descriptors that costs is bounded too (dirfd.Levels): one per level
+    ran the process out of them partway down a deep rootfs, and each
+    directory the walk could then not open was skipped silently, so the
+    archive came back missing everything below that depth and said so
+    nowhere.
+
+    *skip* names entries left out at the top level only — proot's `.l2s/`
+    store, whose files are inlined into the symlinks that refer to them.
     """
-    skip = set(skip_top_level)
-    for dirpath, dirnames, filenames in os.walk(
-        root, followlinks=False, topdown=True
-    ):
-        rel = os.path.relpath(dirpath, root)
-        if rel == '.' and skip:
-            dirnames[:] = [d for d in dirnames if d not in skip]
-        # Sort up front so every sibling — symlink-to-dir yields below,
-        # subsequent descents, and file yields further down — comes out
-        # in deterministic order.
-        dirnames.sort()
-        arc_dir = arcroot if rel == '.' else os.path.join(arcroot, rel)
+    try:
+        st = dirfd.lstat_at(parent_fd, name)
+    except OSError:
+        return
+    visit(parent_fd, name, arcname, path, st)
+    if not stat.S_ISDIR(st.st_mode):
+        return
+    try:
+        fd = dirfd.opendir_at(parent_fd, name)
+    except OSError:
+        return
 
-        yield (dirpath, arc_dir)
+    pending = [n for n in _listing(fd) if n not in skip]
+    pending.reverse()
+    # Frame layout: [fd, None, arcname, path, pending, owned] — the two
+    # descriptor slots first and `owned` last, so close_frames() unwinds it.
+    stack = [[fd, None, arcname, path, pending, True]]
+    levels = dirfd.Levels(stack)
+    try:
+        while stack:
+            fd, _, arc_dir, dir_path, pending, _ = stack[-1]
+            if not pending:
+                levels.pop()
+                os.close(fd)
+                continue
+            child = pending.pop()
+            child_arc = os.path.join(arc_dir, child)
+            child_path = os.path.join(dir_path, child)
+            try:
+                cst = dirfd.lstat_at(fd, child)
+            except OSError:
+                continue
+            visit(fd, child, child_arc, child_path, cst)
+            if not stat.S_ISDIR(cst.st_mode):
+                continue
+            try:
+                sub = dirfd.opendir_at(fd, child)
+            except OSError:
+                continue
+            names = _listing(sub)
+            names.reverse()
+            levels.push([sub, None, child_arc, child_path, names, True])
+    except BaseException:
+        dirfd.close_frames(stack)
+        raise
 
-        i = 0
-        while i < len(dirnames):
-            d = dirnames[i]
-            if os.path.islink(os.path.join(dirpath, d)):
-                yield (os.path.join(dirpath, d), os.path.join(arc_dir, d))
-                dirnames.pop(i)
-            else:
-                i += 1
 
-        for fname in sorted(filenames):
-            yield (os.path.join(dirpath, fname), os.path.join(arc_dir, fname))
+def _each_entry(container_fd, container_name, rootfs_dir, manifest_path,
+                visit):
+    """Call *visit* for manifest.json, then for every entry of the rootfs.
+
+    Both live directly under the container directory, and *container_fd*
+    is the descriptor the whole command holds on it -- opened once, by
+    the O_NOFOLLOW walk, and never resolved again. Opening
+    `containers/<name>` here was the one step of this command still done
+    by name, and it was done three times (relax, measure, archive): the
+    directory is guest-writable on Termux and `backup` holds only a
+    shared lock, so a live session could re-point it between the
+    installed check and any of them and have the pass run against a host
+    directory of its choosing.
+    """
+    manifest_name = os.path.basename(manifest_path)
+    rootfs_name = os.path.basename(rootfs_dir)
+    # manifest.json is optional (legacy containers have none) and is
+    # only ever a plain file; anything else under that name is skipped
+    # rather than followed.
+    try:
+        mst = dirfd.lstat_at(container_fd, manifest_name)
+    except OSError:
+        mst = None
+    if mst is not None and stat.S_ISREG(mst.st_mode):
+        visit(container_fd, manifest_name,
+              os.path.join(container_name, manifest_name),
+              manifest_path, mst)
+    _walk_tree(container_fd, rootfs_name,
+               os.path.join(container_name, rootfs_name), rootfs_dir,
+               visit, skip=(".l2s",))
 
 
 class _ReadCounter:
@@ -141,11 +254,19 @@ class _ReadCounter:
         return getattr(self._fh, name)
 
 
+def _strip_owner(info: tarfile.TarInfo) -> None:
+    """Zero the ownership fields: a restore must not depend on host ids."""
+    info.uid = 0
+    info.gid = 0
+    info.uname = ''
+    info.gname = ''
+
+
 def _add_path(
-    tf: tarfile.TarFile, src: str, arcname: str,
-    rootfs: str, on_read=None,
+    tf: tarfile.TarFile, dir_fd: int, name: str, arcname: str,
+    path: str, st, rootfs: str, rootfs_fd: int, on_read=None,
 ) -> None:
-    """Add *src* to *tf* as *arcname*, stripping ownership info.
+    """Add *name* under dir_fd to *tf* as *arcname*, stripping ownership.
 
     Block/character devices, FIFOs, and sockets are silently skipped.
     Symlinks are stored as symlinks (not followed) unless they are
@@ -156,103 +277,176 @@ def _add_path(
     restored to a different path. Regular files and directories are
     stored with their permissions intact.
 
+    *st* is the lstat the walk already took, and it decides the member's
+    type; *path* is the entry's host path, used only to make sense of a
+    relative l2s target. Every filesystem call goes through (dir_fd, name),
+    so nothing here can be redirected by an entry swapped for a symlink
+    since the walk saw it — which a live session sharing the container's
+    shared lock is free to do.
+
     *rootfs* is the container's rootfs root, used to confine resolved
-    l2s targets to the rootfs subtree.
+    l2s targets to the rootfs subtree; *rootfs_fd* is the descriptor the
+    command pinned it as, which is what the backing file is then opened
+    through — resolving the rootfs path again would undo the pin.
 
     *on_read*, when provided, is called with the byte count of each chunk
     read from a regular file so callers can track progress during compression.
     """
-    try:
-        st = os.lstat(src)
-    except OSError:
-        return
     m = st.st_mode
     if (stat.S_ISBLK(m) or stat.S_ISCHR(m)
             or stat.S_ISFIFO(m) or stat.S_ISSOCK(m)):
         return
 
-    # Detect proot link2symlink symlinks (regardless of whether their
-    # intermediate is stashed in <rootfs>/.l2s/ or alongside the
-    # original) and pack their backing files' content as regular
-    # files. Multiple l2s symlinks sharing one backing file become
-    # independent regular files in the archive — the guest-side
-    # hard-link semantics are lost, file content is preserved, and
-    # the archive carries no absolute paths into the source rootfs
-    # that would dangle after restore.
     if stat.S_ISLNK(m):
         try:
-            target = os.readlink(src)
+            target = os.readlink(name, dir_fd=dir_fd)
         except OSError:
-            target = None
-        if target is not None:
-            l2s_path = resolve_l2s_target(src, target, rootfs)
-            if l2s_path is not None:
+            return
+        # Detect proot link2symlink symlinks (regardless of whether their
+        # intermediate is stashed in <rootfs>/.l2s/ or alongside the
+        # original) and pack their backing files' content as regular
+        # files. Multiple l2s symlinks sharing one backing file become
+        # independent regular files in the archive — the guest-side
+        # hard-link semantics are lost, file content is preserved, and
+        # the archive carries no absolute paths into the source rootfs
+        # that would dangle after restore.
+        l2s_path = resolve_l2s_target(path, target, rootfs)
+        if l2s_path is not None:
+            # Through a descriptor, not the name: the resolve and the
+            # read are two steps and backup holds only a shared lock,
+            # so a live session could re-point a component in between
+            # (see l2s.open_l2s_backing).
+            opened = open_l2s_backing(rootfs, l2s_path,
+                                      rootfs_fd=rootfs_fd)
+            if opened is not None:
+                cfd, cst = opened
                 try:
-                    cst = os.stat(l2s_path)
-                except OSError:
-                    cst = None
-                if cst is not None and stat.S_ISREG(cst.st_mode):
                     info = tarfile.TarInfo(arcname)
                     info.type = tarfile.REGTYPE
                     info.size = cst.st_size
                     info.mode = stat.S_IMODE(cst.st_mode)
                     info.mtime = int(cst.st_mtime)
-                    info.uid = 0
-                    info.gid = 0
-                    info.uname = ''
-                    info.gname = ''
+                    _strip_owner(info)
                     try:
-                        with open(l2s_path, 'rb') as fh:
-                            tf.addfile(
-                                info,
-                                _ReadCounter(fh, on_read) if on_read else fh,
-                            )
+                        fh = open(cfd, 'rb', closefd=False)
+                        tf.addfile(
+                            info,
+                            _ReadCounter(fh, on_read) if on_read else fh,
+                        )
                     except OSError:
                         pass
-                    return
-                # Backing file missing or non-regular: fall through and
-                # store the symlink as-is.
+                finally:
+                    os.close(cfd)
+                return
+            # Backing file missing, unreadable or non-regular: fall
+            # through and store the symlink as-is.
+        info = tarfile.TarInfo(arcname)
+        info.type = tarfile.SYMTYPE
+        info.linkname = target
+        info.size = 0
+        info.mode = stat.S_IMODE(m)
+        info.mtime = int(st.st_mtime)
+        _strip_owner(info)
+        tf.addfile(info)
+        return
+
+    if stat.S_ISDIR(m):
+        info = tarfile.TarInfo(arcname)
+        info.type = tarfile.DIRTYPE
+        info.size = 0
+        info.mode = stat.S_IMODE(m)
+        info.mtime = int(st.st_mtime)
+        _strip_owner(info)
+        tf.addfile(info)
+        return
+
+    if not stat.S_ISREG(m):
+        return
 
     try:
-        info = tf.gettarinfo(src, arcname=arcname)
+        fd, _fst = dirfd.open_regular_at(dir_fd, name, os.O_RDONLY)
     except OSError:
         return
-    info.uid = 0
-    info.gid = 0
-    info.uname = ''
-    info.gname = ''
-    if stat.S_ISREG(m):
-        try:
-            with open(src, 'rb') as fh:
-                tf.addfile(info, _ReadCounter(fh, on_read) if on_read else fh)
-        except OSError:
-            pass
+    try:
+        fh = open(fd, 'rb', closefd=False)
+        # gettarinfo off the open descriptor rather than the name. It is
+        # what keeps tarfile's (dev, ino) table, so a second name for a
+        # file already in the archive becomes a hard-link member instead
+        # of a second copy of the content; and taking the size from the
+        # fd we are about to read means the header describes the very
+        # inode whose bytes follow it.
+        info = tf.gettarinfo(arcname=arcname, fileobj=fh)
+        _strip_owner(info)
+        tf.addfile(info, _ReadCounter(fh, on_read) if on_read else fh)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _relax_permissions(dir_fd, name, arcname, _path, st) -> None:
+    """Make one entry readable by its owner, best effort.
+
+    Called for every entry *before* the walk descends into it, so a
+    directory the backup could not otherwise enter is opened on the next
+    step. os.walk() could not do that: it lists a directory before handing
+    it over, so a chmod-000 one was skipped outright and its whole subtree
+    stayed out of the archive.
+
+    The chmod goes through a descriptor (dirfd.chmod_at): naming the entry
+    would hand the mode change to whatever a symlink planted since the
+    lstat points at, which is a host file with bits of the guest's
+    choosing.
+
+    A regular file carrying more than one link is left exactly as it is.
+    A hardlink is the file itself under a second name -- O_NOFOLLOW says
+    nothing about one and no descriptor can tell a link a guest made to a
+    *host* file from an ordinary rootfs entry -- so this pass, which is
+    the one place `backup` writes to an inode it did not create, would
+    hand the container owner bits on any file the host had put within its
+    reach. That the guest can reach it at all is what makes the link
+    possible, so the file may well be one it could chmod directly; the
+    rule the rest of the program follows is not to be the instrument
+    either way. The count is read twice, and each read has its own job:
+    the walk's lstat is what can still name the entry in a warning --
+    a file left unreadable is one the archiving pass cannot open and
+    drops silently -- while single_link=True re-reads it off the
+    descriptor chmod_at itself opens, which is what actually refuses,
+    since an entry can gain a link between the two.
+    """
+    m = st.st_mode
+    if stat.S_ISDIR(m):
+        needed = stat.S_IRUSR | stat.S_IXUSR
+    elif stat.S_ISREG(m):
+        needed = stat.S_IRUSR
+        if m & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
+            needed |= stat.S_IXUSR
     else:
-        tf.addfile(info)  # directories and symlinks carry no data stream
+        return
+    mode = stat.S_IMODE(m)
+    if mode | needed == mode:
+        return
+    if stat.S_ISREG(m) and st.st_nlink != 1:
+        # The arcname carries names the guest chose; an ESC in one
+        # repaints the terminal.
+        warn(f"'{quote_path(arcname)}' is unreadable and has more than "
+             f"one hard link; leaving its permissions alone. It may be "
+             f"missing from the archive.")
+        return
+    dirfd.chmod_at(dir_fd, name, mode | needed,
+                   single_link=stat.S_ISREG(m))
 
 
-def _fix_permissions(rootfs_dir: str) -> None:
-    """Ensure all dirs and files in *rootfs_dir* are readable by owner."""
-    for dirpath, _dirs, files in os.walk(rootfs_dir):
-        try:
-            os.chmod(
-                dirpath,
-                os.stat(dirpath).st_mode | stat.S_IRUSR | stat.S_IXUSR,
-            )
-        except OSError:
-            pass
-        for fname in files:
-            fpath = os.path.join(dirpath, fname)
-            try:
-                fst = os.lstat(fpath)
-                if stat.S_ISREG(fst.st_mode):
-                    mode = fst.st_mode
-                    if mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
-                        os.chmod(fpath, mode | stat.S_IRUSR | stat.S_IXUSR)
-                    else:
-                        os.chmod(fpath, mode | stat.S_IRUSR)
-            except OSError:
-                pass
+def _fix_permissions(container_fd: int, rootfs_dir: str) -> None:
+    """Ensure all dirs and files in *rootfs_dir* are readable by owner.
+
+    Named off the container directory's own descriptor, like the two
+    passes that follow it: this one *writes* -- it chmods what it walks
+    -- so resolving `containers/<name>` again would hand those mode
+    changes to whatever the name led to by then.
+    """
+    _walk_tree(container_fd, os.path.basename(rootfs_dir), '', rootfs_dir,
+               _relax_permissions)
 
 
 def command_backup(args) -> None:
@@ -267,7 +461,7 @@ def command_backup(args) -> None:
     rootfs_dir = container_rootfs(container_name)
     manifest_path = container_manifest(container_name)
 
-    if not os.path.isdir(rootfs_dir):
+    if not container_is_installed(container_name):
         crit_error(_("container '{container_name}' does not exist.", container_name = container_name))
         sys.exit(1)
 
@@ -290,7 +484,7 @@ def command_backup(args) -> None:
             try:
                 compression = _compression_mode(output_path)
             except ValueError as exc:
-                crit_error(str(exc).lower())
+                crit_error(str(exc))
                 sys.exit(1)
     else:
         if sys.stdout.isatty():
@@ -305,15 +499,38 @@ def command_backup(args) -> None:
             else ''
         )
 
+    # `--compress zstd` stays a valid choice on every interpreter so the
+    # refusal can say why instead of argparse's bare "invalid choice".
+    if compression == 'zst' and not ZSTD_AVAILABLE:
+        crit_error(unavailable_msg("compression type 'zstd'"))
+        sys.exit(1)
+
     with ContainerLock(container_name, exclusive=False, command="backup"):
-        _run_backup(
-            container_name, rootfs_dir, manifest_path,
-            output_path, compression, verbose,
-        )
+        # One descriptor on containers/<name> for the whole run, taken
+        # by the same O_NOFOLLOW walk the installed check used, and one
+        # on the rootfs below it. Everything after this is named as
+        # (dir_fd, entry): the three passes used to reopen
+        # containers/<name> by path, and `backup` holds only a shared
+        # lock on purpose, so a live session was free to re-point it in
+        # between and have the permission pass chmod -- and the archiver
+        # pack -- a host directory of its choosing.
+        try:
+            container_fd, rootfs_fd = open_container_pair(container_name)
+        except FileNotFoundError:
+            crit_error(f"container '{container_name}' does not exist.")
+            sys.exit(1)
+        try:
+            _run_backup(
+                container_fd, rootfs_fd, container_name, rootfs_dir,
+                manifest_path, output_path, compression, verbose,
+            )
+        finally:
+            os.close(rootfs_fd)
+            os.close(container_fd)
 
 
 def _run_backup(
-    container_name, rootfs_dir, manifest_path,
+    container_fd, rootfs_fd, container_name, rootfs_dir, manifest_path,
     output_path, compression, verbose,
 ):
     log_info(_("Backing up '{container_name}'...", container_name = container_name))
@@ -324,49 +541,40 @@ def _run_backup(
         log_info(_("Will write backup data to stdout."))
 
     log_info(_("Fixing file permissions in rootfs..."))
-    _fix_permissions(rootfs_dir)
-
-    # Build the list of entries: manifest.json first, then rootfs tree.
-    # Archive prefix is just the container name (e.g. "ubuntu/").
-    # `.l2s` is skipped at the rootfs root because its files are inlined
-    # into their referring symlinks by _add_path.
-    arc_prefix = container_name
-    entries = []
-    # manifest.json (optional — may not exist for legacy containers).
-    if os.path.isfile(manifest_path):
-        entries.append((manifest_path, os.path.join(arc_prefix, "manifest.json")))
-    # rootfs tree.
-    entries.extend(_iter_entries(
-        rootfs_dir, os.path.join(arc_prefix, "rootfs"),
-        skip_top_level=(".l2s",),
-    ))
+    _fix_permissions(container_fd, rootfs_dir)
 
     # Pre-compute total size of payload bytes to drive the progress bar.
     # Regular files contribute their own size; l2s symlinks contribute
     # the size of their backing file (since _add_path will inline that
-    # content in place of the symlink).
+    # content in place of the symlink). The archive prefix is just the
+    # container name (e.g. "ubuntu/"); `.l2s` is left out at the rootfs
+    # root because its files are inlined into their referring symlinks.
     total_size = 0
-    for src, _arc in entries:
-        try:
-            st = os.lstat(src)
-        except OSError:
-            continue
+
+    def _measure(dir_fd, name, _arc, path, st) -> None:
+        nonlocal total_size
         if stat.S_ISREG(st.st_mode):
             total_size += st.st_size
-        elif stat.S_ISLNK(st.st_mode):
-            try:
-                target = os.readlink(src)
-            except OSError:
-                continue
-            l2s_path = resolve_l2s_target(src, target, rootfs_dir)
-            if l2s_path is None:
-                continue
-            try:
-                cst = os.stat(l2s_path)
-            except OSError:
-                continue
-            if stat.S_ISREG(cst.st_mode):
-                total_size += cst.st_size
+            return
+        if not stat.S_ISLNK(st.st_mode):
+            return
+        try:
+            target = os.readlink(name, dir_fd=dir_fd)
+        except OSError:
+            return
+        l2s_path = resolve_l2s_target(path, target, rootfs_dir)
+        if l2s_path is None:
+            return
+        opened = open_l2s_backing(rootfs_dir, l2s_path,
+                                  rootfs_fd=rootfs_fd)
+        if opened is None:
+            return
+        cfd, cst = opened
+        os.close(cfd)
+        total_size += cst.st_size
+
+    _each_entry(container_fd, container_name, rootfs_dir, manifest_path,
+                _measure)
 
     done_size = 0
 
@@ -389,21 +597,38 @@ def _run_backup(
 
     def _on_entry(arc: str) -> None:
         if verbose:
-            log_info(_("Adding: '{arc}'", arc = arc))
+            # The arcname carries the rootfs entry's own name, which the
+            # guest chose; an ESC in one repaints the terminal.
+            log_info(_("Adding: '{arc}'", arc=quote_path(arc)))
         _draw_bar()
 
-    try:
+    def _open_archive():
+        """Return the context manager producing the TarFile to write."""
+        if compression == 'zst':
+            # Not tarfile's own zstd mode: `w|zst` refuses a compression
+            # level, so a piped backup would be stuck at libzstd's
+            # default while `-o file.tar.zst` could pick one. See
+            # proot_distro.compress.
+            return open_tar_writer(
+                output_path,
+                None if output_path else sys.stdout.buffer,
+            )
         tar_mode = f'w:{compression}' if output_path else f'w|{compression}'
-        tar_target = output_path if output_path else sys.stdout.buffer
-
-        with tarfile.open(
-            tar_target if output_path else None,
-            fileobj=None if output_path else tar_target,
+        return tarfile.open(
+            output_path if output_path else None,
+            fileobj=None if output_path else sys.stdout.buffer,
             mode=tar_mode,
-        ) as tf:
-            for src, arc in entries:
-                _add_path(tf, src, arc, rootfs_dir, on_read=_on_read)
+        )
+
+    try:
+        with _open_archive() as tf:
+            def _archive(dir_fd, name, arc, path, st) -> None:
+                _add_path(tf, dir_fd, name, arc, path, st, rootfs_dir,
+                          rootfs_fd, on_read=_on_read)
                 _on_entry(arc)
+
+            _each_entry(container_fd, container_name, rootfs_dir,
+                        manifest_path, _archive)
 
         clear_bar()
         log_info(_("Finished backing up."))
@@ -419,7 +644,7 @@ def _run_backup(
         sys.exit(1)
     except (OSError, tarfile.TarError) as exc:
         clear_bar()
-        log_error(_("Failed to create backup archive: {exc}", exc = exc))
+        log_error(_("Failed to create backup archive: {exc}", exc = quote_error(exc)))
         if output_path:
             try:
                 os.remove(output_path)

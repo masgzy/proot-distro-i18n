@@ -18,16 +18,16 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 #
 
-# Architecture: CLI entry point. Most of the heavy lifting now lives
+# Architecture: CLI entry point. Most of the heavy lifting lives
 # elsewhere:
 #
 #   parser.py             — argparse construction + ALIAS_TO_CANONICAL.
 #   commands/help/        — HELP_COMMANDS dispatcher + per-command pages.
 #   commands/*            — one module (or subpackage) per subcommand.
 #
-# main() routes signals, checks the runtime environment (root warn,
-# nested-proot rejection, proot probe), runs the parser, validates
-# required positionals, and dispatches to the matching command.
+# main() routes signals, checks the runtime environment (nested-proot
+# rejection, proot probe), runs the parser, validates required
+# positionals, and dispatches to the matching command.
 
 import os
 import shutil
@@ -40,7 +40,7 @@ from proot_distro.i18n import _
 from proot_distro.message import C, msg, set_quiet, crit_error
 from proot_distro.arch import get_proot_bin
 from proot_distro.parser import (
-    ALIAS_TO_CANONICAL, REQUIRED_ARGS, build_parser,
+    ALIAS_TO_CANONICAL, build_parser, required_args_for,
 )
 from proot_distro.commands.help import command_help, HELP_COMMANDS
 from proot_distro.commands.install import command_install
@@ -60,6 +60,7 @@ from proot_distro.commands.push import command_push
 from proot_distro.commands.ps import command_ps
 from proot_distro.commands.kill import command_kill
 from proot_distro.commands.mirror import command_mirror
+from proot_distro.commands.search import command_search
 
 
 _COMMAND_HANDLERS = {
@@ -80,6 +81,7 @@ _COMMAND_HANDLERS = {
     "ps":          command_ps,
     "kill":        command_kill,
     "mirror":      command_mirror,
+    "search":      command_search,
     "help":        command_help,
 }
 
@@ -107,6 +109,15 @@ def _refuse_nested_proot() -> None:
     Defensive parsing: if /proc/self/status is malformed (TracerPid line
     missing or non-numeric), we skip the check rather than crashing.
     """
+    err_message = (
+        f"attempted to run {PROGRAM_NAME} in a proot session. "
+        "Please check your system configuration to ensure that this program "
+        "does not run under any other proot instance. Additionally check the "
+        f"target container to ensure it does not invoke {PROGRAM_NAME} on "
+        "a loop basis. With 100% confidence this is not a mistake. Do not "
+        "send bug reports!"
+    )
+
     try:
         with open(f"/proc/{os.getpid()}/status") as fh:
             for line in fh:
@@ -125,8 +136,7 @@ def _refuse_nested_proot() -> None:
                     with open(f"/proc/{tracer_pid}/status") as tfh:
                         for tline in tfh:
                             if tline.startswith("Name:") and "proot" in tline:
-                                crit_error(f"{PROGRAM_NAME} "
-                                           f"{_('should not be executed under PRoot.')}")
+                                crit_error(_(err_message))
                                 sys.exit(1)
                 except OSError:
                     return
@@ -137,11 +147,14 @@ def _refuse_nested_proot() -> None:
 
 # Commands that never invoke proot — exempt from the proot-on-PATH
 # startup probe. Documented inline so future commands can opt in.
-_PROOT_EXEMPT_COMMANDS = frozenset({"build", "push", "kill", "ps", "mirror", "help"})
+_PROOT_EXEMPT_COMMANDS = frozenset({"build", "push", "kill", "ps", "mirror", "search", "help"})
 
 
 def ensure_proot_installed() -> None:
-    """Verify proot is on PATH; offer to install it on Termux (TTY only).
+    """Verify proot is usable; offer to install it on Termux (TTY only).
+
+    A PD_PROOT_BIN override is validated by get_proot_bin() and nothing
+    else is probed; without one, proot must be on PATH.
 
     Exits the process when proot is unavailable and cannot be installed
     (or the user declines the offer). Shared by the startup probe and by
@@ -194,7 +207,7 @@ def ensure_proot_installed() -> None:
 
 
 def _ensure_proot_available(first_canonical: str) -> None:
-    """Verify proot is on PATH; offer to install it on Termux.
+    """Run the startup proot probe (see ensure_proot_installed).
 
     `build` and `push` are exempt from this startup probe: `build` may
     run a Dockerfile with no RUN instructions in pure-Python mode, and
@@ -206,7 +219,9 @@ def _ensure_proot_available(first_canonical: str) -> None:
     invoke proot. `mirror` is exempt as well: it only does HTTP probes
     against registries and never invokes proot, so users can fix a
     broken registry source even without proot installed. `help` is
-    exempt because help text should always render.
+    exempt because help text should always render. So is `search`,
+    which only queries Docker Hub — refusing to look up an image
+    because the runtime for it is not installed yet would be backwards.
     """
     if first_canonical in _PROOT_EXEMPT_COMMANDS:
         return
@@ -278,7 +293,6 @@ def main() -> None:
     for sig in (signal.SIGQUIT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, _sigquit_to_keyboard_interrupt)
 
-    _warn_if_root()
     _refuse_nested_proot()
 
     first_canonical = ""
@@ -346,7 +360,7 @@ def main() -> None:
         msg()
         sys.exit(1)
 
-    for arg_name, error_msg in REQUIRED_ARGS.get(canonical, []):
+    for arg_name, error_msg in required_args_for(canonical, args):
         if getattr(args, arg_name, None) is None:
             msg()
             crit_error(_(error_msg))
@@ -360,7 +374,9 @@ def main() -> None:
     # (helpers/docker, helpers/download, etc.) silence their info
     # lines and progress bars too. `list`, `ps` and `mirror` have different
     # --quiet semantics (print names / PIDs / URLs only) and do not use
-    # log_info(), so the global flag is left off for them.
+    # log_info(), so the global flag is left off for them. `search`
+    # means both — bare names on stdout *and* no info lines, including
+    # the retry notices its helper emits — so it keeps the flag.
     if canonical not in ("list", "ps", "mirror") and getattr(args, "quiet", False):
         set_quiet(True)
 

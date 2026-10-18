@@ -29,6 +29,15 @@
 #       │ waitpid      ▼ (reaped; grandchild   │ register_session()
 #       │ read pid ◀────  reparented to init)  │ write pid to pipe
 #       ▼ return pid                           └ execvpe(proot)
+#                                                 │ (refused: write the
+#                                                 ▼  reason, _exit)
+#
+# The pipe is the daemon's only way of saying anything -- its standard
+# streams are /dev/null by then -- and the write end is CLOEXEC, so a
+# successful exec closes it and the foreground reads the PID alone. A
+# refused exec (E2BIG from an environment too large in total, ENOMEM,
+# a NUL in the argv) writes the reason after the PID instead, and the
+# foreground reports that rather than a session that never started.
 #
 # setsid() puts the daemon in a new session with no controlling
 # terminal, so closing the launching terminal won't SIGHUP it; the
@@ -42,16 +51,25 @@
 
 import os
 
+from proot_distro.message import log_error, quote_path
 from proot_distro.session import register_session
 
 
-def spawn_detached(proot_bin, proot_args, child_env, *, register_kwargs):
+def spawn_detached(proot_bin, proot_args, child_env, *, register_kwargs,
+                   rootfs_fd=None):
     """Launch proot as a detached daemon; return its PID, or None.
 
     Called from the foreground process in place of the usual
     register_session()+os.execvpe() tail. Returns the daemon's PID to
     the foreground (None if the daemon could not be started). The
     foreground never returns from inside the forked children.
+
+    *rootfs_fd* is the descriptor the container's rootfs was pinned as.
+    The daemon chdirs into it before the exec, for the same reason the
+    foreground path does (see login._exec_proot): the argv says
+    `--rootfs=.` so proot resolves the guest root against an inode
+    rather than a name. The chdir happens in the grandchild, so the
+    foreground's own working directory is left alone.
     """
     try:
         read_fd, write_fd = os.pipe()
@@ -72,7 +90,7 @@ def spawn_detached(proot_bin, proot_args, child_env, *, register_kwargs):
         raw = b""
         try:
             while True:
-                chunk = os.read(read_fd, 64)
+                chunk = os.read(read_fd, 4096)
                 if not chunk:
                     break
                 raw += chunk
@@ -83,9 +101,15 @@ def spawn_detached(proot_bin, proot_args, child_env, *, register_kwargs):
             os.waitpid(pid1, 0)
         except OSError:
             pass
+        # The PID on the first line; a second line is the daemon saying
+        # its exec was refused, which is not a session.
+        pid_text, _, reason = raw.decode(errors="replace").partition("\n")
+        if reason:
+            log_error(f"cannot execute proot: {quote_path(reason.strip())}")
+            return None
         try:
-            return int(raw.decode().strip())
-        except (UnicodeDecodeError, ValueError):
+            return int(pid_text.strip())
+        except ValueError:
             return None
 
     # Intermediate child. Detach into a new session, then fork the
@@ -109,17 +133,30 @@ def spawn_detached(proot_bin, proot_args, child_env, *, register_kwargs):
     # (and soon /dev/null) standard streams.
     try:
         _redirect_std_to_devnull()
+        if rootfs_fd is not None:
+            os.fchdir(rootfs_fd)
         # Keep a reference until execvpe so the session fd (and its
         # inherited flock) is not closed early. Best-effort.
         _session_fd = register_session(**register_kwargs)  # noqa: F841
         try:
-            os.write(write_fd, str(os.getpid()).encode())
+            os.write(write_fd, f"{os.getpid()}\n".encode())
         except OSError:
             pass
-        _safe_close(write_fd)
-        os.execvpe(proot_bin, proot_args, child_env)
+        # The write end stays open across the exec on purpose: it is
+        # CLOEXEC, so success closes it and the foreground sees EOF,
+        # while a refusal is reported through it below. Closing it here
+        # first was what let a refused exec pass for a started session.
+        try:
+            os.execvpe(proot_bin, proot_args, child_env)
+        except (OSError, ValueError) as exc:
+            reason = getattr(exc, "strerror", None) or str(exc)
+            try:
+                os.write(write_fd, reason.encode(errors="replace"))
+            except OSError:
+                pass
     except BaseException:
         pass
+    _safe_close(write_fd)
     os._exit(127)
 
 

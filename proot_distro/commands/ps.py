@@ -19,18 +19,27 @@
 #
 
 # Architecture: Lists active proot sessions reported by the session
-# registry (session.py). active_sessions() already prunes dead entries,
-# so this module only formats output. --quiet prints one PID per line
-# (to stdout, for piping into kill/xargs); the default renders a colored
+# registry (session.py). active_sessions() already prunes dead entries
+# and validates every field it hands back, so this module only formats
+# output. --quiet prints one PID per line (to stdout, for piping into
+# kill/xargs); the default renders a colored
 # PID/CONTAINER/TYPE/USER/UPTIME/COMMAND table to stderr, mirroring the
 # style of command_list.
+#
+# Two of those columns are free text: the `--user` the session was
+# started with and the argv it runs. Both are read back out of
+# SESSIONS_DIR, which is guest-writable on Termux, and a guest can write
+# a record for a PID of its own -- so an ESC in either would repaint the
+# terminal of whoever runs `ps`. They go through quote_path, the same
+# rule every name read off a filesystem follows. CONTAINER and TYPE need
+# no such treatment: the registry only reports a container name this
+# program would accept and a kind out of a closed vocabulary.
 
-import os
 import shlex
 import time
 
 from proot_distro.constants import PROGRAM_NAME
-from proot_distro.message import C, msg
+from proot_distro.message import C, msg, quote_path, terminal_width
 from proot_distro.session import active_sessions
 from proot_distro.i18n import _
 
@@ -46,7 +55,7 @@ def command_ps(args) -> None:
 
     if quiet:
         for sess in sessions:
-            print(sess.get("pid", ""))
+            print(sess["pid"])
         return
 
     msg()
@@ -59,15 +68,15 @@ def command_ps(args) -> None:
         return
 
     now = time.time()
-    any_detached = any(s.get("detach") for s in sessions)
+    any_detached = any(s["detach"] for s in sessions)
     rows = [
         (
-            str(sess.get("pid", "?")),
-            str(sess.get("container", "?")),
-            str(sess.get("kind", "?")) + ("*" if sess.get("detach") else ""),
-            str(sess.get("user", "?")),
-            _fmt_uptime(now - sess.get("start_time", now)),
-            _fmt_command(sess.get("command")),
+            str(sess["pid"]),
+            sess["container"],
+            sess["kind"] + ("*" if sess["detach"] else ""),
+            quote_path(sess["user"]),
+            _fmt_uptime(now - sess["start_time"]),
+            _fmt_command(sess["command"]),
         )
         for sess in sessions
     ]
@@ -79,7 +88,7 @@ def command_ps(args) -> None:
         for i in range(len(_HEADERS) - 1)
     ]
     used = sum(widths) + _GAP * len(widths)
-    cmd_width = max(len(_HEADERS[-1]), _table_width() - used)
+    cmd_width = max(len(_HEADERS[-1]), terminal_width() - used)
 
     pad = " " * _GAP
     head = [_HEADERS[i].ljust(widths[i]) for i in range(len(widths))]
@@ -117,26 +126,13 @@ def _fmt_uptime(seconds: float) -> str:
 
 
 def _fmt_command(command) -> str:
-    """Render the recorded inner argv as a single shell-style string."""
-    if isinstance(command, (list, tuple)):
-        parts = [str(c) for c in command]
-        try:
-            return shlex.join(parts)
-        except (TypeError, ValueError):
-            return " ".join(parts)
-    return str(command or "")
+    """Render the recorded inner argv as a single shell-style string.
 
-
-def _table_width() -> int:
-    """Actual terminal column count (stderr first), defaulting to 80."""
-    for fd in (2, 1):
-        try:
-            cols = os.get_terminal_size(fd).columns
-        except (OSError, ValueError):
-            continue
-        if cols > 0:
-            return cols
-    return 80
+    shlex.join() quotes for a shell, which says nothing about a control
+    character: it wraps an ESC in single quotes and passes it through.
+    quote_path is what makes the result printable.
+    """
+    return quote_path(shlex.join(command))
 
 
 __all__ = ("command_ps",)

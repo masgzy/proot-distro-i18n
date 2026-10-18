@@ -2,7 +2,7 @@
 
 > proot-distro 的完整中文汉化(i18n国际化)版本，附带 Docker registry 镜像源管理子命令、性能优化与逻辑改进。
 >
-> 本 README 对应 `proot-distro-i18n` v5.4.1（2026-07-13）。
+> 本 README 对应 `proot-distro-i18n` v5.10.0（已合并官方 5.5.0 ~ 5.10.0 全部更新）。
 
 ## 目录
 
@@ -31,12 +31,26 @@ PRoot-Distro 是 proot 用户空间模拟器（chroot、mount --bind、binfmt_mi
 
 ## 主要改动
 
+### 本次合并的官方更新（v5.5.0 → v5.10.0）
+
+- **新命令 `search`**：在 Docker Hub 搜索镜像（支持 `--limit`、`--quiet`），结果可直接传给 `install`。
+- **`remove --image` / `list --image`**：直接管理缓存的 OCI 镜像及其层 blob。
+- **`clear-cache --orphan / --build-cache`**：细粒度清理孤立层与构建缓存。
+- **构建系统大幅增强**：多阶段 Dockerfile、`COPY --from`、RUN 缓存（build_cache_index）、Heredoc、`--push` 等。
+- **安全加固**：全方位的 fd（文件描述符）寻址——容器树内的所有操作都通过目录描述符进行，guest 无法用符号链接把宿主目录偷换成攻击目标；引用/摘要钉住（pinned pull）。
+- **zstd 支持**：备份/恢复支持 zstd 压缩（需 Python 3.14+）。
+- **性能**：更快的 tar 提取（dirfd 迭代式遍历，避免递归爆栈）、层完整性回读哈希。
+- **下载链路重构**：重试/重定向策略统一到 download.py，保留本仓库的 TCP 窗口调优并接入新架构。
+
+### 与原版（官方）的差异
+
 | 维度 | 原版 | 本版 |
 |---|---|---|
 | 镜像源 | 硬编码单一源 `https://docker.xuanyuan.run` | 内置 17 个镜像源 + 用户自定义 JSON + `mirror` 子命令（ls/test/use/unset/show） |
-| 语言 | 英文直出 | 默认中文，`PD_LANG=en` 切英文；201 条 msgid 全译；help pages 双语版 |
-| shell 补全 | bash/fish/zsh 英文 + 无 mirror | 三脚本全中文 + 含 mirror 子命令补全 |
+| 语言 | 英文直出 | 默认中文，`PD_LANG=en` 切英文；help pages 双语版 |
+| shell 补全 | bash/fish/zsh 英文 + 无 mirror | 三脚本全中文 + 含 mirror/search 子命令补全 |
 | 性能 | paths.container_* 每次重算 | `lru_cache(maxsize=256)`，8.8x 加速 |
+| 下载 | 单连接串行 | TCP 窗口调优（SO_RCVBUF 2 MiB + TCP_NODELAY）+ 大文件分块并行下载 |
 | 帮助可用性 | 未装 proot 时所有 `-h` 报错 | 任何 `-h`/`--help` 提前到 proot 检查之前 |
 | 配置文件 | 无 | `~/.config/proot-distro/mirror.json`（XDG）或 `$PREFIX/etc/proot-distro/mirror.json`（Termux） |
 

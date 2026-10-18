@@ -30,10 +30,13 @@ import json
 import os
 import re
 
+from proot_distro import dirfd
+from proot_distro.execenv import is_exportable, is_host_exec_var
 from proot_distro.arch import get_device_cpu_arch
 from proot_distro.message import C, log_info
 from proot_distro.helpers.docker import (
-    ARCH_TO_DOCKER, apply_layer, layer_cache_path, pull_image,
+    ARCH_TO_DOCKER, InvalidReference, apply_layer, manifest_config_digest,
+    open_required_layer, parse_reference, pull_image,
 )
 from proot_distro.helpers.dockerfile import expand_vars
 from proot_distro.helpers.rootfs import write_hosts, write_resolv_conf
@@ -50,6 +53,163 @@ from proot_distro.i18n import _
 
 _FROM_RE = re.compile(r"^\s*(\S+)(?:\s+AS\s+(\S+))?\s*$", re.IGNORECASE)
 _FROM_AS_RE = re.compile(r"\s+AS\s+(\S+)\s*$", re.IGNORECASE)
+
+
+
+def _malformed(image_ref: str, what: str):
+    """The one refusal shape for a base image config that will not do."""
+    raise BuildError(
+        f"FROM {image_ref}: the image config is malformed: {what}."
+    )
+
+
+def _cfg_object(value, image_ref: str, what: str) -> dict:
+    if not isinstance(value, dict):
+        _malformed(image_ref, f"{what} is not an object")
+    return value
+
+
+def _cfg_str_list(value, image_ref: str, what: str) -> list:
+    if not isinstance(value, list):
+        _malformed(image_ref, f"{what} is not a list")
+    for entry in value:
+        if not isinstance(entry, str):
+            _malformed(image_ref, f"{what} holds an entry that is not "
+                                  f"a string")
+    return value
+
+
+def _adopt_image_config(image_config, image_ref: str) -> dict:
+    """Return a pulled image's config, held to the shapes read out of it.
+
+    Two things happen here, both at the point a stranger's config is
+    *adopted* rather than where it is used: nothing downstream can
+    re-seed a value, because a stage's env is seeded from this at FROM,
+    `FROM <earlier stage>` deep-copies the whole config, and what the
+    build finally stores as its own image's config comes from here too.
+    One pass, and every one of those is clean by construction.
+
+    The first is the LD_*/PROOT_* filter over `Env`. An ENV line in the
+    user's own Dockerfile still reaches the image config -- it goes
+    through do_env, which writes this same list afterwards, and what a
+    Dockerfile says about the image it produces is its author's
+    business. What no such name reaches from any source is the
+    environment proot itself is exec'd with, which run_step refuses
+    separately (see proot_distro.execenv for the one rule both apply).
+
+    The second is the shape. Every field below is read back by this
+    module or by a handler -- `User` and `Shell` decide what a RUN step
+    runs and who as, `WorkingDir` becomes proot's --cwd, `OnBuild` is
+    parsed as Dockerfile lines, `Env` seeds the stage, `Cmd` and
+    `Entrypoint` are what `run` later executes, `Labels`, `ExposedPorts`
+    and `Volumes` are merged into by their handlers, and `history` is
+    appended to once per instruction. All of it is a registry's JSON (or
+    a manifest-cache entry's, which on Termux sits under the bound
+    $TERMUX_PREFIX and is a guest's to compose), and every consumer
+    subscripted it as the type OCI says it is: `"config": "x"` was an
+    AttributeError at FROM, `"Labels": ["a"]` a ValueError in do_label,
+    `"OnBuild": 5` a TypeError, `"history": null` an AttributeError at
+    the first instruction -- and `build` catches none of those, so each
+    was a traceback.
+
+    A field of the wrong type is a refusal naming it, not a value
+    dropped quietly: two of them decide what runs, and the rest would
+    otherwise be carried into the image this build publishes. Absent and
+    JSON `null` are simply "not set", which is how registries spell an
+    empty field; a `null` is removed rather than left standing, since
+    `.get(key) or default` and `setdefault(key, default)` do not answer
+    alike for one.
+    """
+    doc = _cfg_object(image_config, image_ref, "the document")
+
+    if doc.get("history") is None:
+        doc.pop("history", None)
+    elif not isinstance(doc["history"], list):
+        _malformed(image_ref, "'history' is not a list")
+
+    if doc.get("rootfs") is None:
+        doc.pop("rootfs", None)
+    else:
+        rootfs = _cfg_object(doc["rootfs"], image_ref, "'rootfs'")
+        if rootfs.get("diff_ids") is None:
+            rootfs.pop("diff_ids", None)
+        else:
+            _cfg_str_list(rootfs["diff_ids"], image_ref, "'rootfs.diff_ids'")
+
+    if doc.get("config") is None:
+        doc["config"] = {}
+        return doc
+    cfg = _cfg_object(doc["config"], image_ref, "'config'")
+
+    for key in ("Cmd", "Entrypoint", "OnBuild", "Shell"):
+        if cfg.get(key) is None:
+            cfg.pop(key, None)
+        else:
+            _cfg_str_list(cfg[key], image_ref, f"'config.{key}'")
+
+    for key in ("User", "WorkingDir"):
+        if cfg.get(key) is None:
+            cfg.pop(key, None)
+        elif not isinstance(cfg[key], str):
+            _malformed(image_ref, f"'config.{key}' is not a string")
+
+    for key in ("ExposedPorts", "Volumes"):
+        if cfg.get(key) is None:
+            cfg.pop(key, None)
+        else:
+            # The key set is the whole of what either field says: the
+            # spec's value is an empty object, and both handlers write
+            # one. Rewritten rather than checked, so an inherited value
+            # of any other shape cannot reach the built image either.
+            names = _cfg_object(cfg[key], image_ref, f"'config.{key}'")
+            cfg[key] = {name: {} for name in names}
+
+    if cfg.get("Labels") is None:
+        cfg.pop("Labels", None)
+    else:
+        labels = _cfg_object(cfg["Labels"], image_ref, "'config.Labels'")
+        for value in labels.values():
+            if value is not None and not isinstance(value, str):
+                _malformed(image_ref, "'config.Labels' holds a value that "
+                                      "is not a string")
+        # A null label value is the empty string, as it is to every
+        # other reader of a map of strings.
+        cfg["Labels"] = {k: (v if v is not None else "")
+                         for k, v in labels.items()}
+
+    if cfg.get("Env") is None:
+        cfg.pop("Env", None)
+    else:
+        env_list = _cfg_str_list(cfg["Env"], image_ref, "'config.Env'")
+        # An entry that cannot be an environment string at all -- a
+        # NUL, a lone surrogate, a value past what execve(2) takes --
+        # is dropped here too, the one place a stranger's Env is
+        # adopted: it would otherwise reach the RUN launcher's Popen
+        # (ValueError, not caught as a build error) and the produced
+        # image's config, and a value that was never exportable is not
+        # a statement about the image worth carrying on.
+        cfg["Env"] = [
+            e for e in env_list
+            if not ("=" in e and (
+                is_host_exec_var(e.partition("=")[0])
+                or not is_exportable(*e.partition("=")[::2])
+            ))
+        ]
+
+    return doc
+
+
+def _stage_rootfs_fd(stage):
+    """A private descriptor on *stage*'s rootfs. Raises OSError.
+
+    From the stage's own pinned descriptor when it has one, so the
+    caller's walk starts at the inode the engine created rather than at
+    `<scratch>/stage-N/rootfs`, a name a previous step's leftovers can
+    have re-pointed. The caller owns and closes what comes back.
+    """
+    if stage.rootfs_fd is not None:
+        return dirfd.reopen(stage.rootfs_fd)
+    return dirfd.opendir(stage.rootfs_dir)
 
 
 class BuildEngine:
@@ -71,9 +231,17 @@ class BuildEngine:
                  verbose,
                  quiet,
                  no_cache,
-                 emulator):
+                 emulator,
+                 tmp_root_fd=None):
         self.build_dir = os.path.abspath(build_dir)
         self.tmp_root = tmp_root
+        # The scratch root as a descriptor. Every directory the build
+        # makes inside it -- a stage's, its rootfs -- is created off this
+        # and kept as a descriptor of its own, because the path form is
+        # a name anything running as the invoking user can re-point, and
+        # a RUN step's leftovers are exactly that. None is the shape a
+        # test hands in, and each consumer then keeps the path form.
+        self.tmp_root_fd = tmp_root_fd
         self.target_arch_pd = target_arch_pd
         self.target_arch_docker = ARCH_TO_DOCKER.get(
             target_arch_pd, (target_arch_pd, "")
@@ -97,6 +265,49 @@ class BuildEngine:
         self._stop_after = False
         self._step_no = 0
         self._step_total = 0
+        # True only while the base image's ONBUILD triggers are running,
+        # so do_env can tell a stranger's ENV from the author's.
+        self._firing_onbuild = False
+        # LD_*/PROOT_* names the Dockerfile set and the host-side proot
+        # exec was refused (run_step._refuse_host_exec). Kept per build
+        # so a name is named once rather than once per RUN step.
+        self.warned_host_exec = set()
+
+    def _make_stage_dirs(self, idx):
+        """Create `stage-<idx>/rootfs` and return both descriptors.
+
+        Made off the scratch root's descriptor, one level at a time with
+        O_NOFOLLOW, so the two names cannot be resolved through anything
+        a previous stage left behind -- and what the stage keeps is the
+        descriptors, not the names it made them under.
+
+        Without a pinned scratch root (a test) this falls back to the
+        path form, and the stage carries no descriptors: every consumer
+        then behaves exactly as it did before.
+        """
+        if self.tmp_root_fd is None:
+            rootfs_dir = os.path.join(self.tmp_root, f"stage-{idx}", "rootfs")
+            os.makedirs(rootfs_dir, exist_ok=True)
+            return None, None
+
+        stage_fd = None
+        try:
+            stage_fd = dirfd.descend_at(
+                self.tmp_root_fd, (f"stage-{idx}",), create=True,
+            )
+            rootfs_fd = dirfd.descend_at(stage_fd, ("rootfs",), create=True)
+        except OSError as exc:
+            if stage_fd is not None:
+                os.close(stage_fd)
+            raise BuildError(
+                f"cannot create the scratch tree for stage {idx}: {exc}"
+            ) from exc
+        return stage_fd, rootfs_fd
+
+    def close(self):
+        """Release every stage's descriptors. Idempotent."""
+        for stage in self.stages_by_idx:
+            stage.close()
 
     # ----- public entry point ----------------------------------------------
 
@@ -315,18 +526,27 @@ class BuildEngine:
         idx = len(self.stages_by_idx)
         stage_dir = os.path.join(self.tmp_root, f"stage-{idx}")
         rootfs_dir = os.path.join(stage_dir, "rootfs")
-        os.makedirs(rootfs_dir, exist_ok=True)
+        stage_fd, rootfs_fd = self._make_stage_dirs(idx)
         stage = Stage(
             index=idx, name=stage_name, rootfs_dir=rootfs_dir,
             target_arch_pd=self.target_arch_pd,
+            dir_fd=stage_fd, rootfs_fd=rootfs_fd,
         )
 
-        if base_ref.lower() == "scratch":
-            stage.image_config = {"config": {}}
-        elif base_ref in self.stages:
-            self._inherit_from_stage(stage, self.stages[base_ref])
-        else:
-            self._pull_base_image(stage, base_ref)
+        # The stage is not registered until the bottom of this method, so
+        # a base image that will not resolve would otherwise take its two
+        # descriptors with it, past the close() that walks the registered
+        # ones.
+        try:
+            if base_ref.lower() == "scratch":
+                stage.image_config = {"config": {}}
+            elif base_ref in self.stages:
+                self._inherit_from_stage(stage, self.stages[base_ref])
+            else:
+                self._pull_base_image(stage, base_ref)
+        except BaseException:
+            stage.close()
+            raise
 
         cfg = stage.image_config.get("config") or {}
         env_list = cfg.get("Env") or []
@@ -354,13 +574,16 @@ class BuildEngine:
         self.stages[str(idx)] = stage
         self.current = stage
 
-        # Configure DNS so RUN apt-get etc. work.
-        if os.path.isdir(os.path.join(rootfs_dir, "etc")):
-            try:
-                write_resolv_conf(rootfs_dir)
-                write_hosts(rootfs_dir)
-            except OSError:
-                pass
+        # Configure DNS so RUN apt-get etc. work. Both writers descend
+        # from the stage's own descriptor; the isdir() probe is gone
+        # because _open_etc already answers "no etc here" by refusing to
+        # open it, and asking by name was one more resolution of a name
+        # this no longer trusts.
+        try:
+            write_resolv_conf(rootfs_dir, root_fd=stage.rootfs_fd)
+            write_hosts(rootfs_dir, root_fd=stage.rootfs_fd)
+        except OSError:
+            pass
 
         # Fire ONBUILD triggers from the base image's config.
         base_onbuild = (
@@ -368,20 +591,29 @@ class BuildEngine:
         )
         if base_onbuild:
             from proot_distro.helpers.dockerfile import parse_dockerfile
-            for trig in base_onbuild:
-                _, trig_instrs = parse_dockerfile(trig + "\n")
-                for ti in trig_instrs:
-                    self._step_no += 1
-                    self._announce(ti)
-                    if ti["name"] in EXPANDS_VARS and not ti["exec_form"]:
-                        ti = self._expand_instruction(ti)
-                    h = HANDLERS.get(ti["name"])
-                    if h is None:
-                        raise BuildError(
-                            f"ONBUILD trigger uses unsupported "
-                            f"instruction '{ti['name']}'."
-                        )
-                    self._run_with_history(h, ti)
+            # A trigger that *fires* is always the base image's, never
+            # this Dockerfile's: `ONBUILD` here only records one for
+            # whoever builds FROM the result. So an ENV among them is a
+            # stranger's line, and do_env holds it to the same rule the
+            # image's own Env is held to.
+            self._firing_onbuild = True
+            try:
+                for trig in base_onbuild:
+                    _, trig_instrs = parse_dockerfile(trig + "\n")
+                    for ti in trig_instrs:
+                        self._step_no += 1
+                        self._announce(ti)
+                        if ti["name"] in EXPANDS_VARS and not ti["exec_form"]:
+                            ti = self._expand_instruction(ti)
+                        h = HANDLERS.get(ti["name"])
+                        if h is None:
+                            raise BuildError(
+                                f"ONBUILD trigger uses unsupported "
+                                f"instruction '{ti['name']}'."
+                            )
+                        self._run_with_history(h, ti)
+            finally:
+                self._firing_onbuild = False
 
     def _inherit_from_stage(self, new_stage, parent):
         """Apply parent's layers to new_stage.rootfs_dir; copy config.
@@ -394,36 +626,84 @@ class BuildEngine:
         new_stage.image_config = json.loads(
             json.dumps(parent.image_config)
         )
-        for layer in parent.layers:
-            cache_path = layer_cache_path(layer["digest"])
-            if not os.path.isfile(cache_path):
-                raise BuildError(
-                    f"Layer {layer['digest']} of stage "
-                    f"'{parent.name or parent.index}' is missing from "
-                    f"the cache."
-                )
-            apply_layer(cache_path, new_stage.rootfs_dir)
+        # The stage's own descriptor, not its name: the directory was
+        # made by this process, but by the time a second FROM re-applies
+        # layers into it a previous stage's RUN steps have run, and what
+        # they leave running is the invoking user.
+        rootfs_fd = _stage_rootfs_fd(new_stage)
+        try:
+            for layer in parent.layers:
+                # Verified, not merely present: these layers were produced
+                # by this build, so a blob that no longer hashes to its
+                # digest cannot be refetched and must not be applied.
+                try:
+                    layer_fd = open_required_layer(
+                        layer["digest"],
+                        what=(f"Layer of stage "
+                              f"'{parent.name or parent.index}':"),
+                    )
+                except RuntimeError as exc:
+                    raise BuildError(str(exc)) from exc
+                try:
+                    apply_layer(layer_fd, rootfs_fd,
+                                digest=layer["digest"])
+                finally:
+                    os.close(layer_fd)
+        finally:
+            os.close(rootfs_fd)
         new_stage.layers = list(parent.layers)
         new_stage.parent_layer_digest = parent.parent_layer_digest
+        # The rootfs is still that image plus layers, so a RUN step in
+        # this stage is told the same thing about where it came from.
+        new_stage.base_ref = parent.base_ref
+        new_stage.base_image_id = parent.base_image_id
 
     def _pull_base_image(self, stage, image_ref):
         """Use helpers.docker.pull_image to populate the stage rootfs."""
+        # pull_image refuses a reference the grammar does not accept as
+        # well; asked here first so the line below never echoes one, since
+        # it is the Dockerfile's text (after ARG expansion) and may hold
+        # anything, a terminal escape included.
+        try:
+            parse_reference(image_ref)
+        except InvalidReference as exc:
+            raise BuildError(f"FROM {image_ref}: {exc}") from exc
         log_info(_("Pulling base image '{image_ref}' ({arch})...", image_ref = image_ref, arch = self.target_arch_pd))
         try:
-            meta = pull_image(image_ref, stage.rootfs_dir,
-                              self.target_arch_pd)
+            rootfs_fd = _stage_rootfs_fd(stage)
+        except OSError as exc:
+            raise BuildError(f"FROM {image_ref}: {exc}") from exc
+        try:
+            meta = pull_image(image_ref, rootfs_fd, self.target_arch_pd)
         except RuntimeError as exc:
             raise BuildError(f"FROM {image_ref}: {exc}") from exc
+        finally:
+            os.close(rootfs_fd)
 
-        stage.image_config = meta.get("image_config") or {"config": {}}
+        stage.image_config = _adopt_image_config(
+            meta.get("image_config") or {"config": {}}, image_ref,
+        )
         manifest = meta.get("manifest") or {}
+        # What a RUN step is told about the image under it: the reference
+        # as the Dockerfile wrote it (expanded), and the config digest
+        # when the manifest names one it can vouch for.
+        stage.base_ref = image_ref
+        stage.base_image_id = manifest_config_digest(manifest)
         config_diff_ids = (
             (stage.image_config.get("rootfs") or {}).get("diff_ids") or []
         )
         stage.layers = []
         for i, layer in enumerate(manifest.get("layers", [])):
+            # pull_image has already held the manifest to manifest_layers'
+            # rule, so `layers` is a list of descriptors and each digest
+            # is a string. A `size` is not part of that promise, and this
+            # one is copied into the manifest the build publishes: read a
+            # non-int as absent, the way every other reader of the field
+            # does.
             digest = layer.get("digest", "")
             size = layer.get("size", 0)
+            if not isinstance(size, int) or isinstance(size, bool):
+                size = 0
             diff_id = (
                 config_diff_ids[i]
                 if i < len(config_diff_ids) else digest

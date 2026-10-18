@@ -19,7 +19,8 @@
 #
 
 # Architecture: Metadata-only handlers — the Dockerfile instructions
-# whose only side effect is to mutate the in-progress image config.
+# whose only side effect is to mutate the in-progress image config
+# (WORKDIR also creates its directory and records a thin layer for it).
 # Each handler receives the live BuildEngine and the parsed instruction
 # record. The HANDLERS dispatch table at the bottom of this module
 # binds every Dockerfile name to its function (including the RUN and
@@ -27,17 +28,21 @@
 
 import json
 import os
-import shlex
 
+from proot_distro import dirfd
+from proot_distro.atomic import publish_file
+from proot_distro.execenv import is_host_exec_var
+from proot_distro.message import warn
 from proot_distro.helpers.build_engine.copy_step import do_add, do_copy
 from proot_distro.helpers.build_engine.errors import BuildError
 from proot_distro.helpers.build_engine.constants import PREDEFINED_ARGS
 from proot_distro.helpers.build_engine.parsing import (
-    parse_kv_list, split_arg, to_argv,
+    parse_kv_list, split_arg, split_operands, to_argv,
 )
 from proot_distro.helpers.build_engine.run_step import do_run
 from proot_distro.helpers.docker import layer_cache_path
 from proot_distro.helpers.layer_diff import write_files_layer
+from proot_distro.helpers.tar_extract import safe_resolve_parts
 
 
 def do_arg(engine, instr):
@@ -87,7 +92,18 @@ def do_env(engine, instr):
         for e in env_list
         if isinstance(e, str) and "=" in e
     }
+    # An ENV fired by the base image's ONBUILD is the image's line, not
+    # the author's, so it is held to the rule the image's own Env is
+    # held to: the LD_*/PROOT_* namespaces are read by the host-side
+    # proot exec before it confines anything (see proot_distro.execenv).
+    # Dropped rather than merely not applied, so the built image does
+    # not carry it on to whoever runs it next either.
+    from_image = getattr(engine, "_firing_onbuild", False)
     for k, v in pairs:
+        if from_image and is_host_exec_var(k):
+            warn(f"ignoring ONBUILD ENV '{k}' from the base image: "
+                 f"it is read by proot itself, not by the container.")
+            continue
         env_map[k] = v
         engine.current.env[k] = v
     cfg["Env"] = [f"{k}={v}" for k, v in env_map.items()]
@@ -121,6 +137,42 @@ def do_user(engine, instr):
     cfg["User"] = engine.current.user
 
 
+def _missing_levels(rootfs, parts, rootfs_fd=None):
+    """The prefixes of *parts* that do not exist under the rootfs.
+
+    One descent rather than an os.path.lexists() per prefix: the answer
+    decides which directories the thin WORKDIR layer records, and each
+    prefix was a separate resolution of the same name. Once a level is
+    missing every level below it is too, which is what the old
+    prefix-by-prefix loop worked out the long way round.
+    """
+    missing = []
+    fd = None
+    try:
+        fd = (dirfd.reopen(rootfs_fd) if rootfs_fd is not None
+              else dirfd.opendir(rootfs))
+    except OSError:
+        return ["/".join(parts[:depth]) for depth in range(1, len(parts) + 1)]
+    try:
+        for depth in range(1, len(parts) + 1):
+            name = parts[depth - 1]
+            if fd is None or not dirfd.exists_at(fd, name):
+                missing.append("/".join(parts[:depth]))
+                nxt = None
+            else:
+                try:
+                    nxt = dirfd.opendir_at(fd, name)
+                except OSError:
+                    nxt = None      # a file or a symlink: nothing to descend
+            if fd is not None:
+                os.close(fd)
+            fd = nxt
+    finally:
+        if fd is not None:
+            os.close(fd)
+    return missing
+
+
 def do_workdir(engine, instr):
     """WORKDIR PATH: set the cwd and create the directory on disk.
 
@@ -133,10 +185,17 @@ def do_workdir(engine, instr):
         raise BuildError(
             f"WORKDIR with empty path at line {instr['lineno']}."
         )
-    if not path.startswith("/"):
-        path = os.path.normpath(
-            os.path.join(engine.current.workdir or "/", path)
-        )
+    # Normalised whether or not it is absolute. Only the relative branch
+    # used to be, so `WORKDIR /../../../x` kept its ".." in the host path
+    # the directory was then made at -- and os.makedirs() created it as
+    # many levels above the rootfs as the instruction asked for, anywhere the
+    # invoking user can write, with a chmod 0755 behind it. The layer
+    # picked up a matching "../x" arcname. ".." is resolved against the
+    # guest's "/" here, clamping at the image root the way a chroot does
+    # and the way Docker reads it.
+    path = os.path.normpath(
+        os.path.join("/", engine.current.workdir or "/", path)
+    )
     engine.current.workdir = path
     cfg = engine.current.image_config.setdefault("config", {})
     cfg["WorkingDir"] = path
@@ -144,25 +203,48 @@ def do_workdir(engine, instr):
     # Create the directory inside the rootfs and emit a thin layer that
     # captures every newly-created ancestor, so the path also exists
     # when the image is applied to a fresh rootfs by `install`.
-    host_path = os.path.join(engine.current.rootfs_dir, path.lstrip("/"))
-    new_dirs = []
-    cur = host_path
-    while cur and cur != engine.current.rootfs_dir:
-        if not os.path.lexists(cur):
-            new_dirs.append(cur)
-        cur = os.path.dirname(cur)
-    try:
-        os.makedirs(host_path, exist_ok=True)
-        os.chmod(host_path, 0o755)
-    except OSError:
+    #
+    # The path is resolved before anything is created and then created off
+    # a descriptor per level. os.makedirs() and os.chmod() address every
+    # level by name, so an image shipping `/x -> /tmp/victim` had
+    # `WORKDIR /x/sub` create -- and chmod 0755 -- a directory on the
+    # *host*, outside the rootfs entirely; a base image's `ONBUILD WORKDIR`
+    # reaches that without the Dockerfile containing the line at all.
+    # safe_resolve_parts_at still follows the symlinks a legitimate image
+    # ships (`/var/run -> /run` is in nearly every distro image), it just
+    # re-anchors each hop at the rootfs the way proot's own view of the
+    # guest does; makedirs_at then refuses a component planted after the
+    # resolve rather than following it. The arcnames come from the
+    # resolved path, which is where the directories really landed.
+    #
+    # The walk starts at the stage's pinned rootfs descriptor rather than
+    # at `<scratch>/stage-N/rootfs`: that name is inside the build's own
+    # scratch tree, which anything running as the invoking user can
+    # re-point -- a process a previous RUN step left behind, on Termux a
+    # session of another container -- and every level below it was only
+    # ever as safe as where the descent began.
+    stage = engine.current
+    rootfs = stage.rootfs_dir
+    rootfs_fd = stage.rootfs_fd
+    parts = safe_resolve_parts(
+        rootfs, path.strip("/").split("/"), root_fd=rootfs_fd,
+    )
+    if parts is None:
+        return
+
+    new_dirs = _missing_levels(rootfs, parts, rootfs_fd)
+
+    made = (dirfd.makedirs_at(rootfs_fd, rootfs, parts, mode=0o755)
+            if rootfs_fd is not None
+            else dirfd.makedirs_under(rootfs, parts, mode=0o755))
+    if made is None:
         return
 
     if not new_dirs:
         return
 
     file_map = {}
-    for d in sorted(new_dirs):
-        arc = os.path.relpath(d, engine.current.rootfs_dir)
+    for arc in new_dirs:
         file_map[arc] = {
             "kind": "dir", "mode": 0o755, "uid": 0, "gid": 0, "mtime": 0,
         }
@@ -172,9 +254,8 @@ def do_workdir(engine, instr):
         f"layer-{engine.current.index}-{len(engine.current.layers)}.tar.gz",
     )
     digest, size, diff_id = write_files_layer(file_map, tmp_layer_path)
-    final_path = layer_cache_path(digest)
-    os.makedirs(os.path.dirname(final_path), exist_ok=True)
-    os.replace(tmp_layer_path, final_path)
+    # See run_step: the layer cache is walked down to, not named.
+    publish_file(tmp_layer_path, layer_cache_path(digest))
     engine.current.layers.append(
         {"digest": digest, "size": size, "diff_id": diff_id}
     )
@@ -202,7 +283,7 @@ def do_expose(engine, instr):
     """EXPOSE port[/proto]: record container ports in image config."""
     cfg = engine.current.image_config.setdefault("config", {})
     ports = dict(cfg.get("ExposedPorts") or {})
-    for token in shlex.split(str(instr["value"])):
+    for token in split_operands(instr["value"], instr):
         if "/" not in token:
             token = token + "/tcp"
         ports[token] = {}
@@ -216,7 +297,7 @@ def do_volume(engine, instr):
     if instr["exec_form"]:
         paths = list(instr["value"])
     else:
-        paths = shlex.split(str(instr["value"]))
+        paths = split_operands(instr["value"], instr)
     for p in paths:
         vols[p] = {}
     cfg["Volumes"] = vols

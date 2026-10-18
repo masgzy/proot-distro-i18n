@@ -33,6 +33,15 @@ function __proot_distro_containers
 end
 
 # ---------------------------------------------------------------------------
+# Helper: cached OCI images, as `remove --image` accepts them
+# ---------------------------------------------------------------------------
+# The manifest cache is keyed by a hash, so the references are read back
+# through the program itself rather than derived from file names.
+function __proot_distro_images
+    proot-distro list --image --quiet 2>/dev/null
+end
+
+# ---------------------------------------------------------------------------
 # Termux/Android 检测 — 与 constants.py 中的 _detect_termux() 保持一致。
 # 三个独立指标中至少两个匹配时返回 0 (true)。
 # ---------------------------------------------------------------------------
@@ -61,7 +70,7 @@ end
 # ---------------------------------------------------------------------------
 function __proot_distro_no_subcommand
     not __fish_seen_subcommand_from \
-        install remove rename reset login list ps kill backup restore \
+        install search remove rename reset login list ps kill backup restore \
         clear-cache copy sync run build push mirror help
 end
 
@@ -85,6 +94,24 @@ complete -c proot-distro -f -n __proot_distro_no_subcommand -a run         -d '�
 complete -c proot-distro -f -n __proot_distro_no_subcommand -a build       -d '从 Dockerfile 构建 OCI 镜像'
 complete -c proot-distro -f -n __proot_distro_no_subcommand -a push        -d '把本地构建的镜像推送到仓库'
 complete -c proot-distro -f -n __proot_distro_no_subcommand -a help        -d '显示帮助'
+complete -c proot-distro -f -n __proot_distro_no_subcommand -a install     -d 'Install a container from a Docker image or local archive'
+complete -c proot-distro -f -n __proot_distro_no_subcommand -a search      -d 'Search Docker Hub for images'
+complete -c proot-distro -f -n __proot_distro_no_subcommand -a remove      -d 'Remove a container or a cached image'
+complete -c proot-distro -f -n __proot_distro_no_subcommand -a rename      -d 'Rename a container'
+complete -c proot-distro -f -n __proot_distro_no_subcommand -a reset       -d 'Reinstall a container from its original image'
+complete -c proot-distro -f -n __proot_distro_no_subcommand -a login       -d 'Open a shell inside a container'
+complete -c proot-distro -f -n __proot_distro_no_subcommand -a list        -d 'List containers or cached images'
+complete -c proot-distro -f -n __proot_distro_no_subcommand -a ps          -d 'List active container sessions'
+complete -c proot-distro -f -n __proot_distro_no_subcommand -a kill        -d 'Stop active container sessions'
+complete -c proot-distro -f -n __proot_distro_no_subcommand -a backup      -d 'Backup a container to a tar archive'
+complete -c proot-distro -f -n __proot_distro_no_subcommand -a restore     -d 'Restore a container from a tar archive'
+complete -c proot-distro -f -n __proot_distro_no_subcommand -a clear-cache -d 'Clear the download cache'
+complete -c proot-distro -f -n __proot_distro_no_subcommand -a copy        -d 'Copy files between host and container'
+complete -c proot-distro -f -n __proot_distro_no_subcommand -a sync        -d 'Synchronize files between host and container'
+complete -c proot-distro -f -n __proot_distro_no_subcommand -a run         -d 'Run the image entrypoint/cmd in a container'
+complete -c proot-distro -f -n __proot_distro_no_subcommand -a build       -d 'Build an OCI image from a Dockerfile'
+complete -c proot-distro -f -n __proot_distro_no_subcommand -a push        -d 'Push a locally built image to a registry'
+complete -c proot-distro -f -n __proot_distro_no_subcommand -a help        -d 'Show help'
 
 # 全局帮助标志（子命令之前）
 complete -c proot-distro -f -n __proot_distro_no_subcommand -s h -l help   -d '显示帮助'
@@ -105,10 +132,30 @@ complete -c proot-distro -f -n '__fish_seen_subcommand_from install' \
     -s h -l help       -d '显示帮助'
 
 # ---------------------------------------------------------------------------
+# search
+# ---------------------------------------------------------------------------
+complete -c proot-distro -f -n '__fish_seen_subcommand_from search' \
+    -s l -l limit      -r -d 'Maximum number of results (default 25)'
+complete -c proot-distro -f -n '__fish_seen_subcommand_from search' \
+    -s q -l quiet      -d 'Print only repository names, one per line'
+complete -c proot-distro -f -n '__fish_seen_subcommand_from search' \
+    -s h -l help       -d 'Show help'
+
+# ---------------------------------------------------------------------------
 # remove
 # ---------------------------------------------------------------------------
-complete -c proot-distro -f -n '__fish_seen_subcommand_from remove' \
+complete -c proot-distro -f \
+    -n '__fish_seen_subcommand_from remove; and not __fish_contains_opt -s i image' \
     -a '(__proot_distro_containers)' -d '容器'
+complete -c proot-distro -f \
+    -n '__fish_seen_subcommand_from remove; and __fish_contains_opt -s i image' \
+    -a '(__proot_distro_images)' -d '镜像'
+complete -c proot-distro -f -n '__fish_seen_subcommand_from remove' \
+    -s i -l image      -d '删除缓存的 OCI 镜像而非容器'
+complete -c proot-distro -f -n '__fish_seen_subcommand_from remove' \
+    -s a -l architecture -x -a 'aarch64 arm i686 riscv64 x86_64' \
+    -d '仅删除此架构变体'
+
 complete -c proot-distro -f -n '__fish_seen_subcommand_from remove' \
     -s v -l verbose    -d '打印每个被删除的文件'
 complete -c proot-distro -f -n '__fish_seen_subcommand_from remove' \
@@ -184,7 +231,10 @@ complete -c proot-distro -f -n '__fish_seen_subcommand_from login' \
 # list
 # ---------------------------------------------------------------------------
 complete -c proot-distro -f -n '__fish_seen_subcommand_from list' \
+    -s i -l image      -d '列出缓存的 OCI 镜像而非容器'
+complete -c proot-distro -f -n '__fish_seen_subcommand_from list' \
     -s q -l quiet      -d '抑制非错误输出'
+
 complete -c proot-distro -f -n '__fish_seen_subcommand_from list' \
     -s h -l help       -d '显示帮助'
 
@@ -218,7 +268,7 @@ complete -c proot-distro -n '__fish_seen_subcommand_from backup' \
     -s o -l output     -r -d 'Write archive to FILE instead of stdout'
 complete -c proot-distro -f -n '__fish_seen_subcommand_from backup' \
     -s c -l compress   -r -d 'Compression algorithm' \
-    -a 'gzip\tgzip bzip2\tbzip2 xz\txz none\tNo compression'
+    -a 'gzip\tgzip bzip2\tbzip2 xz\txz zstd\tzstd none\tNo compression'
 complete -c proot-distro -f -n '__fish_seen_subcommand_from backup' \
     -s v -l verbose    -d '打印每个归档的文件'
 complete -c proot-distro -f -n '__fish_seen_subcommand_from backup' \
@@ -239,6 +289,10 @@ complete -c proot-distro -n '__fish_seen_subcommand_from restore' \
 # ---------------------------------------------------------------------------
 # clear-cache
 # ---------------------------------------------------------------------------
+complete -c proot-distro -f -n '__fish_seen_subcommand_from clear-cache' \
+    -l orphan          -d 'Remove only unreferenced layer blobs'
+complete -c proot-distro -f -n '__fish_seen_subcommand_from clear-cache' \
+    -l build-cache     -d 'Drop the build cache index and the layers it pinned'
 complete -c proot-distro -f -n '__fish_seen_subcommand_from clear-cache' \
     -s v -l verbose    -d 'List removed files'
 complete -c proot-distro -f -n '__fish_seen_subcommand_from clear-cache' \
@@ -389,13 +443,14 @@ complete -c proot-distro -f -n '__fish_seen_subcommand_from mirror'     -s h -l 
 # help
 # ---------------------------------------------------------------------------
 complete -c proot-distro -f -n '__fish_seen_subcommand_from help' \
-    -a 'install remove rename reset login list ps kill backup restore clear-cache copy sync run build push' \
+    -a 'install search remove rename reset login list ps kill backup restore clear-cache copy sync run build push' \
     -d 'Topic'
 
 # ---------------------------------------------------------------------------
 # pd (same entry point, duplicate all completions)
 # ---------------------------------------------------------------------------
 complete -c pd -f -n __proot_distro_no_subcommand -a install     -d '从 Docker 镜像或本地归档安装容器'
+complete -c pd -f -n __proot_distro_no_subcommand -a search      -d '在 Docker Hub 上搜索镜像'
 complete -c pd -f -n __proot_distro_no_subcommand -a remove      -d '删除已安装的容器'
 complete -c pd -f -n __proot_distro_no_subcommand -a rename      -d '重命名容器'
 complete -c pd -f -n __proot_distro_no_subcommand -a reset       -d '从原始镜像重新安装容器'
@@ -419,7 +474,10 @@ complete -c pd -f -n '__fish_seen_subcommand_from install' -s a -l architecture 
 complete -c pd -f -n '__fish_seen_subcommand_from install' -s q -l quiet           -d '抑制非错误输出'
 complete -c pd -f -n '__fish_seen_subcommand_from install' -s h -l help             -d '显示帮助'
 
-complete -c pd -f -n '__fish_seen_subcommand_from remove' -a '(__proot_distro_containers)' -d '容器'
+complete -c pd -f -n '__fish_seen_subcommand_from remove; and not __fish_contains_opt -s i image' -a '(__proot_distro_containers)' -d '容器'
+complete -c pd -f -n '__fish_seen_subcommand_from remove; and __fish_contains_opt -s i image' -a '(__proot_distro_images)' -d '镜像'
+complete -c pd -f -n '__fish_seen_subcommand_from remove' -s i -l image -d '删除缓存的 OCI 镜像'
+complete -c pd -f -n '__fish_seen_subcommand_from remove' -s a -l architecture -x -a 'aarch64 arm i686 riscv64 x86_64' -d '仅删除此架构变体'
 complete -c pd -f -n '__fish_seen_subcommand_from remove' -s v -l verbose -d '打印每个被删除的文件'
 complete -c pd -f -n '__fish_seen_subcommand_from remove' -s q -l quiet   -d '抑制非错误输出'
 complete -c pd -f -n '__fish_seen_subcommand_from remove' -s h -l help    -d '显示帮助'
@@ -433,6 +491,48 @@ complete -c pd -f -n '__fish_seen_subcommand_from reset' -s q -l quiet -d '抑�
 complete -c pd -f -n '__fish_seen_subcommand_from reset' -s h -l help -d '显示帮助'
 
 complete -c pd -f -n '__fish_seen_subcommand_from login' -a '(__proot_distro_containers)' -d '容器'
+complete -c pd -f -n __proot_distro_no_subcommand -a install     -d 'Install a container from a Docker image or local archive'
+complete -c pd -f -n __proot_distro_no_subcommand -a search      -d 'Search Docker Hub for images'
+complete -c pd -f -n __proot_distro_no_subcommand -a remove      -d 'Remove a container or a cached image'
+complete -c pd -f -n __proot_distro_no_subcommand -a rename      -d 'Rename a container'
+complete -c pd -f -n __proot_distro_no_subcommand -a reset       -d 'Reinstall a container from its original image'
+complete -c pd -f -n __proot_distro_no_subcommand -a login       -d 'Open a shell inside a container'
+complete -c pd -f -n __proot_distro_no_subcommand -a list        -d 'List containers or cached images'
+complete -c pd -f -n __proot_distro_no_subcommand -a ps          -d 'List active container sessions'
+complete -c pd -f -n __proot_distro_no_subcommand -a kill        -d 'Stop active container sessions'
+complete -c pd -f -n __proot_distro_no_subcommand -a backup      -d 'Backup a container to a tar archive'
+complete -c pd -f -n __proot_distro_no_subcommand -a restore     -d 'Restore a container from a tar archive'
+complete -c pd -f -n __proot_distro_no_subcommand -a clear-cache -d 'Clear the download cache'
+complete -c pd -f -n __proot_distro_no_subcommand -a copy        -d 'Copy files between host and container'
+complete -c pd -f -n __proot_distro_no_subcommand -a sync        -d 'Synchronize files between host and container'
+complete -c pd -f -n __proot_distro_no_subcommand -a run         -d 'Run the image entrypoint/cmd in a container'
+complete -c pd -f -n __proot_distro_no_subcommand -a build       -d 'Build an OCI image from a Dockerfile'
+complete -c pd -f -n __proot_distro_no_subcommand -a push        -d 'Push a locally built image to a registry'
+complete -c pd -f -n __proot_distro_no_subcommand -a help        -d 'Show help'
+complete -c pd -f -n __proot_distro_no_subcommand -s h -l help   -d 'Show help'
+
+complete -c pd -f -n '__fish_seen_subcommand_from install' -s n -l name         -r -d 'Install under a custom container name'
+complete -c pd -f -n '__fish_seen_subcommand_from install' -s a -l architecture -r -d 'Target CPU architecture' -a 'aarch64 arm i686 riscv64 x86_64'
+complete -c pd -f -n '__fish_seen_subcommand_from install' -s q -l quiet           -d 'Suppress non-error output'
+complete -c pd -f -n '__fish_seen_subcommand_from install' -s h -l help             -d 'Show help'
+
+complete -c pd -f -n '__fish_seen_subcommand_from remove; and not __fish_contains_opt -s i image' -a '(__proot_distro_containers)' -d 'Container'
+complete -c pd -f -n '__fish_seen_subcommand_from remove; and __fish_contains_opt -s i image' -a '(__proot_distro_images)' -d 'Image'
+complete -c pd -f -n '__fish_seen_subcommand_from remove' -s i -l image -d 'Delete a cached OCI image'
+complete -c pd -f -n '__fish_seen_subcommand_from remove' -s a -l architecture -x -a 'aarch64 arm i686 riscv64 x86_64' -d 'Only this architecture variant'
+complete -c pd -f -n '__fish_seen_subcommand_from remove' -s v -l verbose -d 'Print each removed file'
+complete -c pd -f -n '__fish_seen_subcommand_from remove' -s q -l quiet   -d 'Suppress non-error output'
+complete -c pd -f -n '__fish_seen_subcommand_from remove' -s h -l help    -d 'Show help'
+
+complete -c pd -f -n '__fish_seen_subcommand_from rename' -a '(__proot_distro_containers)' -d 'Container'
+complete -c pd -f -n '__fish_seen_subcommand_from rename' -s q -l quiet -d 'Suppress non-error output'
+complete -c pd -f -n '__fish_seen_subcommand_from rename' -s h -l help -d 'Show help'
+
+complete -c pd -f -n '__fish_seen_subcommand_from reset' -a '(__proot_distro_containers)' -d 'Container'
+complete -c pd -f -n '__fish_seen_subcommand_from reset' -s q -l quiet -d 'Suppress non-error output'
+complete -c pd -f -n '__fish_seen_subcommand_from reset' -s h -l help -d 'Show help'
+
+complete -c pd -f -n '__fish_seen_subcommand_from login' -a '(__proot_distro_containers)' -d 'Container'
 complete -c pd -f -n '__fish_seen_subcommand_from login' -s u -l user         -r -d 'Run as this user'
 complete -c pd -f -n '__fish_seen_subcommand_from login' -s P -l redirect-ports   -d 'Redirect ports below 1024'
 complete -c pd -f -n '__fish_seen_subcommand_from login; and __proot_distro_is_termux' -l isolated -d 'Isolated mode'
@@ -453,8 +553,14 @@ complete -c pd -f -n '__fish_seen_subcommand_from login' -s d -l detach         
 complete -c pd -f -n '__fish_seen_subcommand_from login' -l get-proot-cmd         -d 'Print proot command'
 complete -c pd -f -n '__fish_seen_subcommand_from login' -s h -l help             -d '显示帮助'
 
+complete -c pd -f -n '__fish_seen_subcommand_from search' -s l -l limit -r -d '最多显示的结果数（默认 25）'
+complete -c pd -f -n '__fish_seen_subcommand_from search' -s q -l quiet    -d '仅打印仓库名，每行一个'
+complete -c pd -f -n '__fish_seen_subcommand_from search' -s h -l help     -d '显示帮助'
+
+complete -c pd -f -n '__fish_seen_subcommand_from list' -s i -l image -d '列出缓存的 OCI 镜像'
 complete -c pd -f -n '__fish_seen_subcommand_from list' -s q -l quiet -d '抑制非错误输出'
 complete -c pd -f -n '__fish_seen_subcommand_from list' -s h -l help  -d '显示帮助'
+
 
 complete -c pd -f -n '__fish_seen_subcommand_from ps' -s q -l quiet -d 'Print only PIDs, one per line'
 complete -c pd -f -n '__fish_seen_subcommand_from ps' -s h -l help  -d '显示帮助'
@@ -466,7 +572,7 @@ complete -c pd -f -n '__fish_seen_subcommand_from kill' -s h -l help    -d '显�
 
 complete -c pd -f -n '__fish_seen_subcommand_from backup' -a '(__proot_distro_containers)' -d '容器'
 complete -c pd -n   '__fish_seen_subcommand_from backup' -s o -l output    -r -d 'Output archive file'
-complete -c pd -f -n '__fish_seen_subcommand_from backup' -s c -l compress -r -d 'Compression type' -a 'gzip bzip2 xz none'
+complete -c pd -f -n '__fish_seen_subcommand_from backup' -s c -l compress -r -d 'Compression type' -a 'gzip bzip2 xz zstd none'
 complete -c pd -f -n '__fish_seen_subcommand_from backup' -s v -l verbose -d 'Verbose output'
 complete -c pd -f -n '__fish_seen_subcommand_from backup' -s q -l quiet   -d '抑制非错误输出'
 complete -c pd -f -n '__fish_seen_subcommand_from backup' -s h -l help    -d '显示帮助'
@@ -475,6 +581,8 @@ complete -c pd -n '__fish_seen_subcommand_from restore' -s v -l verbose -d 'Verb
 complete -c pd -n '__fish_seen_subcommand_from restore' -s q -l quiet   -d '抑制非错误输出'
 complete -c pd -n '__fish_seen_subcommand_from restore' -s h -l help    -d '显示帮助'
 
+complete -c pd -f -n '__fish_seen_subcommand_from clear-cache' -l orphan -d 'Remove only unreferenced layer blobs'
+complete -c pd -f -n '__fish_seen_subcommand_from clear-cache' -l build-cache -d 'Drop the build cache index and the layers it pinned'
 complete -c pd -f -n '__fish_seen_subcommand_from clear-cache' -s v -l verbose -d 'Verbose output'
 complete -c pd -f -n '__fish_seen_subcommand_from clear-cache' -s q -l quiet   -d '抑制非错误输出'
 complete -c pd -f -n '__fish_seen_subcommand_from clear-cache' -s h -l help    -d '显示帮助'
@@ -533,4 +641,4 @@ complete -c pd -f -n '__fish_seen_subcommand_from push' -s q -l quiet           
 complete -c pd -f -n '__fish_seen_subcommand_from push' -s h -l help            -d '显示帮助'
 
 complete -c pd -f -n '__fish_seen_subcommand_from help' \
-    -a 'install remove rename reset login list ps kill backup restore clear-cache copy sync run build push' -d 'Topic'
+    -a 'install search remove rename reset login list ps kill backup restore clear-cache copy sync run build push' -d 'Topic'

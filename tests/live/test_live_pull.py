@@ -37,18 +37,57 @@ def test_live_pull_alpine():
         assert os.path.isfile(container_manifest(name))
     finally:
         if os.path.isdir(container_rootfs(name)):
-            command_remove(SimpleNamespace(container_name=name, verbose=False))
+            command_remove(SimpleNamespace(target=name, verbose=False))
 
 
 def test_live_pull_is_cached_second_time(capsys):
     name = "live-alpine-cache"
     try:
         _install("alpine:latest", name)
-        command_remove(SimpleNamespace(container_name=name, verbose=False))
+        command_remove(SimpleNamespace(target=name, verbose=False))
         capsys.readouterr()
         # Second install reuses the cached manifest + layers.
         _install("alpine:latest", name)
         assert os.path.isdir(container_rootfs(name))
     finally:
         if os.path.isdir(container_rootfs(name)):
-            command_remove(SimpleNamespace(container_name=name, verbose=False))
+            command_remove(SimpleNamespace(target=name, verbose=False))
+
+
+def _index_digest(image_ref):
+    """The digest Docker Hub currently serves for *image_ref*'s tag."""
+    import hashlib
+
+    from proot_distro.helpers.docker import pull as pull_mod
+    from proot_distro.helpers.docker.refs import parse_reference
+
+    ref = parse_reference(image_ref)
+    token, base = pull_mod.get_auth_token(ref.repo, ref.registry)
+    body, _ct = pull_mod._manifest_body(ref.repo, ref.tag, token, base)
+    return "sha256:" + hashlib.sha256(body).hexdigest()
+
+
+def test_live_pull_by_digest_and_again_offline(monkeypatch):
+    # A pinned pull goes by the digest, and the second one is answered by
+    # the cache only after the whole chain re-verifies against the pin --
+    # with the network gone, so nothing else could have answered it.
+    from proot_distro.helpers.docker import pull as pull_mod
+
+    pinned = f"alpine:latest@{_index_digest('alpine:latest')}"
+    name = "live-alpine-pinned"
+    try:
+        _install(pinned, name)
+        assert detect_installed_arch(container_rootfs(name)) == \
+            get_device_cpu_arch()
+        command_remove(SimpleNamespace(target=name, verbose=False))
+
+        def offline(*_a, **_k):
+            raise AssertionError("the pinned image was fetched again")
+
+        monkeypatch.setattr(pull_mod, "get_auth_token", offline)
+        monkeypatch.setattr(pull_mod, "opener", offline)
+        _install(pinned, name)
+        assert os.path.isdir(os.path.join(container_rootfs(name), "bin"))
+    finally:
+        if os.path.isdir(container_rootfs(name)):
+            command_remove(SimpleNamespace(target=name, verbose=False))

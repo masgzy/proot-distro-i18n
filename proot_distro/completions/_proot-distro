@@ -30,6 +30,15 @@ _proot_distro_containers() {
 }
 
 # ---------------------------------------------------------------------------
+# 辅助: 列出缓存的 OCI 镜像（供 remove --image / list 补全）
+# ---------------------------------------------------------------------------
+# 清单缓存按键名哈希存储，因此引用经由程序自身读回，而非从文件名推断。
+_proot_distro_images() {
+    local -a images
+    images=(${(f)"$(proot-distro list --image --quiet 2>/dev/null)"})
+    _describe '镜像' images
+}
+
 # 辅助: 列出内置镜像源 ID（供 mirror 子命令补全）
 # ---------------------------------------------------------------------------
 _proot_distro_mirrors() {
@@ -71,6 +80,7 @@ _proot_distro() {
             local -a subcommands
             subcommands=(
                 'install:从 Docker 镜像或本地归档安装容器'
+                'search:在 Docker Hub 上搜索镜像'
                 'remove:删除已安装的容器'
                 'rename:重命名容器'
                 'reset:从原始镜像重新安装容器'
@@ -88,6 +98,25 @@ _proot_distro() {
                 'push:把本地构建的镜像推送到仓库'
                 'mirror:管理 Docker registry 镜像源'
                 'help:显示帮助'
+=======
+                'install:install a container from a Docker image or local archive'
+                'search:search Docker Hub for images'
+                'remove:remove a container or a cached image'
+                'rename:rename a container'
+                'reset:reinstall a container from its original image'
+                'login:open a shell inside a container'
+                'list:list containers or cached images'
+                'ps:list active container sessions'
+                'kill:stop active container sessions'
+                'backup:backup a container to a tar archive'
+                'restore:restore a container from a tar archive'
+                'clear-cache:clear the download cache'
+                'copy:copy files between host and container'
+                'sync:synchronize files between host and container'
+                'run:run the image entrypoint/cmd in a container'
+                'build:build an OCI image from a Dockerfile'
+                'push:push a locally built image to a registry'
+                'help:show help'
             )
             _describe '命令' subcommands
             ;;
@@ -110,12 +139,32 @@ _proot_distro() {
                     ;;
 
                 # -----------------------------------------------------------
-                remove)
+                search)
                     _arguments \
                         '(-h --help)'{-h,--help}'[显示帮助]' \
-                        '(-v --verbose -q --quiet)'{-v,--verbose}'[打印每个被删除的文件]' \
-                        '(-v --verbose -q --quiet)'{-q,--quiet}'[抑制非错误输出]' \
-                        '1:容器:_proot_distro_containers'
+                        '(-l --limit)'{-l,--limit}'[最多显示的结果数（默认 25）]:数量' \
+                        '(-q --quiet)'{-q,--quiet}'[仅打印仓库名，每行一个]' \
+                        '1:搜索关键词'
+                    ;;
+
+                # -----------------------------------------------------------
+                remove)
+                    if (( ${words[(I)--image]} || ${words[(I)-i]} )); then
+                        _arguments \
+                            '(-h --help)'{-h,--help}'[显示帮助]' \
+                            '(-i --image)'{-i,--image}'[删除缓存的 OCI 镜像]' \
+                            '(-a --architecture)'{-a,--architecture}'[仅删除此架构]:架构:(aarch64 arm i686 riscv64 x86_64)' \
+                            '(-v --verbose -q --quiet)'{-v,--verbose}'[打印每个被删除的文件]' \
+                            '(-v --verbose -q --quiet)'{-q,--quiet}'[抑制非错误输出]' \
+                            '1:镜像:_proot_distro_images'
+                    else
+                        _arguments \
+                            '(-h --help)'{-h,--help}'[显示帮助]' \
+                            '(-i --image)'{-i,--image}'[删除缓存的 OCI 镜像]' \
+                            '(-v --verbose -q --quiet)'{-v,--verbose}'[打印每个被删除的文件]' \
+                            '(-v --verbose -q --quiet)'{-q,--quiet}'[抑制非错误输出]' \
+                            '1:容器:_proot_distro_containers'
+                    fi
                     ;;
 
                 # -----------------------------------------------------------
@@ -170,7 +219,9 @@ _proot_distro() {
                 list)
                     _arguments \
                         '(-h --help)'{-h,--help}'[显示帮助]' \
-                        '(-q --quiet)'{-q,--quiet}'[抑制非错误输出]'
+                        '(-i --image)'{-i,--image}'[列出缓存的 OCI 镜像而非容器]' \
+                        '(-q --quiet)'{-q,--quiet}'[抑制非错误输出]' \
+                        '1:容器:_proot_distro_containers'
                     ;;
 
                 # -----------------------------------------------------------
@@ -196,7 +247,7 @@ _proot_distro() {
                         '(-v --verbose -q --quiet)'{-v,--verbose}'[打印每个归档的文件]' \
                         '(-v --verbose -q --quiet)'{-q,--quiet}'[抑制非错误输出]' \
                         '(-o --output)'{-o,--output}'[把归档写入 FILE 而非 stdout]:文件:_files' \
-                        '(-c --compress)'{-c,--compress}'[压缩算法]:类型:(gzip bzip2 xz none)' \
+                        '(-c --compress)'{-c,--compress}'[压缩算法]:类型:(gzip bzip2 xz zstd none)' \
                         '1:容器:_proot_distro_containers'
                     ;;
 
@@ -206,13 +257,15 @@ _proot_distro() {
                         '(-h --help)'{-h,--help}'[显示帮助]' \
                         '(-v --verbose -q --quiet)'{-v,--verbose}'[打印每个解压的文件]' \
                         '(-v --verbose -q --quiet)'{-q,--quiet}'[抑制非错误输出]' \
-                        '1:归档:_files -g "*.tar *.tar.gz *.tgz *.tar.bz2 *.tbz2 *.tar.xz *.txz"'
+                        '1:归档:_files -g "*.tar *.tar.gz *.tgz *.tar.bz2 *.tbz2 *.tar.xz *.txz *.tar.zst *.tzst"'
                     ;;
 
                 # -----------------------------------------------------------
                 clear-cache)
                     _arguments \
                         '(-h --help)'{-h,--help}'[显示帮助]' \
+                        '--orphan[仅删除不再被引用的孤立层 blob]' \
+                        '--build-cache[清空构建缓存索引及其固定引用的层]' \
                         '(-v --verbose -q --quiet)'{-v,--verbose}'[列出删除的文件]' \
                         '(-v --verbose -q --quiet)'{-q,--quiet}'[抑制非错误输出]'
                     ;;

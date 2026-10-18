@@ -19,7 +19,7 @@
 #
 
 # Architecture: Shared TTY progress-bar primitives. Every long-running
-# command (install, backup, restore, sync, build, push) draws the same
+# command (install, backup, restore, copy, sync, build, push) draws the same
 # style of bar — a 20-cell `[####----] NN% A / B` line on stderr,
 # anchored by '\r' and erased with '\033[K'. Centralising the format
 # here removes ~7 near-identical copies and ensures a single place to
@@ -127,7 +127,10 @@ def draw_count_bar(
         return
     pfx = f"{C['BLUE']}[{C['GREEN']}*{C['BLUE']}] {C['CYAN']}"
     head = f"{label}: " if label else ""
-    pct = (done * 100 // total) if total else 100
+    # Clamped like draw_bytes_bar's: a count can outrun the total it was
+    # given (a source that grew since it was counted), and an unclamped
+    # percentage draws a bar longer than the twenty cells it has.
+    pct = min(done * 100 // total, 100) if total else 100
     bar = "#" * (pct // 5) + "-" * (20 - pct // 5)
     line = (f"\r{pfx}{head}[{bar}] {pct:3d}%  "
             f"{done} / {total} {unit}\033[K{C['RST']}")

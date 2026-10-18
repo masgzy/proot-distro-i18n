@@ -32,6 +32,18 @@ from proot_distro.constants import (
 )
 
 
+# What a guest may ask about where it is running. Both `login` and `run`
+# say it, so it is written once.
+_IDENTITY_NOTE = (
+    "The guest environment carries PD_CONTAINER (the container's name), "
+    "PD_IMAGE (the image reference it was installed from), PD_IMAGE_ID "
+    "(the image's config digest) and container=proot-distro, in every "
+    "mode. PD_IMAGE and PD_IMAGE_ID are unset for a container installed "
+    "from a plain rootfs tarball, which carries no image metadata. Your "
+    "own --env entries override them; the image's Env cannot."
+)
+
+
 HELP_PAGES = {
     "build": {
         "usage": "build [OPTIONS] [PATH]",
@@ -222,16 +234,63 @@ HELP_PAGES = {
     },
 
     "clear-cache": {
-        "usage": "clear-cache",
+        "usage": "clear-cache [OPTIONS]",
         "aliases": ("clear", "cl"),
         "summary": (
-            "清空下载缓存中的所有文件（如 Docker 镜像层）。"
+            "清空下载缓存中的所有文件（如 Docker 镜像层）。\n\n"
+            "默认清空整个缓存；--orphan 仅删除不再被引用的孤立层，"
+            "--build-cache 清空构建缓存（按步索引及其产物层）。"
         ),
         "options": [
             ("-h, --help", "显示本帮助。"),
             ("-v, --verbose", "每删除一个文件就打印其路径。"),
             ("-q, --quiet",
              "抑制非错误输出。与 --verbose 互斥。"),
+            ("--orphan",
+             "仅删除没有任何东西再引用的层 blob，保留缓存其余部分。"),
+            ("--build-cache",
+             "清空构建缓存：按步索引（build_cache_index.json）"
+             "及其记录的各层。这会让下一次构建重新运行每一步。"),
+        ],
+        "examples": [
+            f"{PROGRAM_NAME} clear-cache --orphan",
+            f"{PROGRAM_NAME} clear-cache --build-cache",
+        ],
+        "footer": [
+            {
+                "title": "孤立层（ORPHAN LAYERS）",
+                "intro": (
+                    "层 blob 在被某个缓存镜像列出、或被某条构建缓存"
+                    "条目引用期间属于“被引用”状态；其余即为孤立层，"
+                    "由失败的构建、替换了某步输出的重新构建、或从"
+                    "本地 OCI 归档安装的镜像遗留在磁盘上。已安装的"
+                    "容器不持有任何层（它们的 rootfs 是独立副本），"
+                    "因此永不受影响。由于构建缓存也算作一种引用，"
+                    "--orphan 永远不会缩减它；那正是 --build-cache "
+                    "的职责。在另一个 " + PROGRAM_NAME + " 命令持有锁"
+                    "时，清理会拒绝运行，因为进行中的构建在磁盘上有"
+                    "尚无引用的层。"
+                ),
+            },
+            {
+                "title": "构建缓存（BUILD CACHE）",
+                "intro": (
+                    "构建执行的每条 RUN 都会连同其产物层一起记录在 "
+                    "build_cache_index.json 中，这样后续相同父层、"
+                    "相同指令与输入的构建会直接应用该层而不是重新"
+                    "运行该步。这些条目永远不会被驱逐，而每次编辑 "
+                    "Dockerfile 都会让之前的条目失效，所以索引及其"
+                    "各层是缓存中只增不减的部分。--build-cache 正是"
+                    "在不丢弃已下载基础镜像的前提下回收它们的方式"
+                    "（普通 clear-cache 会连它们一起清掉）。它会先"
+                    "删除索引，再在索引不再计入引用的情况下清扫层"
+                    "缓存，于是你仍保留的镜像的各层得以保留，构建"
+                    "自身的中间产物则被清除。下一次构建会重新运行"
+                    "每一步。若只想对单次构建跳过缓存查找而不丢弃"
+                    f"任何东西，请改用 '{PROGRAM_NAME} build "
+                    f"--no-cache'。"
+                ),
+            },
         ],
     },
 
@@ -355,6 +414,56 @@ HELP_PAGES = {
                     ("ubuntu:24.04", None),
                     ("ghcr.io/void-linux/void-musl:latest", None),
                 ]
+            },
+        ],
+    },
+
+    "search": {
+        "usage": "search [OPTIONS] QUERY",
+        "aliases": ("se", "s"),
+        "summary": (
+            "在 Docker Hub 上搜索与 QUERY 匹配的镜像，等效于 "
+            "'docker search'。"
+            "\n\n"
+            "结果以表格形式列出仓库名、描述、星标数、拉取次数，"
+            "以及是否为官方镜像。列出的任何名称都可直接用于 "
+            f"'{PROGRAM_NAME} install'。"
+            "\n\n"
+            "仅支持搜索 Docker Hub。搜索不属于 OCI 分发协议的一部分，"
+            "因此自定义仓库（ghcr.io、gallery.ecr.aws、自建仓库）"
+            "无法用此方式查询——请使用它们各自的网页界面。"
+        ),
+        "options": [
+            ("-h, --help", "显示本帮助。"),
+            ("-l, --limit [N]",
+             "最多显示的结果数。默认 25，最大 1000。Docker Hub 每次"
+             "请求返回 100 条结果，更大的 limit 会逐页获取。"),
+            ("-q, --quiet",
+             "仅打印仓库名，每行一个，不输出表格。适合用管道"
+             "传给其他命令。"),
+        ],
+        "examples": [
+            f"{PROGRAM_NAME} search ubuntu",
+            f"{PROGRAM_NAME} search --limit 50 'linux distro'",
+            f"{PROGRAM_NAME} search -q alpine | head -1 | "
+                f"xargs {PROGRAM_NAME} install",
+        ],
+        "footer": [
+            {
+                "title": "说明",
+                "intro": (
+                    "仅搜索公开仓库，且不会发送 PD_DOCKER_AUTH："
+                    "Hub 的搜索端点忽略凭据，因此即使配置了认证，"
+                    "私有镜像也不会出现在结果中。但仍可直接按引用"
+                    "安装它们。"
+                    "\n\n"
+                    "搜索结果不会说明镜像支持哪些 CPU 架构，"
+                    "也无法说明它是否包含可用的 root 文件系统。"
+                    "两者只有在拉取镜像后才能确定。"
+                    "\n\n"
+                    "星标数和拉取次数是 Docker Hub 自身的人气统计，"
+                    "按原样显示。"
+                ),
             },
         ],
     },
@@ -618,10 +727,25 @@ HELP_PAGES = {
             f"{PROGRAM_NAME} kill 12345",
             f"{PROGRAM_NAME} kill --signal KILL nextcloud",
         ],
+        "footer": [
+            {
+                "title": "NOTES",
+                "intro": (
+                    "PRoot itself ignores every signal but QUIT, KILL "
+                    "and the job control ones, so TERM, INT or HUP "
+                    "reach the guest processes only. When they do not "
+                    "end the session, the container root is sent QUIT "
+                    "(which makes proot kill every traced process) and "
+                    "anything still left is sent KILL. Job control "
+                    "signals (STOP, CONT, TSTP) and USR1/USR2 are "
+                    "delivered as asked and never escalated."
+                ),
+            },
+        ],
     },
 
     "remove": {
-        "usage": "remove [OPTIONS] CONTAINER",
+        "usage": "remove [OPTIONS] CONTAINER|IMAGE",
         "aliases": ("rm",),
         "summary": (
             "永久删除指定的 proot 容器。不会请求确认，请谨慎操作。"
@@ -631,6 +755,11 @@ HELP_PAGES = {
             ("-v, --verbose", "每删除一个文件就打印其路径。"),
             ("-q, --quiet",
              "抑制非错误输出。与 --verbose 互斥。"),
+        ],
+        "examples": [
+            f"{PROGRAM_NAME} remove ubuntu",
+            f"{PROGRAM_NAME} remove --image ubuntu:24.04",
+            f"{PROGRAM_NAME} rm -i -a aarch64 myapp:latest",
         ],
     },
 
@@ -807,6 +936,22 @@ HELP_PAGES = {
             f"{PROGRAM_NAME} sync ./dotfiles/ ubuntu:/root/",
             f"{PROGRAM_NAME} sync --delete ./app/ ubuntu:/opt/app/"
         ],
+        "footer": [
+            {
+                "title": "NOTES",
+                "intro": (
+                    "Hard links become independent copies, so a tree "
+                    "that shares content between names grows on the "
+                    "way over. Special files (devices, FIFOs, sockets) "
+                    "are skipped, and ownership is never changed. "
+                    "An entry that cannot be read or written is "
+                    "reported and stepped over; the exit status is "
+                    "non-zero when any were. '--checksum' compares a "
+                    "CRC32, which detects changed content but is not "
+                    "an integrity check."
+                ),
+            },
+        ],
     },
 }
 
@@ -831,5 +976,6 @@ TOP_COMMANDS = [
     ("sync", "在容器与宿主之间同步文件。"),
     ("build", "从 Dockerfile 构建 OCI 镜像。"),
     ("push", "把本地构建的镜像推送到仓库。"),
+    ("search", "在 Docker Hub 上搜索镜像。"),
     ("mirror", "管理 Docker registry 镜像源（ls/test/use/unset/show）。"),
 ]

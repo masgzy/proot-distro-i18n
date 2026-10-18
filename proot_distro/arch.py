@@ -22,7 +22,9 @@
 # machine-specific knowledge (ELF header parsing, QEMU binary names, 32-bit
 # support probing) in one place so the rest of the codebase stays
 # arch-agnostic. detect_installed_arch() accepts a rootfs path so callers
-# are not coupled to the container storage layout.
+# are not coupled to the container storage layout. The proot binary itself
+# is located here too (get_proot_bin), since the emulator and proot paths
+# are made absolute for the same reason.
 
 import ctypes
 import os
@@ -33,6 +35,7 @@ from functools import lru_cache
 
 from proot_distro.message import crit_error
 from proot_distro.constants import TERMUX_PREFIX
+from proot_distro.guestfile import read_guest_bytes
 from proot_distro.paths import container_rootfs
 from proot_distro.i18n import _
 
@@ -92,25 +95,52 @@ _ELF_MACHINE_MAP = {
 }
 
 
-def _elf_arch(path: str) -> str:
-    """Return the proot-distro arch name for an ELF binary, or '' on failure."""
-    try:
-        with open(path, "rb") as fh:
-            ident = fh.read(20)
-        if len(ident) < 20 or ident[:4] != b"\x7fELF":
-            return ""
-        fmt = "<H" if ident[5] == 1 else ">H"  # EI_DATA: 1=LE, 2=BE
-        e_machine = struct.unpack_from(fmt, ident, 18)[0]
-        return _ELF_MACHINE_MAP.get(e_machine, "")
-    except OSError:
+# e_ident (16 bytes) + e_type (2) + e_machine (2): everything the probe
+# needs and nothing more, so how much is read never depends on the file.
+_ELF_HEADER_BYTES = 20
+
+
+def _elf_arch(ident) -> str:
+    """Return the proot-distro arch name for an ELF header, or '' if it isn't one.
+
+    Takes the *bytes*, not a path. Reading them is the caller's job
+    because where they come from is the whole question: these are a
+    container's binaries, and every component of the path to one is
+    image or guest content (see detect_installed_arch).
+    """
+    if not ident or len(ident) < _ELF_HEADER_BYTES or ident[:4] != b"\x7fELF":
         return ""
+    fmt = "<H" if ident[5] == 1 else ">H"  # EI_DATA: 1=LE, 2=BE
+    try:
+        e_machine = struct.unpack_from(fmt, ident, 18)[0]
+    except struct.error:
+        return ""
+    return _ELF_MACHINE_MAP.get(e_machine, "")
 
 
-def detect_installed_arch(container_name_or_rootfs: str) -> str:
+def detect_installed_arch(container_name_or_rootfs: str, *,
+                          rootfs_fd=None) -> str:
     """Detect CPU architecture of an installed container by reading ELF headers.
 
     Accepts either a plain container name (resolved as
     ``CONTAINERS_DIR/<name>/rootfs``) or a full path to the rootfs directory.
+    *rootfs_fd* is that directory when the caller has pinned it.
+
+    The candidates are read through the guest walk, the same one `login`
+    takes the container's passwd out of, rather than by composing
+    ``root + rel`` and handing the result to open(). That composition was
+    wrong three ways. It resolved the *middle* of the path on the host,
+    so a rootfs shipping an absolute ``/bin -> /usr/bin`` — or a guest
+    leaving ``usr -> /`` behind — had the probe read the **host's**
+    binaries and report the host's architecture: for an emulated
+    container that means no emulator is selected and the session cannot
+    start. It followed an absolute symlink out of the rootfs for the same
+    reason, where the walk re-anchors one at the guest's "/" the way
+    proot does at runtime, so a legitimate one now resolves to the right
+    binary instead of a host one. And open() on a *FIFO* blocks until a
+    peer appears, which a guest that plants one at ``/bin/sh`` simply
+    never provides — the login hung for as long as the user left it.
+    open_regular_at() refuses one outright.
     """
     if os.sep in container_name_or_rootfs or container_name_or_rootfs.startswith("/"):
         root = container_name_or_rootfs
@@ -123,7 +153,9 @@ def detect_installed_arch(container_name_or_rootfs: str) -> str:
         "/bin/bash", "/bin/sh", "/bin/su", "/bin/busybox",
     ]
     for rel in candidates:
-        arch = _elf_arch(root + rel)
+        arch = _elf_arch(read_guest_bytes(
+            root, rel, _ELF_HEADER_BYTES, root_fd=rootfs_fd,
+        ))
         if arch:
             return arch
     return "unknown"
@@ -192,11 +224,26 @@ _QEMU_PKGS = {
 
 
 def get_proot_bin() -> str:
-    """Return the proot executable to invoke, honoring PD_PROOT_BIN.
+    """Return the absolute path of the proot executable, or exit.
 
-    A set override is validated like --emulator: it must point at an
+    A set PD_PROOT_BIN is validated like --emulator: it must point at an
     existing, executable file, or the process exits with an error.
-    Unset falls back to the existing PATH lookup for "proot".
+    Unset falls back to the PATH lookup for "proot".
+
+    The answer is always absolute, and a lookup that finds nothing is a
+    refusal rather than the bare name "proot". Both callers hand this
+    string to an exec that resolves it against an environment the
+    *image* has a say in -- `login` to os.execvpe(child_env), the build's
+    RUN step to subprocess.Popen(env=child_env), which looks a name with
+    no directory in it up in that environment's PATH. PATH is
+    deliberately not blocked there, being the guest's to choose, so a
+    bare name meant an image's `ENV PATH=/tmp/mine` could decide which
+    binary this process became -- outside any container, before proot
+    had confined anything. A relative name is the same hole one step
+    removed, and worse once `login` chdirs into the rootfs: it would
+    resolve against a file the guest wrote. Every command that reaches
+    here has already passed cli.ensure_proot_installed(), so the exit is
+    a backstop, not the ordinary "proot is missing" report.
     """
     override = os.environ.get("PD_PROOT_BIN")
     if override:
@@ -204,8 +251,12 @@ def get_proot_bin() -> str:
             crit_error(_("PD_PROOT_BIN '{override}' is not found or not "
                          "executable.", override=override))
             sys.exit(1)
-        return override
-    return shutil.which("proot") or "proot"
+        return os.path.abspath(override)
+    found = shutil.which("proot")
+    if not found:
+        crit_error("proot utility does not exist on your system.")
+        sys.exit(1)
+    return os.path.abspath(found)
 
 
 def get_emulator_args(
@@ -215,6 +266,18 @@ def get_emulator_args(
 
     When emulator_override is given it is used as the emulator path directly,
     bypassing default selection and native-run checks.
+
+    The path handed to proot is absolute, for the reason get_proot_bin()
+    gives: both callers exec proot from *inside* the rootfs -- `login`
+    fchdir's into the pinned container rootfs just before execvpe, the
+    build's RUN step does the same in the child between fork and exec --
+    while this runs earlier, in this process's own working directory. A
+    relative `--emulator qemu-arm` (or a relative PATH entry, which makes
+    shutil.which() answer relatively) is validated here against one
+    directory and resolved by proot against another: the guest's rootfs,
+    whose contents an earlier step or a previous session wrote. Resolved
+    while the cwd still means what the user meant by it, the answer names
+    the file this checked whatever proot's cwd is by then.
     """
     if emulator_override:
         emu_path = emulator_override
@@ -245,7 +308,7 @@ def get_emulator_args(
                        f"'{pkg}' which is not installed.")
             sys.exit(1)
 
-    args = ["-q", emu_path]
+    args = ["-q", os.path.abspath(emu_path)]
     # Extra bindings needed for QEMU to locate Android system libraries.
     for path in (
         "/apex", "/linkerconfig/ld.config.txt",

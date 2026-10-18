@@ -20,9 +20,12 @@
 
 # Architecture: Pure-Python OCI/Docker registry client, split by concern:
 #
-#   refs.py        — parse_image_ref, derive_alias, ARCH_TO_DOCKER.
+#   refs.py        — parse_reference (Docker's reference grammar),
+#                    parse_image_ref, derive_alias, ARCH_TO_DOCKER.
 #                    No I/O.
-#   cache.py       — manifest/layer cache paths + save/load helpers.
+#   cache.py       — manifest/layer cache paths + save/load helpers,
+#                    and the digest checks every blob consumer runs
+#                    before trusting a cached file's name.
 #   media.py       — OCI/Docker media-type constants + canonical_json.
 #   transport.py   — User-Agent, AuthStrippingRedirectHandler, the
 #                    PD_DOCKER_AUTH token exchange.
@@ -32,19 +35,41 @@
 #                    through manifest fetch, layer download, apply.
 #   push.py        — push_image: blob existence probe, upload session,
 #                    monolithic PUT, manifest PUT.
+#   search.py      — search_images: Docker Hub's repository search,
+#                    the one registry API that is Hub-only.
 
 from proot_distro.helpers.docker.refs import (
     ARCH_TO_DOCKER,
+    DOCKER_TO_ARCH,
+    InvalidReference,
+    Reference,
+    canonical_ref,
     derive_alias,
     parse_image_ref,
+    parse_reference,
+    parse_tag_reference,
+    with_explicit_tag,
 )
 from proot_distro.helpers.docker.cache import (
-    all_layers_cached,
+    annotate_manifest_cache,
+    data_matches_digest,
+    image_cache_entry,
+    iter_cached_images,
+    layer_cache_name,
+    blob_present,
     layer_cache_path,
     load_manifest_cache,
     manifest_cache_path,
+    manifest_config_digest,
+    open_layer_cache_dir,
+    open_manifest_cache_dir,
+    referenced_blob_digests,
+    require_data_digest,
+    open_required_layer,
     save_manifest_cache,
+    split_digest,
     validate_digest,
+    open_verified_layer,
 )
 from proot_distro.helpers.docker.transport import (
     AuthStrippingRedirectHandler,
@@ -53,9 +78,11 @@ from proot_distro.helpers.docker.transport import (
     auth_opener,
     env_basic_auth,
     get_auth_token,
+    insecure_for,
     insecure_registry_msg,
     push_denied_msg,
     registry_base_url,
+    same_auth_origin,
 )
 from proot_distro.helpers.docker.layers import (
     apply_layer,
@@ -63,28 +90,60 @@ from proot_distro.helpers.docker.layers import (
 )
 from proot_distro.helpers.docker.pull import pull_image
 from proot_distro.helpers.docker.push import push_image
+from proot_distro.helpers.docker.search import (
+    SEARCH_DEFAULT_LIMIT,
+    SEARCH_LIMIT_MAX,
+    SEARCH_PAGE_MAX,
+    search_images,
+)
 
 __all__ = (
     "ARCH_TO_DOCKER",
     "AuthStrippingRedirectHandler",
-    "all_layers_cached",
+    "DOCKER_TO_ARCH",
+    "InvalidReference",
+    "Reference",
+    "SEARCH_DEFAULT_LIMIT",
+    "SEARCH_LIMIT_MAX",
+    "SEARCH_PAGE_MAX",
+    "annotate_manifest_cache",
     "apply_layer",
+    "data_matches_digest",
     "auth_denied_msg",
     "auth_note",
     "auth_opener",
+    "canonical_ref",
     "derive_alias",
     "download_blob",
     "env_basic_auth",
     "get_auth_token",
+    "image_cache_entry",
+    "insecure_for",
     "insecure_registry_msg",
+    "iter_cached_images",
+    "layer_cache_name",
+    "blob_present",
     "layer_cache_path",
     "load_manifest_cache",
     "manifest_cache_path",
+    "manifest_config_digest",
+    "open_layer_cache_dir",
+    "open_manifest_cache_dir",
     "parse_image_ref",
+    "parse_reference",
+    "parse_tag_reference",
     "pull_image",
     "push_denied_msg",
     "push_image",
+    "referenced_blob_digests",
     "registry_base_url",
+    "same_auth_origin",
+    "require_data_digest",
+    "open_required_layer",
     "save_manifest_cache",
+    "search_images",
+    "split_digest",
     "validate_digest",
+    "open_verified_layer",
+    "with_explicit_tag",
 )

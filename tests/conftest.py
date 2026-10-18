@@ -9,8 +9,8 @@
 # root conftest.py before collecting test modules, so doing it here at module
 # top is sufficient for the whole session.
 
+import ctypes
 import os
-import shutil
 import sys
 import tempfile
 
@@ -26,6 +26,14 @@ os.makedirs(os.environ["HOME"], exist_ok=True)
 
 # Deterministic, color-free output so assertions can match plain text.
 os.environ["PD_FORCE_NO_COLORS"] = "1"
+# i18n fork: upstream tests assert English message text; the shipped
+# program defaults to Chinese (PD_LANG unset -> zh_CN). Pin English for
+# the test run so the assertions test logic, not translations.
+os.environ.setdefault("PD_LANG", "en")
+# i18n fork: resolve_registry_url() defaults to a mirror when no config
+# exists; upstream tests exercise the official Docker Hub flow. Pin the
+# official endpoint for the test run.
+os.environ.setdefault("PD_REGISTRY_URL", "https://registry-1.docker.io")
 
 # Force non-Termux detection and anonymous registry auth regardless of the
 # host running the suite.
@@ -49,7 +57,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import pytest  # noqa: E402
 
 # Safe now: constants resolves into the sandbox on first import.
-from proot_distro import constants, locking, message  # noqa: E402
+from proot_distro import constants, dirfd, locking, message  # noqa: E402
 
 import _builders  # noqa: E402
 
@@ -72,8 +80,28 @@ def _assert_sandboxed():
 _assert_sandboxed()
 
 
+def _remove_tree(path):
+    """Remove *path* and everything under it; the paths that would not go.
+
+    Not shutil.rmtree: a deep tree is exactly what much of this suite
+    builds, and rmtree recurses. RecursionError is not an OSError, so
+    ignore_errors=True never caught it -- one tree a test left behind
+    turned every later test's setup into an error and the end of the
+    session into a traceback that took the report with it, burying the
+    failure that left the tree there. dirfd.remove_tree walks on an
+    explicit stack with a bounded number of descriptors, and relaxes a
+    directory a test sealed on its way in.
+    """
+    left = []
+    dirfd.remove_tree(
+        path, on_error=lambda rel, exc: left.append(
+            f"{os.path.join(path, rel) if rel else path}: {exc}"))
+    return left
+
+
 def pytest_sessionfinish(session, exitstatus):
-    shutil.rmtree(_SANDBOX, ignore_errors=True)
+    # Best effort: an exception here would replace the session's report.
+    _remove_tree(_SANDBOX)
 
 
 def pytest_collection_modifyitems(config, items):
@@ -92,13 +120,41 @@ def pytest_collection_modifyitems(config, items):
 # Per-test isolation.
 # ---------------------------------------------------------------------------
 
+def _clear_child_subreaper():
+    """Drop the subreaper flag a RUN step sets on the process it runs in.
+
+    run_step asks for PR_SET_CHILD_SUBREAPER so a step's daemonised
+    leftovers are reparented onto the build process rather than onto
+    init. It is process-wide and survives the test that triggered it,
+    which changes where *every* orphan in this process lands afterwards
+    -- `kill`'s process-tree walk is one of the things that notices.
+    """
+    from proot_distro.helpers.build_engine import run_step
+
+    run_step._subreaper_asked = None
+    try:
+        ctypes.CDLL(None, use_errno=True).prctl(
+            run_step._PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0
+        )
+    except (OSError, AttributeError, ValueError):
+        pass
+
+
 @pytest.fixture(autouse=True)
 def _clean_runtime():
     """Reset process globals and wipe the runtime/cache trees around each test."""
     message.set_quiet(False)
     locking._held_exclusive.clear()
+    _clear_child_subreaper()
     for d in (constants.RUNTIME_DIR, constants.BASE_CACHE_DIR):
-        shutil.rmtree(d, ignore_errors=True)
+        left = _remove_tree(d)
+        if left:
+            # The test is about to run on whatever an earlier one left
+            # behind; say so here rather than let it fail for no reason
+            # of its own.
+            raise RuntimeError(
+                "cannot reset the sandbox before this test:\n  "
+                + "\n  ".join(left))
     os.makedirs(constants.CONTAINERS_DIR, exist_ok=True)
     os.makedirs(constants.BASE_CACHE_DIR, exist_ok=True)
     os.makedirs(constants.LAYER_CACHE_DIR, exist_ok=True)
@@ -106,6 +162,7 @@ def _clean_runtime():
     yield
     message.set_quiet(False)
     locking._held_exclusive.clear()
+    _clear_child_subreaper()
 
 
 # ---------------------------------------------------------------------------

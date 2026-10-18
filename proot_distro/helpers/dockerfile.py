@@ -23,8 +23,9 @@
 # access. Handles parser directives (only `escape=` changes lexer
 # behaviour), line continuations, full-line comments, JSON exec form
 # detection, here-docs for RUN/COPY/ADD, and per-instruction flag
-# parsing. Variable expansion is intentionally not performed here —
-# the engine does that with the live ARG/ENV scope.
+# parsing. Variable expansion is intentionally not performed while
+# parsing — the engine does that with the live ARG/ENV scope, using
+# expand_vars() at the bottom of this module.
 
 import json
 import re
@@ -47,6 +48,18 @@ _HEREDOC_INSTRUCTIONS = frozenset({"ADD", "COPY", "RUN"})
 # other `# k=v` lines after the first non-directive line become
 # normal comments.
 _DIRECTIVES = frozenset({"syntax", "escape", "check"})
+
+
+# How large a Dockerfile may be before `build` refuses to read it. A
+# Dockerfile is instructions -- kilobytes, a few megabytes with here-doc
+# bodies inlined -- and the parser holds the whole text and then one
+# record per instruction on top of it, so its size is the parser's
+# memory. The file is as often copied as written, and everything else
+# this program parses whole out of a stranger's file is read through a
+# ceiling; 16 MiB is the one they share, orders of magnitude above any
+# real Dockerfile and still bounded. The cap is on the bytes actually
+# read, not on a stat: stdin has no size, and a file's can change.
+MAX_DOCKERFILE_BYTES = 16 * 1024 * 1024
 
 
 class DockerfileSyntaxError(Exception):

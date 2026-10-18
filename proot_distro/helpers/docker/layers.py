@@ -18,160 +18,163 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 #
 
-# 架构：Blob 级操作 —— 下载单个层到本地缓存，并将缓存的层应用到
-# rootfs 目录。应用器处理 OCI whiteouts（§6.1.2），延迟硬链接复制
-# 直到所有常规文件写入完成，并最后戳目录 mtime 以免被中间文件写入覆盖。
+# Architecture: Blob-level operations — download a single layer to the
+# local cache, and apply a cached layer to a rootfs directory. The
+# applier handles OCI whiteouts (§6.1.2), defers hard-link copies until
+# all regular files are written, and stamps directory mtimes last so
+# they don't get clobbered by intermediate file writes.
 
 import hashlib
 import os
 import socket
+import threading
 import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from proot_distro.message import log_info, warn
-from proot_distro.progress import clear_bar, draw_bytes_bar, fmt_size, progress_active
-from proot_distro.helpers.download import retry_http
-from proot_distro.helpers.docker.cache import layer_cache_path
+from proot_distro.atomic import atomic_replace
+from proot_distro.i18n import _
+from proot_distro.message import log_info
+from proot_distro.progress import clear_bar, draw_bytes_bar, fmt_size
+from proot_distro.helpers.download import (
+    declared_length, new_request, require_complete_body, retry_http,
+)
+from proot_distro.helpers.docker.cache import (
+    layer_cache_path, open_verified_layer, split_digest,
+)
 from proot_distro.helpers.docker.transport import (
     opener, _ua,
 )
-from proot_distro.helpers.tar_extract import extract_tar_to_rootfs
+from proot_distro.helpers.tar_extract import extract_tar_fd_to_rootfs
 
 
 # 下载块大小：1 MiB。
 _CHUNK_SIZE = 1 << 20
 
-# 单次读取超时：30 秒。
-_READ_TIMEOUT = 30.0
-
-# blob 下载最大重试次数。
-_BLOB_MAX_RETRIES = 3
-
-# 分块并行下载阈值：大于此值的 blob 使用并行分块下载。
-# 小于此值的 blob 使用串行下载（含断点续传）。
+# 分块并行下载阈值：大于此值的 blob 使用并行分块下载（fork 优化，
+# 类似 aria2 的分块下载）。单连接慢的网络（如国内访问 Docker Hub）
+# 下，4 路并行可显著提升吞吐。
 _PARALLEL_THRESHOLD = 5 << 20  # 5 MiB
 
 # 分块数量：把单个 blob 切成这么多段并行下载。
 _PARALLEL_CHUNKS = 4
 
 
-def _part_path(dest: str) -> str:
-    """返回下载中的持久化 .part 文件路径。"""
-    return dest + ".part"
-
-
-def _cleanup_part(dest: str) -> None:
-    """删除残留的 .part 文件（如果存在）。"""
-    try:
-        os.remove(_part_path(dest))
-    except FileNotFoundError:
-        pass
-    except OSError:
-        pass
-
-
-def _download_chunk(
+def _download_chunk_range(
     url: str, headers: dict, start: int, end: int,
-    part_file: str, insecure: bool, timeout: float,
+    tmp_fd: int, insecure: bool, timeout: float,
     short_id: str, chunk_idx: int, n_chunks: int,
-    progress_state: dict,
-) -> int:
-    """下载 blob 的一个字节范围 [start, end]，写入 .part 文件的对应位置。
-
-    返回已下载的字节数。使用 ``Range: bytes=start-end`` 请求。
-    写入使用 ``seek + write`` 定位到正确偏移，多线程安全（各线程写不同区域）。
-    """
+    progress: dict, progress_lock: threading.Lock,
+) -> None:
+    """下载 blob 的一个字节范围 [start, end]，用 pwrite 写入 tmp_fd。"""
     range_headers = {**headers, "Range": f"bytes={start}-{end}"}
-    req = urllib.request.Request(url, headers=range_headers)
+    req = new_request(url, headers=range_headers)
 
     def _attempt():
-        resp = opener(insecure).open(req, timeout=timeout)
+        resp = opener(insecure).open(req)
         with resp:
             if resp.status not in (200, 206):
                 raise RuntimeError(
                     f"Unexpected status {resp.status} for range {start}-{end}"
                 )
-            # 206 Partial Content 或 200（服务器忽略 Range）
             offset = start if resp.status == 206 else 0
             written = 0
-            with open(part_file, "r+b") as fh:
-                fh.seek(offset)
-                while True:
-                    try:
-                        chunk = resp.read(_CHUNK_SIZE)
-                    except socket.timeout:
-                        raise urllib.error.URLError(
-                            f"Read timeout after {timeout}s "
-                            f"(chunk {chunk_idx}/{n_chunks}, "
-                            f"{written}/{end - start + 1} bytes)"
-                        )
-                    if not chunk:
-                        break
-                    fh.write(chunk)
-                    written += len(chunk)
-                    # 更新全局进度
-                    progress_state["done"] += len(chunk)
-                    total = progress_state["total"]
-                    elapsed = time.monotonic() - progress_state["start"]
-                    speed = progress_state["done"] / elapsed if elapsed > 0 else 0
-                    draw_bytes_bar(
-                        progress_state["done"], total,
-                        noun=f"downloaded {fmt_size(int(speed))}/s",
+            while True:
+                try:
+                    chunk = resp.read(_CHUNK_SIZE)
+                except socket.timeout:
+                    raise urllib.error.URLError(
+                        f"Read timeout after {timeout}s "
+                        f"(chunk {chunk_idx}/{n_chunks}, "
+                        f"{written}/{end - start + 1} bytes)"
                     )
+                if not chunk:
+                    break
+                os.pwrite(tmp_fd, chunk, offset + written)
+                written += len(chunk)
+                # 更新共享进度（加锁保护 += ）
+                with progress_lock:
+                    progress["done"] += len(chunk)
+                    done, total = progress["done"], progress["total"]
+                elapsed = time.monotonic() - progress["start"]
+                speed = done / elapsed if elapsed > 0 else 0
+                draw_bytes_bar(
+                    done, total,
+                    noun=_("downloaded {speed}/s", speed=fmt_size(int(speed))),
+                )
             return written
 
     return retry_http(
         _attempt,
-        what=f"Downloading layer {short_id} chunk {chunk_idx}/{n_chunks}",
-        max_retries=_BLOB_MAX_RETRIES,
+        what=_("Downloading layer {short_id} chunk {idx}/{n}",
+               short_id=short_id, idx=chunk_idx, n=n_chunks),
+        max_retries=3,
         retry_delay=3,
     )
 
 
+def _probe_blob_size(
+    url: str, headers: dict, insecure: bool, timeout: float,
+) -> int:
+    """HEAD 探测 blob 大小；服务器不支持 Range 时返回 0。
+
+    探测只是并行下载的优化入口：任何失败（网络、响应形状、
+    测试替身缺少属性等）都返回 0，让调用方走官方串行路径。
+    """
+    head_req = urllib.request.Request(
+        url, headers={**headers, "Range": "bytes=0-0"})
+    try:
+        with opener(insecure).open(head_req) as head_resp:
+            status = getattr(head_resp, "status", None) or getattr(
+                head_resp, "code", None)
+            if status == 206:
+                cr = head_resp.headers.get("Content-Range", "")
+                # Content-Range: bytes 0-0/47400000
+                if "/" in cr:
+                    total = cr.rsplit("/", 1)[-1]
+                    if total.isdigit():
+                        return int(total)
+    except Exception:
+        pass
+    return 0
+
+
 def _download_blob_parallel(
     url: str, headers: dict, total_size: int,
-    part_file: str, insecure: bool, timeout: float,
+    tmp_fd: int, insecure: bool, timeout: float,
     short_id: str,
 ) -> None:
-    """将单个 blob 分成多块并行下载。
+    """将单个 blob 分成多块并行下载到已打开的 tmp_fd。
 
-    预分配 .part 文件到目标大小，每个线程下载一个字节范围并
-    通过 seek+write 写入对应位置。全部完成后由调用方校验哈希。
+    每个线程下载一个字节范围并通过 os.pwrite 写入对应偏移
+    （各线程写不同区域，互不干扰）。全部完成后由调用方回读校验哈希。
     """
     n_chunks = _PARALLEL_CHUNKS
     chunk_size = total_size // n_chunks
-    # 最后一块负责剩余字节
     ranges = []
     for i in range(n_chunks):
         start = i * chunk_size
         end = (i + 1) * chunk_size - 1 if i < n_chunks - 1 else total_size - 1
         ranges.append((start, end))
 
-    # 预分配文件
-    with open(part_file, "wb") as fh:
-        fh.truncate(total_size)
+    log_info(_("{short_id}: downloading in {n} parallel parts "
+               "({total} total)...",
+               short_id=short_id, n=n_chunks, total=fmt_size(total_size)))
 
-    log_info(f"{short_id}: 并行下载 {n_chunks} 块 "
-             f"(总计 {fmt_size(total_size)})...")
-
-    progress_state = {
-        "done": 0,
-        "total": total_size,
-        "start": time.monotonic(),
-    }
+    progress = {"done": 0, "total": total_size, "start": time.monotonic()}
+    progress_lock = threading.Lock()
 
     errors = []
     with ThreadPoolExecutor(max_workers=n_chunks) as pool:
         futures = {}
         for i, (start, end) in enumerate(ranges):
             fut = pool.submit(
-                _download_chunk,
+                _download_chunk_range,
                 url, headers, start, end,
-                part_file, insecure, timeout,
+                tmp_fd, insecure, timeout,
                 short_id, i + 1, n_chunks,
-                progress_state,
+                progress, progress_lock,
             )
             futures[fut] = (i, start, end)
 
@@ -185,7 +188,6 @@ def _download_blob_parallel(
     clear_bar()
 
     if errors:
-        # 至少有一块失败，清理并报错
         details = "; ".join(
             f"chunk {i+1} ({start}-{end}): {exc}"
             for i, start, end, exc in errors
@@ -194,234 +196,137 @@ def _download_blob_parallel(
             f"Parallel download failed for {short_id}: {details}"
         )
 
-    elapsed = time.monotonic() - progress_state["start"]
+    elapsed = time.monotonic() - progress["start"]
     speed = total_size / elapsed if elapsed > 0 else 0
-    log_info(f"{short_id}: 下载完成 "
-             f"({fmt_size(total_size)}，{fmt_size(int(speed))}/s)")
+    log_info(_("{short_id}: download complete "
+               "({total}, {speed}/s)",
+               short_id=short_id, total=fmt_size(total_size),
+               speed=fmt_size(int(speed))))
 
 
 def download_blob(
     repo: str, digest: str, token: str, base: str,
-    insecure: bool = False, *,
-    timeout: float = _READ_TIMEOUT,
-    quiet: bool = False,
-) -> str:
-    """下载 blob 到层缓存；返回本地文件路径。
+    insecure: bool = False,
+) -> int:
+    """Download a blob to the layer cache; return an open descriptor on it.
 
-    通过 sha256 流式校验数据，在与期望的 *digest* 匹配后才提升文件。
-    因此缓存中只存在完整的层。
+    Streams the bytes through sha256 and verifies the result against the
+    expected *digest* before promoting the .tmp file. The descriptor is a
+    duplicate of the one the bytes were *written* through, so it names
+    the very inode that was just hashed — os.replace() carries the inode
+    across, and re-opening the destination by name afterwards would have
+    cost a second full hash to prove the same thing. The caller closes
+    it.
 
-    **并行分块下载**：大于 5 MiB 的 blob 被切成 4 块并行下载
-    （类似 aria2 的分块下载）。每个线程使用 HTTP Range 请求
-    下载不同的字节范围，写入预分配文件的对应位置。这样即使
-    单连接速度只有 500 KB/s，4 路并行也能达到 2 MB/s。
-
-    **断点续传**（仅小 blob）：小于 5 MiB 的 blob 使用串行下载
-    带 .part 断点续传支持。
-
-    *timeout*（默认 30s）是单次读取的 socket 超时。
-
-    *quiet* 抑制进度条输出。并发下载多个层时设为 True。
+    A blob already in the cache is re-hashed rather than taken at its
+    name (open_verified_layer): the file may have been written by
+    something other than this function, so its name is not evidence of
+    its content. One that fails is dropped and downloaded again.
     """
     dest = layer_cache_path(digest)
-    if os.path.isfile(dest):
-        return dest
+    cached = open_verified_layer(digest)
+    if cached is not None:
+        return cached
 
-    if ":" not in digest:
-        raise RuntimeError(f"Malformed layer digest '{digest}'.")
-    algo, expected_hex = digest.split(":", 1)
-    if algo.lower() != "sha256":
-        raise RuntimeError(
-            f"Unsupported layer digest algorithm '{algo}' (only sha256 "
-            f"is supported)."
-        )
+    _algo, expected_hex = split_digest(digest)
 
     url = f"{base}/v2/{repo}/blobs/{digest}"
-    expected_hex = expected_hex.lower()
-    short_id = digest.split(":")[-1][:12]
-    part = _part_path(dest)
-
-    base_headers = {**_ua()}
+    headers = {**_ua()}
     if token:
-        base_headers["Authorization"] = f"Bearer {token}"
+        headers["Authorization"] = f"Bearer {token}"
+    req = new_request(url, headers=headers)
 
-    # ---- 先发 HEAD 请求获取 blob 大小 ----
-    blob_size = 0
-    head_req = urllib.request.Request(url, headers={**base_headers, "Range": "bytes=0-0"})
-    try:
-        with opener(insecure).open(head_req, timeout=timeout) as head_resp:
-            # 206 Partial Content → 服务器支持 Range
-            if head_resp.status == 206:
-                cr = head_resp.headers.get("Content-Range", "")
-                # Content-Range: bytes 0-0/47400000
-                if "/" in cr:
-                    blob_size = int(cr.rsplit("/", 1)[-1])
-            elif head_resp.status == 200:
-                blob_size = int(head_resp.headers.get("Content-Length", 0))
-    except Exception:
-        pass  # HEAD 失败则回退到串行下载
-
-    # ---- 路径选择：大 blob 并行分块，小 blob 串行续传 ----
-    if blob_size >= _PARALLEL_THRESHOLD:
-        # 并行分块下载
-        def _parallel_attempt():
-            _download_blob_parallel(
-                url, base_headers, blob_size,
-                part, insecure, timeout, short_id,
-            )
-            # 校验哈希
-            hasher = hashlib.sha256()
-            with open(part, "rb") as fh:
-                while True:
-                    chunk = fh.read(_CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    hasher.update(chunk)
-            actual_hex = hasher.hexdigest()
-            if actual_hex != expected_hex:
-                _cleanup_part(dest)
-                raise RuntimeError(
-                    f"Layer integrity check failed for digest '{digest}': "
-                    f"expected {expected_hex}, got {actual_hex}."
-                )
-            os.replace(part, dest)
-            return dest
-
-        try:
-            return retry_http(
-                _parallel_attempt,
-                what=f"Downloading layer {short_id}",
-                max_retries=2,
-                retry_delay=3,
-            )
-        finally:
-            clear_bar()
-
-    # ---- 串行下载（含断点续传） ----
-    def _serial_attempt():
-        # 检查上次失败留下的部分下载文件。
-        existing = 0
-        if os.path.isfile(part):
-            existing = os.path.getsize(part)
-
-        headers = {**base_headers}
-        if existing > 0:
-            headers["Range"] = f"bytes={existing}-"
-
-        req = urllib.request.Request(url, headers=headers)
-
-        # 每次尝试新建哈希器。如果是续传，需要预读已有字节
-        # 喂给哈希器，使最终哈希覆盖完整 blob。
+    def _attempt():
+        # Fresh hasher per attempt: a retry re-downloads the whole blob, so
+        # state from a failed partial download must not carry over.
         hasher = hashlib.sha256()
-        mode = "ab" if existing > 0 else "wb"
-
         try:
-            resp = opener(insecure).open(req, timeout=timeout)
-        except urllib.error.HTTPError as exc:
-            if exc.code == 416 and existing > 0:
-                _cleanup_part(dest)
-                raise urllib.error.URLError(
-                    "Range request failed (416); restarting from scratch"
-                )
-            raise
-
-        with resp:
-            status = resp.status
-            if status == 200 and existing > 0:
-                existing = 0
-                mode = "wb"
-                hasher = hashlib.sha256()
-
-            total = int(resp.headers.get("Content-Length", 0))
-            if status == 206:
-                total = existing + total
-            elif total and existing == 0:
-                pass
-            elif total and existing > 0:
-                total = existing + total
-
-            downloaded = existing
-
-            if existing > 0 and not quiet:
-                log_info(f"{short_id}: 从 {fmt_size(existing)} 续传")
-            if existing > 0:
-                with open(part, "rb") as fh:
+            with atomic_replace(dest) as tmp_fd:
+                # fork 优化：先探测 blob 大小与 Range 支持，超过阈值则
+                # 分块并行下载（类似 aria2），否则走官方串行流式路径。
+                blob_size = _probe_blob_size(url, headers, insecure, 30.0)
+                if blob_size >= _PARALLEL_THRESHOLD:
+                    _download_blob_parallel(
+                        url, headers, blob_size, tmp_fd, insecure, 30.0,
+                        short_id,
+                    )
+                    # 回读整个文件计算哈希（并行写时无法边写边算）。
+                    got = 0
                     while True:
-                        chunk = fh.read(_CHUNK_SIZE)
+                        chunk = os.pread(tmp_fd, 1 << 20, got)
                         if not chunk:
                             break
                         hasher.update(chunk)
-
-            with open(part, mode, buffering=1 << 20) as fh:
-                dl_start = time.monotonic()
-                last_log = dl_start
-                while True:
-                    try:
-                        chunk = resp.read(_CHUNK_SIZE)
-                    except socket.timeout:
-                        raise urllib.error.URLError(
-                            f"Read timeout after {timeout}s "
-                            f"(downloaded {downloaded}/{total} bytes)"
+                        got += len(chunk)
+                    if got != blob_size:
+                        raise RuntimeError(
+                            f"Parallel download incomplete for "
+                            f"'{digest}': got {got} of {blob_size} bytes."
                         )
-                    if not chunk:
-                        break
-                    fh.write(chunk)
-                    hasher.update(chunk)
-                    downloaded += len(chunk)
-                    if not quiet:
-                        elapsed = time.monotonic() - dl_start
-                        speed = (downloaded - existing) / elapsed if elapsed > 0 else 0
-                        draw_bytes_bar(
+                else:
+                    with opener(insecure).open(req) as resp, \
+                            open(tmp_fd, "wb", closefd=False) as fh:
+                        total = declared_length(resp)
+                        downloaded = 0
+                        while True:
+                            chunk = resp.read(65536)
+                            if not chunk:
+                                break
+                            fh.write(chunk)
+                            hasher.update(chunk)
+                            downloaded += len(chunk)
+                            draw_bytes_bar(downloaded, total,
+                                           noun=_("downloaded"))
+                        # Before the digest, so a connection that ended early
+                        # is reported as what it is and retried, instead of
+                        # surfacing as the registry serving the wrong bytes --
+                        # which is not retried, being no fault of the wire.
+                        require_complete_body(
                             downloaded, total,
-                            noun=f"downloaded {fmt_size(int(speed))}/s",
+                            _("Downloading blob {blob}", blob=digest[:19]),
                         )
-                        # 非 TTY 环境每 5 秒输出一次进度
-                        now = time.monotonic()
-                        if now - last_log > 5 and not progress_active():
-                            last_log = now
-                            pct = downloaded * 100 // total if total else 0
-                            log_info(f"{short_id}: {pct}% "
-                                     f"({fmt_size(downloaded)}/{fmt_size(total)}, "
-                                     f"{fmt_size(int(speed))}/s)")
-
-        actual_hex = hasher.hexdigest()
-        if actual_hex != expected_hex:
-            _cleanup_part(dest)
-            raise RuntimeError(
-                f"Layer integrity check failed for digest '{digest}': "
-                f"expected {expected_hex}, got {actual_hex}."
-            )
-
-        os.replace(part, dest)
-
-        dl_elapsed = time.monotonic() - dl_start
-        dl_bytes = downloaded - existing
-        if dl_elapsed > 0 and dl_bytes > 0:
-            speed = dl_bytes / dl_elapsed
-            log_info(f"{short_id}: 下载完成 "
-                     f"({fmt_size(dl_bytes)}，{fmt_size(int(speed))}/s)")
-
-        return dest
-
-    try:
-        result = retry_http(
-            _serial_attempt,
-            what=f"Downloading layer {short_id}",
-            max_retries=_BLOB_MAX_RETRIES,
-            retry_delay=3,
-        )
-    finally:
-        if not quiet:
+                actual_hex = hasher.hexdigest()
+                if actual_hex != expected_hex.lower():
+                    raise RuntimeError(
+                        f"Layer integrity check failed for digest '{digest}': "
+                        f"expected {expected_hex}, got {actual_hex}."
+                    )
+                # A duplicate of the descriptor the bytes were written
+                # through, so what the caller reads is the inode they
+                # went into. atomic_replace closes its own once the
+                # rename has promoted it; nothing that later happens to
+                # the name changes what this names.
+                fd = os.dup(tmp_fd)
+                os.lseek(fd, 0, os.SEEK_SET)
+        finally:
             clear_bar()
+        return fd
 
-    return result
+    short_id = digest.split(":")[-1][:12]
+    return retry_http(_attempt, what=_("Downloading layer {short_id}",
+                                       short_id=short_id))
 
 
-def apply_layer(layer_path: str, rootfs_dir: str) -> None:
-    """将一个 OCI/Docker 层（gzip 压缩的 tar）应用到 rootfs_dir。
+def apply_layer(layer_fd: int, rootfs_fd: int, *, digest: str = "") -> None:
+    """Apply one OCI/Docker layer (a tar, compressed or not) into *rootfs_fd*.
 
-    是 extract_tar_to_rootfs 的薄封装，开启 OCI whiteout 处理
-    （.wh.<name> 删除同级条目，.wh..wh..opq 清空父目录）。
-    详见该函数的完整提取不变式说明。
+    Takes the **descriptor** the verification handed back, not a path, so
+    the inode read is the one that was hashed (see
+    cache.open_verified_layer). With *digest* the extraction re-hashes as
+    it consumes and refuses a total that does not match, which is what
+    covers the remaining case a descriptor cannot: the same inode
+    truncated and rewritten in place. The rootfs is a descriptor for the
+    same reason the blob is: every member goes in as (dir_fd, name)
+    beneath it. Thin wrapper around
+    extract_tar_fd_to_rootfs that turns on OCI whiteout handling
+    (.wh.<name> deletes sibling, .wh..wh..opq clears the parent dir). See
+    that function for the full set of invariants enforced during
+    extraction.
     """
-    extract_tar_to_rootfs(layer_path, rootfs_dir, handle_whiteouts=True)
+    short = digest.split(":")[-1][:12] if digest else ""
+    expected = split_digest(digest)[1] if digest else ""
+    extract_tar_fd_to_rootfs(
+        layer_fd, rootfs_fd, handle_whiteouts=True,
+        subject=f"layer {short}" if short else "layer",
+        expected_sha256=expected,
+    )

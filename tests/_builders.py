@@ -6,6 +6,7 @@
 # rootfs/container trees — so tests can drive the real code paths against
 # both well-formed and hostile input.
 
+import contextlib
 import gzip
 import hashlib
 import io
@@ -131,6 +132,59 @@ def rootfs_members(extra=()):
 # ---------------------------------------------------------------------------
 # Layer blobs (gzipped tar) + OCI image-layout archives
 # ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def dir_fd(path):
+    """A directory descriptor for an API that names a *pinned* rootfs.
+
+    The extractor, apply_layer() and pull_image() all take the rootfs as
+    a descriptor: resolving containers/<name>/rootfs a second time is
+    what the pin exists to prevent. Tests hold paths, so this is the
+    adaptor, and it is here so the ownership rule stays in one place.
+    """
+    fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def apply_layer_file(path, rootfs_dir):
+    """apply_layer() for a blob that lives at *path*.
+
+    The production API takes the descriptor the digest check was made on
+    (cache.open_verified_layer) and a descriptor on the rootfs, so a test
+    holding both on disk opens them itself.
+    """
+    from proot_distro.helpers.docker.layers import apply_layer
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        with dir_fd(rootfs_dir) as rfd:
+            apply_layer(fd, rfd)
+    finally:
+        os.close(fd)
+
+
+def pull_image_into(image_ref, rootfs_dir, arch, **kw):
+    """pull_image() for a rootfs given as a path."""
+    from proot_distro.helpers.docker.pull import pull_image
+    with dir_fd(rootfs_dir) as rfd:
+        return pull_image(image_ref, rfd, arch, **kw)
+
+
+def install_local_into(archive_path, rootfs_dir, arch):
+    """install_from_local_file() for a rootfs given as a path."""
+    from proot_distro.commands.install_local import install_from_local_file
+    with dir_fd(rootfs_dir) as rfd:
+        return install_from_local_file(str(archive_path), rfd, arch)
+
+
+def extract_tar_into(archive_path, rootfs_dir, **kw):
+    """extract_tar_to_rootfs() for a rootfs given as a path."""
+    from proot_distro.helpers.tar_extract import extract_tar_to_rootfs
+    with dir_fd(rootfs_dir) as rfd:
+        extract_tar_to_rootfs(str(archive_path), rfd, **kw)
+
 
 def make_layer_blob(members):
     """Return (gzip_bytes, digest, diff_id) for an OCI/Docker layer."""
@@ -320,6 +374,31 @@ def simple_image_manifest(image_ref="test:latest", arch="x86_64",
 
 
 # ---------------------------------------------------------------------------
+# COPY/ADD file_map entries
+# ---------------------------------------------------------------------------
+
+def file_map_entry(src, *, mode=0o644, uid=0, gid=0, mtime=0):
+    """A COPY/ADD file_map "file" entry for the file at *src*.
+
+    An entry names the tree its bytes come from and the components below
+    it, never a path to open: both consumers re-walk those components
+    from the root with O_NOFOLLOW before reading (layer_diff.MapSources),
+    so a component swapped after the enumeration is refused rather than
+    followed.
+    """
+    src = str(src)
+    root, name = os.path.split(src)
+    try:
+        size = os.stat(src).st_size
+    except OSError:
+        size = 0
+    return {
+        "kind": "file", "root": root, "rel": (name,), "src": src,
+        "mode": mode, "uid": uid, "gid": gid, "mtime": mtime, "size": size,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Filesystem assertions
 # ---------------------------------------------------------------------------
 
@@ -343,3 +422,50 @@ def tree_snapshot(root):
                 with open(full, "rb") as fh:
                     snap[rel] = ("file", fh.read())
     return snap
+
+
+# ---------------------------------------------------------------------------
+# login / run: the environment handed to proot
+# ---------------------------------------------------------------------------
+
+def login_args(name, **over):
+    """A `login` argparse namespace with --get-proot-cmd set.
+
+    Every flag `_login_with_rootfs` reads is present, so a test overrides
+    only the ones it is about.
+    """
+    from types import SimpleNamespace
+    base = dict(container_name=name, get_proot_cmd=True, user="root",
+                kernel=None, hostname="localhost", work_dir="",
+                redirect_ports=False, isolated=False, minimal=False,
+                shared_home=False, shared_tmp=False, shared_x11=False,
+                no_link2symlink=False, no_sysvipc=False, no_kill_on_exit=False,
+                detach=False, bind=[], env=[], login_cmd=[], emulator=None)
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def parse_proot_cmd_env(out):
+    """The K=V assignments `--get-proot-cmd` printed, as a dict.
+
+    The printed line is `env -i K=V ... <proot> --flag ...`, so the
+    assignments are everything between `env -i` and the binary.
+    """
+    env = {}
+    for token in out.replace("\\\n", " ").split():
+        if token.endswith("proot") or token.startswith("--"):
+            break
+        if "=" in token and not token.startswith("env"):
+            key, _, val = token.partition("=")
+            env[key] = val.strip('"')
+    return env
+
+
+def login_child_env(command, args, capsys):
+    """Run *command* (command_login / command_run) with --get-proot-cmd set
+    and return the environment it would have exec'd proot with."""
+    import pytest
+    with pytest.raises(SystemExit) as exc:
+        command(args)
+    assert exc.value.code == 0
+    return parse_proot_cmd_env(capsys.readouterr().out)

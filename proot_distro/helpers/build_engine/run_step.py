@@ -27,10 +27,24 @@
 #   3. Snapshot the rootfs, run the command under proot, snapshot
 #      again, diff, and pack the delta into a gzipped layer that's
 #      stored under its content digest in LAYER_CACHE_DIR.
+#
+# A step ends when nothing of it is still running, not when its root
+# process exits. Docker gets that from the pid namespace it tears down;
+# on Termux proot's --kill-on-exit extension kills its tracees; off
+# Termux there was nothing, so `RUN service x start` -- or a plain
+# `cmd &` -- left a process writing into the stage rootfs while the
+# "after" snapshot was being taken, which makes a layer that differs
+# from run to run, and left a daemon running long after the build.
+# _stop_step() closes both halves of that: the process group proot
+# leads, and the descendants that daemonise out of it, which land back
+# on this process because it makes itself a child subreaper first.
 
+import ctypes
 import os
 import signal
 import subprocess
+import tempfile
+import time
 
 from proot_distro.constants import (
     DEFAULT_PATH_ENV,
@@ -40,18 +54,26 @@ from proot_distro.constants import (
     TERMUX_PREFIX,
     PROGRAM_NAME,
 )
-from proot_distro.message import log_info
+from proot_distro import dirfd
+from proot_distro.atomic import publish_file
+from proot_distro.execenv import (
+    CONTAINER_MARKER, is_exportable, is_host_exec_var,
+)
+from proot_distro.message import log_info, warn
 from proot_distro.arch import (
     ARCH_UNAME_M, get_device_cpu_arch, get_emulator_args, get_proot_bin,
 )
-from proot_distro.sysdata import setup_fake_sysdata, fake_proc_bindings
+from proot_distro.shm import make_guest_tmp, make_shm_dir
+from proot_distro.sysdata import setup_fake_sysdata, fake_sysdata_bindings
 from proot_distro.helpers.build_cache import (
     compute_recipe_hash, lookup as cache_lookup, record as cache_record,
 )
 from proot_distro.helpers.build_engine.constants import PREDEFINED_ARGS
 from proot_distro.helpers.build_engine.errors import BuildError
 from proot_distro.helpers.build_engine.users import resolve_user_for_proot
-from proot_distro.helpers.docker import apply_layer, layer_cache_path
+from proot_distro.helpers.docker import (
+    apply_layer, layer_cache_path, open_verified_layer,
+)
 from proot_distro.helpers.layer_diff import (
     diff_snapshots, snapshot, write_layer_tar,
 )
@@ -87,9 +109,23 @@ def do_run(engine, instr):
     if not engine.no_cache:
         hit = cache_lookup(recipe)
         if hit is not None:
-            cached_path = layer_cache_path(hit["layer_digest"])
-            if os.path.isfile(cached_path):
-                apply_layer(cached_path, stage.rootfs_dir)
+            # A recorded layer whose blob no longer hashes to its digest
+            # is not a cache hit: the step is re-run instead, which is
+            # what an evicted blob would have caused anyway.
+            try:
+                cached_fd = open_verified_layer(hit["layer_digest"])
+            except RuntimeError:
+                cached_fd = None
+            if cached_fd is not None:
+                try:
+                    rootfs_fd = _rootfs_fd(stage)
+                    try:
+                        apply_layer(cached_fd, rootfs_fd,
+                                    digest=hit["layer_digest"])
+                    finally:
+                        os.close(rootfs_fd)
+                finally:
+                    os.close(cached_fd)
                 stage.layers.append({
                     "digest": hit["layer_digest"],
                     "size": hit["size"],
@@ -99,7 +135,7 @@ def do_run(engine, instr):
                 return
 
     engine.log("Indexing rootfs state...")
-    before = snapshot(stage.rootfs_dir)
+    before = snapshot(stage.rootfs_dir, rootfs_fd=stage.rootfs_fd)
     exit_code = _exec_proot(engine, stage, command, stdin_input)
     if exit_code != 0:
         raise BuildError(
@@ -108,7 +144,7 @@ def do_run(engine, instr):
         )
 
     engine.log("Capturing filesystem changes...")
-    after = snapshot(stage.rootfs_dir)
+    after = snapshot(stage.rootfs_dir, rootfs_fd=stage.rootfs_fd)
     added, modified, deleted = diff_snapshots(before, after)
     paths_to_pack = added + modified
 
@@ -125,10 +161,13 @@ def do_run(engine, instr):
     )
     digest, size, diff_id = write_layer_tar(
         stage.rootfs_dir, paths_to_pack, deleted, tmp_layer_path,
+        rootfs_fd=stage.rootfs_fd,
     )
-    final_path = layer_cache_path(digest)
-    os.makedirs(os.path.dirname(final_path), exist_ok=True)
-    os.replace(tmp_layer_path, final_path)
+    # Published through the same walk every other cache writer uses:
+    # os.makedirs(dirname) plus os.replace(tmp, final) resolved the layer
+    # cache by name, so a planted `oci_layers -> <host dir>` collected
+    # what a build produced.
+    publish_file(tmp_layer_path, layer_cache_path(digest))
 
     stage.layers.append(
         {"digest": digest, "size": size, "diff_id": diff_id}
@@ -137,16 +176,63 @@ def do_run(engine, instr):
     cache_record(recipe, digest, diff_id, size, {})
 
 
+def _rootfs_fd(stage):
+    """A private descriptor on *stage*'s rootfs. Raises OSError.
+
+    From the stage's own pinned one when it has it, so nothing here
+    re-resolves `<scratch>/stage-N/rootfs` -- the name every step of this
+    module used to hand back to open(), and the one a previous step's
+    leftovers are free to re-point.
+    """
+    if stage.rootfs_fd is not None:
+        return dirfd.reopen(stage.rootfs_fd)
+    return dirfd.opendir(stage.rootfs_dir)
+
+
 def _run_extra_inputs(engine):
-    """Encode env + ARG state visible to RUN for the recipe hash."""
-    scope = engine.expansion_scope()
+    """Encode env + ARG state visible to RUN for the recipe hash.
+
+    The identity variables are part of that state: a step can read
+    $PD_IMAGE the way it reads any ENV, so two stages whose base is
+    spelled differently (`debian:12`, `debian:bookworm`) do not share a
+    layer that may have baked the spelling in. The marker is constant
+    and adds nothing to the key, but it is what the step sees, and the
+    rule is simpler stated whole.
+    """
+    scope = dict(engine.expansion_scope())
+    scope.update(_identity_env(engine.current))
     items = sorted(scope.items())
     return "\n".join(f"{k}={v}" for k, v in items)
+
+
+def _identity_env(stage) -> dict:
+    """What a RUN step is told about where it is running.
+
+    The container session's four, less PD_CONTAINER: a build has no
+    container. `container=proot-distro` always; PD_IMAGE and
+    PD_IMAGE_ID for the stage's base image when there is one (see
+    Stage.base_ref for why it is the base and not a tag). These win
+    over the stage's own ENV in the *process* environment -- Fedora's
+    `ENV container=oci` is a statement about the image, kept in its
+    config, and less true of the process than the marker -- which is
+    the same precedence `login` gives an installed image's Env.
+    """
+    env = {"container": CONTAINER_MARKER}
+    if stage.base_ref and is_exportable("PD_IMAGE", stage.base_ref):
+        env["PD_IMAGE"] = stage.base_ref
+    if stage.base_image_id:
+        env["PD_IMAGE_ID"] = stage.base_image_id
+    return env
 
 
 def _exec_proot(engine, stage, command, stdin_input):
     """Invoke proot against *stage*'s rootfs to execute *command*."""
     rootfs = stage.rootfs_dir
+    # Absolute, from get_proot_bin(). subprocess resolves an executable
+    # with no directory in it against os.get_exec_path(env) -- env being
+    # child_env below, whose PATH is the image's and the stage's to set --
+    # so a bare "proot" would let a Dockerfile's own `ENV PATH=...` pick
+    # the binary this build execs outside any container.
     proot_bin = get_proot_bin()
     proot_args = [proot_bin]
 
@@ -166,9 +252,24 @@ def _exec_proot(engine, stage, command, stdin_input):
         )
         proot_args.append("-L")
 
-    uid, gid = resolve_user_for_proot(rootfs, stage.user)
+    # The uid and gid proot runs the step as come out of the stage's own
+    # /etc/passwd, read through the pinned rootfs (guestfile's walk), not
+    # through a name that could by now lead to the host's copy.
+    uid, gid = resolve_user_for_proot(rootfs, stage.user,
+                                      root_fd=stage.rootfs_fd)
     proot_args.append(f"--change-id={uid}:{gid}")
-    proot_args.append(f"--rootfs={rootfs}")
+    # "." plus a chdir into the pinned descriptor, the way `login` hands
+    # proot a container rootfs. proot resolves --rootfs by name, long
+    # after everything here has finished checking it, so the path form
+    # let a process a previous RUN step left running move
+    # `<scratch>/stage-N/rootfs` aside and leave a symlink under it --
+    # and the next step then ran with a directory of that process's
+    # choosing as its root, writing into it as the invoking user. A
+    # relative root makes proot canonicalise against getcwd(), which the
+    # kernel answers from the directory's own parent chain, so it names
+    # the inode this build created whatever now stands under the name.
+    rootfs_arg = os.curdir if stage.rootfs_fd is not None else rootfs
+    proot_args.append(f"--rootfs={rootfs_arg}")
     proot_args.append(f"--cwd={stage.workdir or '/'}")
     proot_args += ["--bind=/dev", "--bind=/proc", "--bind=/sys"]
 
@@ -179,17 +280,24 @@ def _exec_proot(engine, stage, command, stdin_input):
         for i, name in ((0, "stdin"), (1, "stdout"), (2, "stderr")):
             if not os.path.lexists(f"/dev/{name}") and os.path.exists(f"/proc/self/fd/{i}"):
                 proot_args.append(f"--bind=/proc/self/fd/{i}:/dev/{name}")
-        setup_fake_sysdata(rootfs)
-        sysdata_dir = os.path.join(os.path.dirname(rootfs), "sysdata")
-        proot_args.append(f"--bind={sysdata_dir}/sys_empty:/sys/fs/selinux")
-        proot_args += fake_proc_bindings(rootfs)
-        tmp_dir = os.path.join(rootfs, "tmp")
-        os.makedirs(tmp_dir, exist_ok=True)
-        try:
-            os.chmod(tmp_dir, 0o1777)
-        except OSError:
-            pass
-        proot_args.append(f"--bind={tmp_dir}:/dev/shm")
+        setup_fake_sysdata(rootfs, container_fd=stage.dir_fd)
+        proot_args += fake_sysdata_bindings(rootfs, container_fd=stage.dir_fd)
+        # /dev/shm comes from the stage's own directory, next to the
+        # rootfs rather than inside it: a bind source is a name proot
+        # resolves when it mounts it, and a process an earlier RUN step
+        # left running can re-point one inside the rootfs in between —
+        # nothing kills such a process off Termux, --kill-on-exit being a
+        # Termux-only extension. It also keeps what a step writes to
+        # /dev/shm out of the layer the step produces, which is what
+        # Docker does with its tmpfs. `login` gives a container the same
+        # two directories the same way; see proot_distro.shm.
+        make_guest_tmp(rootfs, rootfs_fd=stage.rootfs_fd)
+        shm = make_shm_dir(rootfs, container_fd=stage.dir_fd)
+        if shm is not None:
+            proot_args.append(f"--bind={shm}:/dev/shm")
+        else:
+            warn("the stage's shm directory is not a plain directory; "
+                 "running this step without the /dev/shm bind.")
 
     if need_emu and IS_TERMUX:
         for path in (
@@ -204,41 +312,380 @@ def _exec_proot(engine, stage, command, stdin_input):
 
     proot_args.extend(command)
 
-    child_env = _build_child_env(stage)
+    child_env = _build_child_env(engine, stage)
 
     if not engine.quiet and not engine.verbose:
         log_info(f"Running step (user={stage.user or 'root'}, "
                  f"cwd={stage.workdir or '/'})...")
 
+    # Before anything is spawned, so a descendant that outlives its own
+    # parent is reparented here rather than onto init.
+    _become_subreaper()
+    baseline = set(_adopted())
+
     try:
-        stdin_arg = (
-            subprocess.PIPE if stdin_input is not None
-            else subprocess.DEVNULL
-        )
+        stdin_file = _stdin_file(engine, stdin_input)
+    except OSError as exc:
+        raise BuildError(f"cannot stage the step's input: {exc}") from exc
+    try:
         proc = subprocess.Popen(
             proot_args,
             env=child_env,
-            stdin=stdin_arg,
+            stdin=stdin_file if stdin_file is not None else subprocess.DEVNULL,
             start_new_session=True,
+            preexec_fn=_chdir_to(stage.rootfs_fd),
         )
-        try:
-            if stdin_input is not None:
-                proc.communicate(input=stdin_input.encode())
-            else:
-                proc.wait()
-        except KeyboardInterrupt:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except OSError:
-                pass
-            proc.wait()
-            raise
-        return proc.returncode
     except FileNotFoundError as exc:
         raise BuildError(f"proot binary not available: {exc}") from exc
+    except (OSError, ValueError) as exc:
+        # E2BIG when the environment is too large in total (each string
+        # is bounded, their number is the image's), ENOMEM -- and the
+        # ValueError Python raises before the syscall for a NUL in the
+        # argv, which is a Dockerfile's RUN line and was a traceback.
+        raise BuildError(f"cannot start proot for the step: {exc}") from exc
+    finally:
+        if stdin_file is not None:
+            stdin_file.close()
+
+    try:
+        _wait_for_step(proc, baseline)
+    except KeyboardInterrupt:
+        # proot goes with the rest here: the build is over either way.
+        _stop_step(proc.pid, baseline, quiet=True)
+        proc.wait()
+        raise
+
+    _stop_step(proc.pid, baseline, skip_pid=proc.pid)
+    try:
+        return proc.wait(timeout=_STRAY_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        # Nothing of the step should still be holding proot open, but a
+        # step that cannot be settled must not hang the build either.
+        proc.kill()
+        return proc.wait()
 
 
-def _build_child_env(stage):
+def _chdir_to(rootfs_fd):
+    """A preexec hook that fchdirs into *rootfs_fd*, or None.
+
+    The other half of `--rootfs=.`: the argv names a relative root, so
+    the process proot starts in has to be the rootfs. In the *child*
+    rather than here, because this process's own working directory is
+    where a relative --output, a relative build context and every
+    message that names one are resolved from, and a step must not move
+    it. `login` does the same fchdir in the process that becomes proot,
+    which is the same place -- it just has no parent left to protect.
+
+    preexec_fn runs after the fork and before the exec, and fchdir(2) is
+    one syscall; the caveat about it (unsafe with threads) does not
+    apply, this program having none. Nothing else is done there.
+    """
+    if rootfs_fd is None:
+        return None
+
+    def _hook():
+        os.fchdir(rootfs_fd)
+
+    return _hook
+
+
+def _stdin_file(engine, stdin_input):
+    """*stdin_input* as a file for the step to read from, or None.
+
+    do_run passes none today: a here-doc's body travels as the shell's
+    own command argument, so the step reads /dev/null. The plumbing is
+    kept for a step that does have input.
+
+    A file rather than a pipe. The step is watched rather than waited on
+    (see _wait_for_step), so there is no communicate() left to feed a
+    pipe while it runs, and a body larger than the pipe buffer would
+    deadlock against a step that is not reading yet. TemporaryFile
+    unlinks it as it creates it, inside the build's own scratch root.
+    """
+    if stdin_input is None:
+        return None
+    try:
+        fh = tempfile.TemporaryFile(dir=engine.tmp_root)
+    except OSError:
+        fh = tempfile.TemporaryFile()
+    try:
+        fh.write(stdin_input.encode())
+        fh.seek(0)
+    except BaseException:
+        fh.close()
+        raise
+    return fh
+
+
+# ---------------------------------------------------------------------------
+# When a step is over, and what it leaves behind
+# ---------------------------------------------------------------------------
+
+# How often the step is looked at, and how long its leftovers get to
+# take a SIGTERM before the SIGKILL.
+_STEP_POLL_INTERVAL = 0.05
+_STRAY_GRACE_SECONDS = 2.0
+
+# prctl(2), Linux 3.4 and up, Android included.
+_PR_SET_CHILD_SUBREAPER = 36
+
+_subreaper_asked = None
+
+
+def _become_subreaper() -> bool:
+    """Ask the kernel to reparent orphaned descendants onto this process.
+
+    This is what makes a step's leftovers findable at all. A backgrounded
+    command outlives the shell that started it and a daemon goes further
+    -- fork, setsid, fork, which leaves the step's process group as well
+    -- and either way the process is then no relation of ours that any
+    interface will name. As a subreaper it is reparented here instead of
+    onto init, so /proc/self/task/<pid>/children lists it.
+
+    Asked once, best effort: a kernel (or a seccomp filter) that refuses
+    leaves _wait_for_step nothing to notice and the step is waited on the
+    way it always was.
+    """
+    global _subreaper_asked
+    if _subreaper_asked is None:
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            _subreaper_asked = libc.prctl(
+                _PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0
+            ) == 0
+        except (OSError, AttributeError, ValueError):
+            _subreaper_asked = False
+    return _subreaper_asked
+
+
+def _children_of(pid: int) -> list:
+    """The PIDs the kernel currently calls children of *pid*."""
+    try:
+        with open(f"/proc/{pid}/task/{pid}/children") as fh:
+            data = fh.read()
+    except OSError:
+        return []
+    return [int(tok) for tok in data.split() if tok.isdigit()]
+
+
+def _adopted(baseline=(), skip_pid=None) -> list:
+    """The step's descendants the kernel has reparented onto this process.
+
+    *baseline* is what was already there when the step started, which
+    should be nothing -- the previous step is stopped before the next one
+    begins -- but a straggler that would not die must not be counted
+    against every step that follows it.
+    """
+    mine = os.getpid()
+    return [
+        pid for pid in _children_of(mine)
+        if pid != skip_pid and pid not in baseline
+    ]
+
+
+def _group_members(pgid: int, skip=()) -> list:
+    """The PIDs in process group *pgid*, minus *skip*.
+
+    Read out of /proc rather than signalled as a group, because proot
+    leads that group and must be left alone until it has reported the
+    step's exit status. The parse takes the fields after the last ')',
+    since a comm can hold anything at all, including one.
+    """
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return []
+    members = []
+    for name in names:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if pid in skip:
+            continue
+        try:
+            with open(f"/proc/{pid}/stat") as fh:
+                data = fh.read()
+        except OSError:
+            continue
+        try:
+            fields = data[data.rindex(")") + 1:].split()
+            if int(fields[2]) == pgid:
+                members.append(pid)
+        except (ValueError, IndexError):
+            continue
+    return members
+
+
+def _wait_for_step(proc, baseline) -> None:
+    """Wait for the step's command, not for the last thing it started.
+
+    proot's event loop ends when its last *tracee* does, so a step that
+    leaves anything running kept proot alive and the build waited on it
+    for as long as that process ran -- `RUN service x start` never
+    returned at all. Termux's proot has --kill-on-exit for exactly this;
+    upstream proot has no equivalent, so the step is watched instead.
+
+    proot's only child is the root tracee, so an empty children list
+    means the step's command has finished. Everything still running is
+    then something it left behind, and everything it left behind has by
+    then been orphaned onto this process (see _become_subreaper), which
+    is the cheap thing to look at -- one small read per poll rather than
+    a scan of /proc. With no adopted process there is nothing to stop
+    and proot is about to exit on its own, so the wait simply continues.
+    """
+    while True:
+        try:
+            proc.wait(timeout=_STEP_POLL_INTERVAL)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        if _children_of(proc.pid):
+            continue
+        if _adopted(baseline, skip_pid=proc.pid):
+            return
+
+
+def _signal_leftovers(targets, sig) -> None:
+    """Deliver *sig* to each leftover, and to any group it leads.
+
+    A daemonised leftover called setsid, so it leads a group of its own
+    and that group goes too -- otherwise its children outlive it by a
+    generation. killpg(pid) can only ever reach a group led by that very
+    process, a group id being the pid of its leader, so this cannot
+    reach anything the step did not start.
+    """
+    for pid in targets:
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+        try:
+            os.killpg(pid, sig)
+        except OSError:
+            pass
+
+
+def _reap(pids) -> None:
+    """Collect the leftovers that have exited, so none linger as zombies.
+
+    Named one at a time rather than with waitpid(-1), which could take
+    proot's own status out from under Popen.wait() -- that call then
+    reports ECHILD as a clean exit, and a step that failed would pass.
+    A leftover reaped a moment too early to be a zombie is collected on
+    the next round of the sweep, or left to the next step, which knows
+    what was already there and does not count it again.
+    """
+    for pid in pids:
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except OSError:
+            pass
+
+
+def _leftovers(pgid: int, baseline, skip_pid) -> list:
+    """Every process the step still has running, most-derived first.
+
+    This process and the group it is in are never among them. A step
+    runs in a session of its own, so its group id can only be proot's;
+    one that is this program's own group would mean the caller got the
+    pgid wrong, and the answer to that must not be a SIGTERM to
+    everything sharing a terminal with the build.
+    """
+    found = list(_adopted(baseline, skip_pid=skip_pid))
+    skip = set(found)
+    skip.add(os.getpid())
+    if skip_pid is not None:
+        skip.add(skip_pid)
+    if pgid is not None and pgid != os.getpgrp():
+        for pid in _group_members(pgid, skip=skip):
+            found.append(pid)
+    return found
+
+
+def _stop_step(pgid: int, baseline=(), *, skip_pid=None,
+               quiet: bool = False) -> int:
+    """Stop whatever the step still has running. Returns how many it found.
+
+    *skip_pid* is proot, while it is still owed the chance to report the
+    step's exit status; on the interrupt path it goes with the rest.
+
+    Costs one small /proc read when the step ended cleanly, which is the
+    usual case and the only one on Termux, where proot's --kill-on-exit
+    has already done this.
+    """
+    targets = _leftovers(pgid, baseline, skip_pid)
+    if not targets:
+        return 0
+
+    found = len(targets)
+    _signal_leftovers(targets, signal.SIGTERM)
+    deadline = time.monotonic() + _STRAY_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        _reap(targets)
+        targets = _leftovers(pgid, baseline, skip_pid)
+        if not targets:
+            break
+        time.sleep(_STEP_POLL_INTERVAL)
+
+    targets = _leftovers(pgid, baseline, skip_pid)
+    if targets:
+        _signal_leftovers(targets, signal.SIGKILL)
+        _reap(targets)
+
+    if not quiet:
+        warn(f"the step left {found} process(es) running after its command "
+             f"finished; they were stopped, so the layer captures a "
+             f"settled rootfs.")
+    return found
+
+
+def _refuse_host_exec(engine, key):
+    """True when *key* is the host side's, so the Dockerfile may not set it.
+
+    proot has no way to set the guest's environment on its own: the dict
+    handed to Popen is proot's own, and proot passes it on to the tracee.
+    So one dict serves two masters, and LD_*/PROOT_* mean "a setting for
+    the process that has not confined anything yet" to the loader and to
+    proot -- read before the step exists, in the process this build
+    becomes.
+
+    proot_distro.execenv states the rule as one about provenance, and
+    that is what this applies: a `--env` flag or a variable in the user's
+    own shell is a choice about *this invocation*, while an ENV line is a
+    statement about the *image*, carried in a file that is as often
+    copied from upstream as written. It is the second kind here -- both
+    of the sources filtered are the Dockerfile's, `stage.env` (its ENV
+    lines) and the ARG values keyed by names it declared -- and the
+    build's own two knobs are read from os.environ afterwards, which is
+    the user's own environment and stays sovereign.
+
+    What made this more than a tidiness rule is where the exec starts
+    from. The argv says `--rootfs=.` and the child fchdir's into the
+    stage rootfs between the fork and the exec, so a *relative*
+    LD_LIBRARY_PATH or LD_AUDIT entry is resolved by the loader against
+    that rootfs -- a directory an earlier RUN step had the run of. `RUN`
+    dropping a libtalloc.so.2 under `lib/`, then `ENV LD_LIBRARY_PATH=lib`
+    on any later step, was the invoking user running the guest's code
+    outside any container, on a native build where nothing of the host is
+    bound in at all.
+
+    The value still goes into the image config: what the Dockerfile says
+    about the image it produces is its author's business, and only the
+    host-side exec is refused it. That is also what `login` does with the
+    same names when it starts a container from that image.
+    """
+    if not is_host_exec_var(key):
+        return False
+    warned = engine.warned_host_exec
+    if key not in warned:
+        warned.add(key)
+        warn(f"ignoring '{key}' for RUN steps: it is read by proot itself "
+             f"on the host side, not by the container. It stays in the "
+             f"image config.")
+    return True
+
+
+def _build_child_env(engine, stage):
     env = {}
     env["PATH"] = stage.env.get("PATH") or DEFAULT_PATH_ENV
     env["HOME"] = stage.env.get("HOME", "/root")
@@ -254,14 +701,24 @@ def _build_child_env(stage):
         if v:
             env[k] = v
 
-    # Declared ARGs in this stage.
+    # Declared ARGs in this stage. An entry that cannot be an
+    # environment string (a NUL byte in the Dockerfile, a value past
+    # what execve(2) takes) is left out rather than handed to Popen,
+    # which raised ValueError past every net in the build.
     for k in stage.declared_args:
-        if k in stage.args:
-            env[k] = stage.args[k]
+        if k in stage.args and not _refuse_host_exec(engine, k):
+            if is_exportable(k, stage.args[k]):
+                env[k] = stage.args[k]
 
     # ENVs always win.
     for k, v in stage.env.items():
+        if _refuse_host_exec(engine, k) or not is_exportable(k, v):
+            continue
         env[k] = v
+
+    # Over the ENVs, under the user's own toggles below: what the step
+    # is told about where it runs is this program's to say.
+    env.update(_identity_env(stage))
 
     # proot toggles inherited from host.
     for var in ("PROOT_NO_SECCOMP", "PROOT_VERBOSE"):
@@ -269,8 +726,30 @@ def _build_child_env(stage):
         if v:
             env[var] = v
     if IS_TERMUX:
-        l2s_dir = os.path.join(stage.rootfs_dir, ".l2s")
-        os.makedirs(l2s_dir, exist_ok=True)
-        env["PROOT_L2S_DIR"] = l2s_dir
-    env.pop("LD_PRELOAD", None)
+        # Where proot puts the backing files --link2symlink stands in for.
+        # Through a descriptor for the same reason /tmp is: an image (or an
+        # earlier step) can leave `.l2s` behind as a symlink, and proot
+        # would then write every hard-link backing file into whatever host
+        # directory it named. Unset rather than pointed somewhere
+        # unvalidated -- proot then places each intermediate next to its
+        # original, which is what it did before the pin existed.
+        l2s_dir = (
+            dirfd.makedirs_at(stage.rootfs_fd, stage.rootfs_dir, (".l2s",))
+            if stage.rootfs_fd is not None
+            else dirfd.makedirs_under(stage.rootfs_dir, (".l2s",))
+        )
+        if l2s_dir is not None:
+            env["PROOT_L2S_DIR"] = l2s_dir
+        else:
+            # As in login: "unset" has to actually unset, or a value
+            # from somewhere else stands in the fallback's place.
+            env.pop("PROOT_L2S_DIR", None)
+            warn("rootfs .l2s is not a plain directory; leaving "
+                 "PROOT_L2S_DIR unset for this step.")
+    # LD_PRELOAD used to be popped here, alone among the LD_* names,
+    # because it is the one that breaks proot outright. The refusal above
+    # covers it and the rest of both namespaces, from every source this
+    # dict is built out of -- everything set after that refusal is either
+    # a name this module chose or one of the two toggles read from the
+    # user's own environment.
     return env

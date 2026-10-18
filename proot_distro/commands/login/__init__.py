@@ -26,10 +26,11 @@
 #   passwd.py    — user/group resolution against the rootfs.
 #   bindings.py  — Android storage and system --bind args.
 #   env.py       — image Env reading + /etc/profile.d injection.
+#   proot_cmd.py — assembles the proot argv (build_proot_args).
+#   detach.py    — --detach: double-fork daemonisation.
 #   migrate.py   — legacy installed-rootfs migration.
 #   quoting.py   — POSIX double-quoting for --get-proot-cmd.
 
-import json
 import os
 import shlex
 import sys
@@ -42,7 +43,9 @@ from proot_distro.constants import (
     DEFAULT_FAKE_KERNEL_RELEASE,
     PROGRAM_NAME,
 )
-from proot_distro.message import C, msg, crit_error
+from proot_distro import dirfd
+from proot_distro.guestfile import guest_file_exists
+from proot_distro.message import C, msg, crit_error, quote_error, warn
 from proot_distro.arch import (
     detect_installed_arch,
     get_device_cpu_arch,
@@ -53,19 +56,23 @@ from proot_distro.sysdata import setup_fake_sysdata
 from proot_distro.locking import ContainerLock
 from proot_distro.session import register_session
 from proot_distro.names import require_valid_name
-from proot_distro.paths import container_dir, container_rootfs
+from proot_distro.paths import (
+    container_image_config, container_rootfs, open_container_pair,
+)
 
 from proot_distro.commands.login.env import (
-    ANDROID_HOST_ENV_VARS, IMAGE_ENV_BLOCKED,
-    inject_termux_profile, read_manifest_env,
+    ANDROID_HOST_ENV_VARS, identity_env_pairs, image_env_pairs,
+    inject_termux_profile,
 )
 from proot_distro.commands.login.detach import spawn_detached
 from proot_distro.commands.login.migrate import migrate_legacy_rootfs
 from proot_distro.commands.login.passwd import (
     find_passwd_by_uid,
+    passwd_available,
+    passwd_field,
     read_group_gid,
     read_passwd_entry,
-    resolve_rootfs_path,
+    shell_available,
 )
 from proot_distro.commands.login.proot_cmd import build_proot_args
 from proot_distro.commands.login.quoting import dq
@@ -89,21 +96,28 @@ def command_login(args) -> None:
         _command_login_inner(container_name, args, lock)
 
 
-def _detect_dist_type(rootfs: str) -> str:
+def _detect_dist_type(rootfs: str, rootfs_fd=None) -> str:
     """Return 'termux' iff the rootfs is a Termux installation.
 
     Check for the existence of the Termux 'login' binary as a file
     (not directory). When a concurrent proot session is running it can
     materialise the bind-mount target directory on the host filesystem;
     a directory check would then misidentify a normal container as termux.
+
+    Asked of the guest walk rather than of a composed path, since every
+    component of that path is the container's own: os.path.isfile() on
+    `<rootfs>/data/...` followed a guest-planted `data -> /` straight to
+    the *host's* Termux login binary, and the answer decides the whole
+    shape of the session — its environment, its bindings, and whether
+    --change-id is passed at all.
     """
-    termux_usr = rootfs + TERMUX_PREFIX
-    if os.path.isfile(os.path.join(termux_usr, "bin", "login")):
-        return "termux"
-    return "normal"
+    return "termux" if guest_file_exists(
+        rootfs, f"{TERMUX_PREFIX}/bin/login", root_fd=rootfs_fd
+    ) else "normal"
 
 
-def _resolve_login_user(rootfs: str, container_name: str, user_arg: str) -> dict:
+def _resolve_login_user(rootfs: str, container_name: str, user_arg: str,
+                        rootfs_fd=None) -> dict:
     """Resolve --user against the container's passwd/group.
 
     Returns a dict with name, uid, gid, home, shell — all strings.
@@ -120,31 +134,25 @@ def _resolve_login_user(rootfs: str, container_name: str, user_arg: str) -> dict
         user_spec = user_arg
         group_spec = None
 
-    passwd_available = False
-    try:
-        passwd_path = resolve_rootfs_path(rootfs, "/etc/passwd")
-        passwd_available = os.path.isfile(passwd_path)
-    except OSError:
-        pass
-
-    if passwd_available:
+    if passwd_available(rootfs, root_fd=rootfs_fd):
         if user_spec.isdigit():
             uid = user_spec
-            home, shell, primary_gid = find_passwd_by_uid(rootfs, user_spec)
+            home, shell, primary_gid = find_passwd_by_uid(
+                rootfs, user_spec, root_fd=rootfs_fd,
+            )
             home = home or "/"
             shell = shell or "/bin/sh"
         else:
-            # Single read of /etc/passwd — old code did 5 separate
-            # scans (one existence check + 4 read_passwd_field calls).
-            entry = read_passwd_entry(rootfs, user_spec)
-            if entry is None:
+            entry = read_passwd_entry(rootfs, user_spec,
+                                      root_fd=rootfs_fd)
+            if not entry:
                 crit_error(_("no user '{user_spec}' defined in /etc/passwd.", user_spec = user_spec))
                 sys.exit(1)
 
-            uid = entry["uid"]
-            primary_gid = entry["gid"]
-            home = entry["home"] or "/"
-            shell = entry["shell"] or "/bin/sh"
+            uid = passwd_field(entry, 2)
+            primary_gid = passwd_field(entry, 3)
+            home = passwd_field(entry, 5) or "/"
+            shell = passwd_field(entry, 6) or "/bin/sh"
 
             if not uid:
                 crit_error(_("failed to retrieve UID for user '{user_spec}'.", user_spec = user_spec))
@@ -155,7 +163,8 @@ def _resolve_login_user(rootfs: str, container_name: str, user_arg: str) -> dict
         elif group_spec.isdigit():
             gid = group_spec
         else:
-            gid = read_group_gid(rootfs, group_spec)
+            gid = read_group_gid(rootfs, group_spec,
+                                 root_fd=rootfs_fd)
             if not gid:
                 crit_error(
                     _("no group '{group_spec}' defined in /etc/group.", group_spec = group_spec)
@@ -191,7 +200,7 @@ def _resolve_login_user(rootfs: str, container_name: str, user_arg: str) -> dict
     }
 
 
-def _build_termux_env(container_path, extra_env, minimal, isolated):
+def _build_termux_env(container_name, extra_env, minimal, isolated):
     """Env dict for termux-type containers."""
     env: dict = {}
     if not minimal:
@@ -201,11 +210,15 @@ def _build_termux_env(container_path, extra_env, minimal, isolated):
         env["TMPDIR"] = f"{TERMUX_PREFIX}/tmp"
 
     # Image manifest Env applies in every mode (including isolated and
-    # minimal). IMAGE_ENV_BLOCKED still guards host-controlled vars.
-    for entry in read_manifest_env(container_path):
-        key, _, val = entry.partition("=")
-        if key and key not in IMAGE_ENV_BLOCKED:
-            env[key] = val
+    # minimal); image_env_pairs() is where what it may set is decided.
+    for key, val in image_env_pairs(container_name):
+        env[key] = val
+
+    # So do the identity variables: they describe the container, not the
+    # host. After the image's Env, which image_env_pairs() has already
+    # refused these names to; before --env, which is the user's to say.
+    for key, val in identity_env_pairs(container_name):
+        env[key] = val
 
     # Android system vars are inherited from the host only in the default
     # mode; isolated and minimal sessions keep just the image's values.
@@ -228,7 +241,7 @@ def _build_termux_env(container_path, extra_env, minimal, isolated):
     return env
 
 
-def _build_normal_env(container_path, login_user, login_home,
+def _build_normal_env(container_name, login_user, login_home,
                       extra_env, minimal, isolated):
     """Env dict for normal-type containers."""
     env: dict = {}
@@ -242,11 +255,15 @@ def _build_normal_env(container_path, login_user, login_home,
             env["PULSE_SERVER"] = "127.0.0.1"
 
     # Image manifest Env applies in every mode (including isolated and
-    # minimal). IMAGE_ENV_BLOCKED still guards host-controlled vars.
-    for entry in read_manifest_env(container_path):
-        key, _, val = entry.partition("=")
-        if key and key not in IMAGE_ENV_BLOCKED:
-            env[key] = val
+    # minimal); image_env_pairs() is where what it may set is decided.
+    for key, val in image_env_pairs(container_name):
+        env[key] = val
+
+    # So do the identity variables: they describe the container, not the
+    # host. After the image's Env, which image_env_pairs() has already
+    # refused these names to; before --env, which is the user's to say.
+    for key, val in identity_env_pairs(container_name):
+        env[key] = val
 
     # Android system vars are inherited from the host only in the default
     # mode; isolated and minimal sessions keep just the image's values.
@@ -271,27 +288,16 @@ def _build_normal_env(container_path, login_user, login_home,
     return env
 
 
-def _check_shell_available(rootfs, container_path, login_shell, container_name):
+def _check_shell_available(rootfs, login_shell, container_name,
+                           rootfs_fd=None):
     """Exit with a helpful error when the shell can't be resolved in the rootfs."""
-    try:
-        shell_found = os.path.isfile(
-            resolve_rootfs_path(rootfs, login_shell)
-        )
-    except OSError:
-        shell_found = False
-    if shell_found:
+    if shell_available(rootfs, login_shell, root_fd=rootfs_fd):
         return
 
-    has_ep_or_cmd = False
-    try:
-        with open(os.path.join(container_path, "manifest.json")) as fh:
-            data = json.load(fh)
-        cfg = (data.get("image_config") or {}).get("config", {})
-        has_ep_or_cmd = bool(
-            (cfg.get("Entrypoint") or []) or (cfg.get("Cmd") or [])
-        )
-    except (OSError, ValueError):
-        pass
+    cfg = container_image_config(container_name)
+    has_ep_or_cmd = bool(
+        (cfg.get("Entrypoint") or []) or (cfg.get("Cmd") or [])
+    )
 
     if has_ep_or_cmd:
         crit_error(f"shell '{login_shell}' is not available in container "
@@ -307,13 +313,32 @@ def _check_shell_available(rootfs, container_path, login_shell, container_name):
 def _command_login_inner(container_name: str, args, lock) -> None:
     migrate_legacy_rootfs(container_name)
 
-    rootfs = container_rootfs(container_name)
-    if not os.path.isdir(rootfs):
+    # The descriptor the O_NOFOLLOW walk validated, not just its answer:
+    # a `containers/<name>` a guest re-pointed at a host directory
+    # holding a rootfs used to answer "installed", and the session then
+    # ran with that host directory as its root. Asking by descriptor
+    # refuses that; *keeping* the descriptor is what carries the answer
+    # through to the exec, where proot would otherwise resolve the name
+    # again -- see _exec_proot().
+    try:
+        container_fd, rootfs_fd = open_container_pair(container_name)
+    except FileNotFoundError:
         crit_error(_("container '{container_name}' is not installed.", container_name = container_name))
         sys.exit(1)
+    try:
+        _login_with_rootfs(
+            container_name, args, lock, container_fd, rootfs_fd,
+        )
+    finally:
+        os.close(rootfs_fd)
+        os.close(container_fd)
 
-    dist_type = _detect_dist_type(rootfs)
-    container_path = container_dir(container_name)
+
+def _login_with_rootfs(container_name: str, args, lock,
+                       container_fd: int, rootfs_fd: int) -> None:
+    rootfs = container_rootfs(container_name)
+
+    dist_type = _detect_dist_type(rootfs, rootfs_fd)
 
     login_user = getattr(args, "user", "root") or "root"
     kernel_release = (
@@ -341,7 +366,7 @@ def _command_login_inner(container_name: str, args, lock) -> None:
         if not login_wd:
             login_wd = TERMUX_HOME
         child_env = _build_termux_env(
-            container_path, extra_env, minimal, isolated
+            container_name, extra_env, minimal, isolated
         )
 
         if run_inner is not None:
@@ -353,7 +378,8 @@ def _command_login_inner(container_name: str, args, lock) -> None:
         # termux-type doesn't use uid/gid for proot --change-id.
         login_uid = login_gid = login_home = None
     else:
-        user = _resolve_login_user(rootfs, container_name, login_user)
+        user = _resolve_login_user(rootfs, container_name, login_user,
+                                   rootfs_fd)
         login_user = user["name"]
         login_uid = user["uid"]
         login_gid = user["gid"]
@@ -364,21 +390,22 @@ def _command_login_inner(container_name: str, args, lock) -> None:
             login_wd = login_home
 
         child_env = _build_normal_env(
-            container_path, login_user, login_home,
+            container_name, login_user, login_home,
             extra_env, minimal, isolated,
         )
 
         if run_inner is not None:
             inner = run_inner
         else:
-            _check_shell_available(rootfs, container_path, login_shell, container_name)
+            _check_shell_available(rootfs, login_shell, container_name,
+                                   rootfs_fd)
             if login_cmd:
                 inner = [login_shell, "-c", shlex.join(login_cmd)]
             else:
                 inner = [login_shell, "-l"]
 
         if IS_TERMUX and not minimal:
-            setup_fake_sysdata(rootfs)
+            setup_fake_sysdata(rootfs, container_fd=container_fd)
 
     # Ensure Termux bin is always last in PATH so guest tools can
     # invoke host Termux utilities. Skipped in --isolated and --minimal
@@ -393,12 +420,24 @@ def _command_login_inner(container_name: str, args, lock) -> None:
         components.append(termux_bin)
         child_env["PATH"] = ":".join(components)
 
-    if dist_type == "normal" and IS_TERMUX and not isolated and not minimal:
-        inject_termux_profile(rootfs, child_env)
+    # Every session writes the snippet, so what `su -` re-exports is what
+    # *this* session was handed: written only by a default-mode Termux
+    # login, it outlived that and an --isolated session after a rename
+    # had `su -` announce the previous container's name. Only the PATH
+    # append is mode-bound, since the prefix it names is bound into the
+    # guest only in the default mode on Termux.
+    if dist_type == "normal":
+        inject_termux_profile(
+            rootfs, child_env, rootfs_fd=rootfs_fd,
+            termux_path=IS_TERMUX and not isolated and not minimal,
+        )
 
     # Architecture detection.
+    target_arch = detect_installed_arch(rootfs, rootfs_fd=rootfs_fd)
+    if target_arch == "unknown":
+        target_arch = get_device_cpu_arch()
+
     device_arch = get_device_cpu_arch()
-    target_arch = detect_installed_arch(rootfs) or device_arch
 
     emulator_override = getattr(args, "emulator", None) or ""
     emu_args = get_emulator_args(target_arch, device_arch, emulator_override)
@@ -416,10 +455,25 @@ def _command_login_inner(container_name: str, args, lock) -> None:
                    f"architecture-specific binaries.")
         sys.exit(1)
 
+    # Absolute, from get_proot_bin(): os.execvpe() looks a name with no
+    # directory in it up in the PATH of the environment it is handed --
+    # child_env's, which an image's Env sets, PATH being deliberately not
+    # blocked because it is the guest's to choose.
     proot_bin = get_proot_bin()
+    # proot resolves --rootfs by name, so the argv carries "." and the
+    # process chdirs into the pinned descriptor just before the exec (see
+    # _exec_proot). `--get-proot-cmd` prints a command the user runs
+    # themselves, from their own working directory, so that one keeps the
+    # real path -- and therefore cannot carry the pin, which is a
+    # descriptor and not something a shell command line can hold. The
+    # printed line is said to be what it is, next to where it is printed.
+    show_cmd = getattr(args, "get_proot_cmd", False)
     proot_args = build_proot_args(
         proot_bin=proot_bin,
         rootfs=rootfs,
+        rootfs_arg=rootfs if show_cmd else os.curdir,
+        container_fd=container_fd,
+        rootfs_fd=rootfs_fd,
         login_wd=login_wd,
         login_uid=login_uid,
         login_gid=login_gid,
@@ -457,17 +511,45 @@ def _command_login_inner(container_name: str, args, lock) -> None:
         # directory upfront. Without this the first session lets proot
         # choose the location implicitly while a simultaneous session
         # sets it explicitly — they can race when both start at once.
-        l2s_dir = os.path.join(rootfs, ".l2s")
-        os.makedirs(l2s_dir, exist_ok=True)
-        child_env["PROOT_L2S_DIR"] = l2s_dir
+        # Through a descriptor: the name is inside the rootfs, so a guest
+        # can leave `.l2s` behind as a symlink and proot would then write
+        # every hard-link backing file into whatever host directory it
+        # named. Unset rather than pointed somewhere unvalidated — proot
+        # falls back to placing each intermediate next to its original,
+        # which is what it did before the pin was added.
+        l2s_dir = dirfd.makedirs_at(rootfs_fd, rootfs, (".l2s",))
+        if l2s_dir is not None:
+            child_env["PROOT_L2S_DIR"] = l2s_dir
+        else:
+            # "Unset" is what the comment above promises and what the
+            # fallback needs; leaving whatever else put a value there
+            # standing is the opposite of it.
+            child_env.pop("PROOT_L2S_DIR", None)
+            warn("container's .l2s is not a plain directory; leaving "
+                 "PROOT_L2S_DIR unset for this session.")
     child_env.pop("LD_PRELOAD", None)
 
-    if getattr(args, "get_proot_cmd", False):
+    if show_cmd:
+        # Said before the command rather than inside it: stdout is the
+        # command and nothing else, so it stays ready to redirect into a
+        # file or pipe into a shell. What the note is for is that the
+        # line below is *not* a copy of what this program runs -- it
+        # names the rootfs, and a name is resolved afresh each time the
+        # command is, while the session this program starts resolves the
+        # guest root against a descriptor it validated (see _exec_proot).
+        # Nothing printable closes that gap: a descriptor cannot be
+        # spelled, and `cd <path> && ... --rootfs=.` only moves the same
+        # name resolution one step earlier.
+        warn(f"printed for inspection: this is not a copy of what "
+             f"{PROGRAM_NAME} runs. It names the rootfs, which is "
+             f"resolved afresh whenever the command is run, while the "
+             f"session {PROGRAM_NAME} starts passes '--rootfs=.' from "
+             f"inside the directory it validated.")
         parts = ["env", "-i"]
         for k, v in child_env.items():
             parts.append(f"{k}={dq(v)}")
         parts.extend(dq(a) for a in proot_args)
-        print(" \\\n  ".join(parts))
+        _print_command(" \\\n  ".join(parts) + "\n")
         sys.exit(0)
 
     # Session metadata shared by the foreground and detached paths.
@@ -489,6 +571,7 @@ def _command_login_inner(container_name: str, args, lock) -> None:
         pid = spawn_detached(
             proot_bin, proot_args, child_env,
             register_kwargs=dict(reg, detach=True),
+            rootfs_fd=rootfs_fd,
         )
         if pid is None:
             crit_error(f"failed to start detached session for container "
@@ -505,7 +588,7 @@ def _command_login_inner(container_name: str, args, lock) -> None:
         msg(f"{C['CYAN']}List sessions:  "
             f"{C['GREEN']}{PROGRAM_NAME} ps{C['RST']}")
         msg(f"{C['CYAN']}Stop session:   "
-            f"{C['GREEN']}kill {pid}{C['RST']}")
+            f"{C['GREEN']}{PROGRAM_NAME} kill {pid}{C['RST']}")
         msg()
         return
 
@@ -515,7 +598,74 @@ def _command_login_inner(container_name: str, args, lock) -> None:
     # reference alive until execvpe() so the fd is not closed early.
     _session_fd = register_session(**reg)  # noqa: F841 (kept alive until exec)
 
-    os.execvpe(proot_bin, proot_args, child_env)
+    _exec_proot(proot_bin, proot_args, child_env, rootfs_fd)
+
+
+def _print_command(text: str) -> None:
+    """Write --get-proot-cmd's *text* to stdout as the bytes it names.
+
+    The command carries the session's environment and argv, and a byte
+    that is not UTF-8 is a lone surrogate in both -- a --build-arg an
+    image's ENV baked in, a password in the environment, an argument on
+    this command line. stdout is strict, so print() raised
+    UnicodeEncodeError on it; and a printed escape would not do either,
+    since the line is for running, and run it would set a different
+    value from the one this program passes. os.fsencode() is how the
+    exec itself turns these strings into bytes, so the line sets exactly
+    what the session gets. Only a string the exec could not encode
+    either -- a surrogate outside the escape range, out of an image's
+    JSON -- falls back to a visible escape; the session refuses that one
+    with a message of its own.
+    """
+    try:
+        data = os.fsencode(text)
+    except UnicodeEncodeError:
+        data = text.encode("utf-8", "backslashreplace")
+    sys.stdout.flush()
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
+
+
+def _exec_proot(proot_bin, proot_args, child_env, rootfs_fd: int) -> None:
+    """chdir into the pinned rootfs, then become proot.
+
+    proot resolves `--rootfs` by name, and every check this command makes
+    is over by the time it does. `containers/<name>` is guest-writable on
+    Termux and `login` takes only a *shared* lock, so a live session was
+    free to move the directory aside and leave a symlink under the name
+    after container_is_installed() had walked it -- and the next session
+    then started with a host directory of that session's choosing as its
+    root. Nothing in the argv could say otherwise: a path is a path.
+
+    So the argv says "." and the process chdirs into the descriptor the
+    walk validated. proot canonicalises a relative binding against
+    getcwd(), which the kernel answers from the directory's own parent
+    chain -- it names the inode we hold open, whatever has since been
+    left standing under the name it used to have. Verified against proot
+    itself: with the swap in place, `--rootfs=<path>` starts in the
+    planted directory and `--rootfs=.` from here starts in the real one.
+
+    The descriptor is not inheritable (Python opens CLOEXEC), so nothing
+    is handed to proot or to the guest beyond the chdir. A rootfs deleted
+    out from under us makes getcwd() fail and proot refuse to start,
+    which is the right way for that to end.
+
+    The exec itself can still be refused, and the reasons are the
+    environment's as much as the binary's: E2BIG when the strings
+    together exceed what execve(2) takes (each one is held to
+    MAX_ENV_STRING_BYTES, their *number* is the image's), ENOMEM, an
+    EACCES on a proot that lost its mode since get_proot_bin() looked.
+    And ValueError is what Python raises before the syscall for a NUL
+    or an unencodable code point in the argv -- an image's Cmd, which
+    `run` checks for shape but not for content. Each of those was a
+    traceback; all of them are one line now.
+    """
+    os.fchdir(rootfs_fd)
+    try:
+        os.execvpe(proot_bin, proot_args, child_env)
+    except (OSError, ValueError) as exc:
+        crit_error(f"cannot execute proot: {quote_error(exc)}")
+        sys.exit(1)
 
 
 __all__ = ("command_login",)

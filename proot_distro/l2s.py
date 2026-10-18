@@ -30,10 +30,17 @@
 # user Ctrl-C's mid-walk we'd leave the container in a half-rewritten
 # state where some inner files point at a now-missing path. Instead the
 # signal handler prints a warning and the walk continues to completion.
+#
+# It also holds the read side that callers packing or inspecting a rootfs
+# (backup, the build engine, guestfile) need: resolve_l2s_target()
+# recognises a stand-in and confines its target to the rootfs, and
+# open_l2s_backing() opens what it names without trusting the path.
 
 import os
 import signal
+import stat
 
+from proot_distro import dirfd
 from proot_distro.message import log_info, log_error
 
 
@@ -66,33 +73,112 @@ def resolve_l2s_target(symlink_full: str, target: str, rootfs: str):
     is therefore by basename prefix, not by directory, so symlinks are
     recognised regardless of where the producing proot stashed them.
 
-    Callers (backup, build layer writer) materialise the symlink as
-    the backing file's content via os.stat / open() on the returned
-    path — both follow symlinks and land on the final file automatically.
+    The whole chain is resolved, so the returned path names the file
+    holding the content rather than the intermediate that stands in
+    front of it. That is what containment has to be decided on:
+    normpath() collapses ".." without consulting the filesystem, so a
+    chain whose first hop lands inside the rootfs and whose second leaves
+    it satisfied the old prefix test. Two `ln -s` calls inside a guest
+    were enough —
+
+        innocent.txt          -> .proot.l2s.evil0001
+        .proot.l2s.evil0001   -> /absolute/host/path
+
+    — and the callers, which must follow the intermediate because that is
+    what an l2s chain is, read straight through to the host file: backup
+    packed its bytes into the archive under innocent.txt's name, and the
+    build engine packed them into a layer that `push` then uploads to a
+    registry.
+
+    Callers open the result with open_l2s_backing() rather than by path,
+    which re-walks it with O_NOFOLLOW; see there for why.
     """
     name = os.path.basename(target)
     if not name.startswith(_L2S_NAME_PREFIXES):
         return None
     if os.path.isabs(target):
-        abs_target = os.path.normpath(target)
+        abs_target = target
     else:
-        abs_target = os.path.normpath(
-            os.path.join(os.path.dirname(symlink_full), target)
-        )
-    rootfs_abs = os.path.abspath(rootfs)
-    if abs_target != rootfs_abs and not abs_target.startswith(
-        rootfs_abs + os.sep
+        abs_target = os.path.join(os.path.dirname(symlink_full), target)
+    # realpath on both sides: the rootfs prefix is composed lexically by
+    # container_rootfs(), so a symlinked $HOME or ~/.local/share would
+    # otherwise leave a resolved target and the root it must sit under
+    # spelled differently and looking unrelated.
+    real_target = os.path.realpath(abs_target)
+    rootfs_real = os.path.realpath(rootfs)
+    if real_target != rootfs_real and not real_target.startswith(
+        rootfs_real + os.sep
     ):
         return None
-    return abs_target
+    return real_target
 
 
-def rewrite_l2s_targets(rootfs: str, old_prefix: str) -> None:
-    """Rewrite every symlink in *rootfs* whose target starts with *old_prefix*.
+def open_l2s_backing(rootfs: str, l2s_path: str, *, rootfs_fd: int = None):
+    """Open the backing file resolve_l2s_target() named. (fd, stat) or None.
 
-    The new prefix is the absolute path of *rootfs* itself. Errors on
-    individual symlinks (e.g. read-only fs) are swallowed so a single
-    bad entry doesn't abort the rewrite.
+    Resolving a path and reading it are two steps, and between them a
+    guest can swap a component for a symlink pointing out of the rootfs —
+    `backup` holds only a shared lock, so a `login` session can be running
+    while the archive is written. The components are therefore re-walked
+    from a descriptor on the rootfs with O_NOFOLLOW, which fails on a
+    swapped component instead of following it, and the caller gets a
+    descriptor rather than a name to open again. Same guarantee
+    paths.pin_path() gives `copy` and `sync`, for the same reason.
+
+    *rootfs_fd* is that descriptor when the caller already holds one, and
+    a caller that does must pass it: opening `rootfs` by name here would
+    resolve `containers/<name>/rootfs` a second time and give the walk
+    back the very component the caller's pin exists to settle. Without
+    it the rootfs is opened by name, which is right for a tree this
+    process made itself (a build stage).
+
+    open_regular_at() refuses anything that is not a regular file, so a
+    FIFO planted under the name cannot block the read waiting for a peer
+    that never comes.
+    """
+    rootfs_real = os.path.realpath(rootfs)
+    rel = os.path.relpath(l2s_path, rootfs_real)
+    parts = [p for p in rel.split(os.sep) if p and p != os.curdir]
+    if not parts or os.pardir in parts:
+        return None
+    fd = None
+    try:
+        fd = (dirfd.reopen(rootfs_fd) if rootfs_fd is not None
+              else dirfd.opendir(rootfs_real))
+        for part in parts[:-1]:
+            nxt = dirfd.opendir_at(fd, part)
+            os.close(fd)
+            fd = nxt
+        return dirfd.open_regular_at(fd, parts[-1], os.O_RDONLY)
+    except OSError:
+        return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def rewrite_l2s_targets(rootfs_fd: int, rootfs: str, old_prefix: str) -> None:
+    """Rewrite every symlink under *rootfs_fd* whose target starts with
+    *old_prefix*.
+
+    The new prefix is *rootfs*, the path that descriptor was opened as.
+    Errors on individual symlinks (e.g. read-only fs) are swallowed so a
+    single bad entry doesn't abort the rewrite.
+
+    The caller passes a descriptor rather than a path because it has one:
+    both callers have just moved the tree and validated where it landed.
+    Walking the path again would resolve `containers/<name>` afresh --
+    guest-writable on Termux -- and this walk *writes*, unlinking an entry
+    and creating a symlink in its place. Every entry is therefore named as
+    (dir_fd, name), and a directory is descended into with O_NOFOLLOW, so
+    a link met on the way is rewritten rather than followed.
+
+    os.walk() also classified a symlink pointing at a directory as a
+    directory, which left it out of the filenames it yielded and so out of
+    the rewrite entirely; lstat is what decides here.
 
     SIGINT and SIGQUIT are intercepted for the duration of the walk:
     aborting partway through would leave dangling symlinks that point
@@ -109,20 +195,75 @@ def rewrite_l2s_targets(rootfs: str, old_prefix: str) -> None:
     old_sigint = signal.signal(signal.SIGINT, _warn_no_interrupt)
     old_sigquit = signal.signal(signal.SIGQUIT, _warn_no_interrupt)
     try:
-        for dirpath, _dirs, filenames in os.walk(rootfs):
-            for fname in filenames:
-                fpath = os.path.join(dirpath, fname)
-                try:
-                    if not os.path.islink(fpath):
-                        continue
-                    target = os.readlink(fpath)
-                    if not target.startswith(old_prefix):
-                        continue
-                    new_target = rootfs + target[len(old_prefix):]
-                    os.unlink(fpath)
-                    os.symlink(new_target, fpath)
-                except OSError:
-                    pass
+        try:
+            _rewrite_walk(rootfs_fd, rootfs, old_prefix)
+        except OSError as exc:
+            # Every per-entry failure is stepped over inside the walk, so
+            # what reaches here is the walk itself losing its footing —
+            # a directory moved out from under it (dirfd.Levels). The
+            # move has already happened, so there is nothing to undo;
+            # what the user needs to know is that the rewrite is partial.
+            log_error(f"Warning: the container changed while its hard-link "
+                      f"stand-ins were being rewritten ({exc.strerror}); "
+                      f"some may still point at the old location.")
     finally:
         signal.signal(signal.SIGINT, old_sigint)
         signal.signal(signal.SIGQUIT, old_sigquit)
+
+
+def _rewrite_walk(root_fd: int, rootfs: str, old_prefix: str) -> None:
+    """Visit every entry under root_fd, rewriting the l2s symlinks."""
+    # Frame layout: [fd, None, pending names, owned] — dirfd's own layout,
+    # so close_frames() unwinds an interrupted walk, and dirfd.Levels
+    # bounds the descriptors it holds. How deep the tree goes is the
+    # container's business rather than the interpreter's, and running out
+    # of descriptors partway down would leave the rest of the container's
+    # l2s symlinks pointing at the location it was moved from.
+    stack = [[root_fd, None, None, False]]
+    levels = dirfd.Levels(stack)
+    try:
+        while stack:
+            frame = stack[-1]
+            fd, _, pending, owned = frame
+            if pending is None:
+                try:
+                    pending = frame[2] = dirfd.listdir_at(fd)
+                except OSError:
+                    pending = frame[2] = []
+            if not pending:
+                levels.pop()
+                if owned:
+                    os.close(fd)
+                continue
+            name = pending.pop()
+            try:
+                st = dirfd.lstat_at(fd, name)
+            except OSError:
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                try:
+                    sub = dirfd.opendir_at(fd, name)
+                except OSError:
+                    continue
+                levels.push([sub, None, None, True])
+            elif stat.S_ISLNK(st.st_mode):
+                _rewrite_link(fd, name, rootfs, old_prefix)
+    except BaseException:
+        dirfd.close_frames(stack)
+        raise
+
+
+def _rewrite_link(dir_fd: int, name: str, rootfs: str,
+                  old_prefix: str) -> None:
+    """Re-root one symlink's target at *rootfs*, best effort."""
+    try:
+        target = os.readlink(name, dir_fd=dir_fd)
+    except OSError:
+        return
+    if not target.startswith(old_prefix):
+        return
+    try:
+        os.unlink(name, dir_fd=dir_fd)
+        os.symlink(rootfs + target[len(old_prefix):], name, dir_fd=dir_fd)
+    except OSError:
+        pass

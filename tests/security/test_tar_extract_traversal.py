@@ -9,7 +9,7 @@ import stat
 
 import pytest
 
-from proot_distro.helpers.tar_extract import extract_tar_to_rootfs
+from _builders import extract_tar_into
 
 
 @pytest.fixture
@@ -27,7 +27,7 @@ def _extract(tmp_path, root, members, **kw):
     arc = tmp_path / "evil.tar"
     from _builders import make_tar
     make_tar(str(arc), members)
-    extract_tar_to_rootfs(str(arc), root, **kw)
+    extract_tar_into(str(arc), root, **kw)
 
 
 def _assert_no_escape(tmp_path, sentinel):
@@ -124,7 +124,7 @@ def test_symlink_dotdot_target_stays_inside(env):
 
 
 # A hostile archive can point a symlink at an *absolute* path and then write
-# "through" it. The extractor's _safe_resolve walks each parent component
+# "through" it. The extractor's safe_resolve_parts walks each parent component
 # clamped inside the rootfs and re-roots an absolute symlink target at the
 # rootfs (matching proot's runtime view where the guest '/' is the rootfs), so
 # the write is contained instead of escaping to the host. These tests pin that
@@ -148,8 +148,7 @@ def test_writethrough_absolute_symlink_across_layers_contained(env):
     # The realistic OCI vector: one layer plants 'evil' -> /abs/host-dir and a
     # *later* layer writes 'evil/pwned' through the now-existing symlink. The
     # pre-existing absolute symlink must not be followed out of the rootfs.
-    from _builders import make_tar
-    from proot_distro.helpers.docker.layers import apply_layer
+    from _builders import apply_layer_file, make_tar
 
     tmp_path, root, sentinel = env
     outside = str(tmp_path / "outside")
@@ -161,8 +160,8 @@ def test_writethrough_absolute_symlink_across_layers_contained(env):
     make_tar(str(l2),
              [{"name": "evil/pwned", "type": "file", "data": b"ESCAPED"}],
              compression="gz")
-    apply_layer(str(l1), root)
-    apply_layer(str(l2), root)
+    apply_layer_file(str(l1), root)
+    apply_layer_file(str(l2), root)
 
     assert not os.path.exists(os.path.join(outside, "pwned"))
     assert sorted(os.listdir(outside)) == ["secret"]
@@ -248,6 +247,80 @@ def test_opaque_whiteout_clears_parent_only(env):
     assert os.path.exists(os.path.join(root, "top"))
 
 
+def test_whiteout_dotdot_name_does_not_escape(env):
+    # ".wh..." strips to "..", which named the parent's parent — for a
+    # top-level whiteout that is one level above the extraction root, i.e.
+    # containers/<name>/ during an install. The member must delete nothing.
+    tmp_path, root, sentinel = env
+    # A sibling of the rootfs, standing in for containers/<name>/manifest.json.
+    sibling = tmp_path / "outside" / "manifest.json"
+    sibling.write_text("KEEP")
+    _extract(tmp_path, root, [
+        {"name": "keep", "type": "file", "data": b"k"},
+        {"name": ".wh...", "type": "file"},
+    ], handle_whiteouts=True)
+    assert sibling.read_text() == "KEEP"
+    assert sentinel.read_text() == "SECRET"
+    assert set(os.listdir(tmp_path)) <= {"root", "outside", "evil.tar"}
+    assert os.path.isdir(root)
+    assert os.path.exists(os.path.join(root, "keep"))
+    # The whiteout member is consumed, not written into the rootfs.
+    assert not os.path.exists(os.path.join(root, ".wh..."))
+
+
+def test_nested_whiteout_dotdot_name_spares_parent(env):
+    tmp_path, root, sentinel = env
+    _extract(tmp_path, root, [
+        {"name": "d", "type": "dir"},
+        {"name": "d/sub", "type": "dir"},
+        {"name": "d/keep", "type": "file", "data": b"k"},
+        {"name": "d/sub/.wh...", "type": "file"},
+    ], handle_whiteouts=True)
+    _assert_no_escape(tmp_path, sentinel)
+    assert os.path.exists(os.path.join(root, "d", "keep"))
+    assert os.path.isdir(os.path.join(root, "d", "sub"))
+
+
+@pytest.mark.parametrize("name", [".wh.", ".wh.."])
+def test_whiteout_naming_own_parent_deletes_nothing(env, name):
+    # ".wh." and ".wh.." strip to "" and ".", both of which name the
+    # directory the whiteout sits in rather than a sibling. Neither is a
+    # sibling to remove, so the contents stay.
+    tmp_path, root, sentinel = env
+    _extract(tmp_path, root, [
+        {"name": "keep", "type": "file", "data": b"k"},
+        {"name": name, "type": "file"},
+    ], handle_whiteouts=True)
+    _assert_no_escape(tmp_path, sentinel)
+    assert os.path.isdir(root)
+    assert os.path.exists(os.path.join(root, "keep"))
+    assert not os.path.exists(os.path.join(root, name))
+
+
+@pytest.mark.parametrize("kind,extra", [
+    ("symlink", {"linkname": "/etc/passwd"}),
+    ("file", {"data": b"X"}),
+    ("dir", {}),
+])
+def test_trailing_dot_member_dropped(env, kind, extra):
+    # "d/." names the directory the member sits in, and os.path.join keeps
+    # the "." in the path: a symlink member rmtree'd the directory's whole
+    # contents before failing on EEXIST, and a regular one ended the
+    # extraction on EISDIR.
+    tmp_path, root, sentinel = env
+    _extract(tmp_path, root, [
+        {"name": "d", "type": "dir"},
+        {"name": "d/keep", "type": "file", "data": b"k"},
+        {"name": "d/.", "type": kind, **extra},
+        {"name": "after", "type": "file", "data": b"a"},
+    ], handle_whiteouts=True)
+    _assert_no_escape(tmp_path, sentinel)
+    assert os.path.isdir(os.path.join(root, "d"))
+    assert os.listdir(os.path.join(root, "d")) == ["keep"]
+    # Extraction carried on past the bad member.
+    assert os.path.exists(os.path.join(root, "after"))
+
+
 def test_whiteouts_ignored_when_disabled(env):
     tmp_path, root, sentinel = env
     # With handle_whiteouts=False (plain rootfs tar), .wh. files are simply
@@ -273,3 +346,92 @@ def test_kitchen_sink_hostile_archive_contained(env):
     assert open(os.path.join(root, "ok", "file"), "rb").read() == b"OK"
     # The absolute path was re-rooted inside, not written to the host.
     assert os.path.exists(os.path.join(root, "abs", "evil"))
+
+
+# ---------------------------------------------------------------------------
+# The live-writer race: resolving is not the same as writing.
+# ---------------------------------------------------------------------------
+#
+# The resolve clamps a member inside the rootfs, but everything that acted
+# on its answer named it again — os.makedirs, os.remove, open(dest, "wb"),
+# os.chmod, os.utime each resolved the path afresh. A process writing into
+# the tree between the two steps could therefore point a resolved parent
+# somewhere else and have the member land there. On Termux that process is
+# ordinary: a container being installed sits under CONTAINERS_DIR, which is
+# inside the $TERMUX_PREFIX bound read-write into every non-isolated guest.
+#
+# The swap is staged deterministically here — the resolve is wrapped and the
+# directory replaced the instant it answers — which is the state the loser of
+# the race is in.
+
+def _swap_after_resolve(monkeypatch, root, at_parts, target):
+    """Replace root/*at_parts* with a link to *target* once it resolves."""
+    from proot_distro.helpers import tar_extract as mod
+
+    real = mod.safe_resolve_parts
+    swapped = []
+
+    def resolve_then_swap(rootv, parts, **kw):
+        answer = real(rootv, parts, **kw)
+        if answer == list(at_parts) and not swapped:
+            victim = os.path.join(root, *at_parts)
+            os.rename(victim, victim + ".moved")
+            os.symlink(str(target), victim)
+            swapped.append(True)
+        return answer
+
+    monkeypatch.setattr(mod, "safe_resolve_parts", resolve_then_swap)
+    return swapped
+
+
+def test_write_does_not_follow_a_parent_swapped_after_the_resolve(
+        env, monkeypatch):
+    tmp_path, root, sentinel = env
+    os.makedirs(os.path.join(root, "a", "b"))
+    outside = os.path.dirname(str(sentinel))
+    swapped = _swap_after_resolve(monkeypatch, root, ("a", "b"), outside)
+
+    with pytest.raises(OSError):
+        _extract(tmp_path, root, [
+            {"name": "a/b/planted", "type": "file", "data": b"pwned"},
+        ])
+
+    assert swapped, "the staged swap never ran; the test proves nothing"
+    assert not os.path.exists(os.path.join(outside, "planted"))
+    _assert_no_escape(tmp_path, sentinel)
+
+
+def test_hardlink_does_not_follow_a_parent_swapped_after_the_resolve(
+        env, monkeypatch):
+    tmp_path, root, sentinel = env
+    os.makedirs(os.path.join(root, "a", "b"))
+    outside = os.path.dirname(str(sentinel))
+    # The deferred pass resolves both endpoints again; stage the swap on
+    # the destination's parent, which is what it writes through.
+    swapped = _swap_after_resolve(monkeypatch, root, ("a", "b"), outside)
+
+    with pytest.raises(OSError):
+        _extract(tmp_path, root, [
+            {"name": "src", "type": "file", "data": b"content"},
+            {"name": "a/b/planted", "type": "hardlink", "linkname": "src"},
+        ])
+
+    assert swapped
+    assert not os.path.exists(os.path.join(outside, "planted"))
+    _assert_no_escape(tmp_path, sentinel)
+
+
+def test_a_hardlinked_member_name_is_not_written_through(env):
+    """A file member replaces the name; it never writes into a linked inode."""
+    tmp_path, root, sentinel = env
+    # What a guest can prepare: a second name, inside the rootfs, for a
+    # host file. openat(2) cannot tell it from an ordinary entry.
+    os.link(str(sentinel), os.path.join(root, "planted"))
+
+    _extract(tmp_path, root, [
+        {"name": "planted", "type": "file", "data": b"layer content"},
+    ])
+
+    assert sentinel.read_text() == "SECRET"
+    with open(os.path.join(root, "planted"), "rb") as fh:
+        assert fh.read() == b"layer content"

@@ -19,13 +19,42 @@
 #
 
 # Architecture: Supplies fake /proc and /sys content that proot bind-mounts
-# read-only into the container. Android restricts or blocks several /proc
-# files; providing static replacements ensures distro tools that read them
-# (top, htop, etc.) work correctly. The fake files live under
-# containers/<name>/sysdata/ so they are removed together with the container.
+# over the real entries in the container. Android restricts or blocks
+# several /proc files; providing static replacements ensures distro tools
+# that read them (top, htop, etc.) work correctly. The fake files live
+# under containers/<name>/sysdata/ so they are removed together with the
+# container.
+#
+# That directory is guest-writable: on Termux it sits under $TERMUX_PREFIX,
+# which is bound read-write into every non-isolated container, so a session
+# can replace any entry here between runs. Every name below is therefore
+# addressed as (directory fd, entry name) with O_NOFOLLOW, never as a path:
+# os.path.exists() plus open(path, "w") followed a planted symlink and
+# created -- or, for a name whose target already existed, silently skipped
+# -- a host file, os.makedirs(exist_ok=True) accepted one in place of
+# sys_empty, and os.chmod() applied 0700 to whatever it led to. The bind
+# arguments are just as bad the other way round: proot mounts what the name
+# resolves to, so a symlinked `loadavg` would have handed the guest a host
+# file as /proc/loadavg. An entry that is not of the type this module wrote
+# is dropped and remade -- nothing else writes here, so nothing legitimate
+# is lost -- and one that cannot be validated is left unbound rather than
+# followed.
+#
+# "The type this module wrote" has to include the link count, because a
+# hardlink is a regular file: it *is* another file, under a second name,
+# and O_NOFOLLOW has nothing to refuse. A session that unlinks sysdata/
+# loadavg and links a host file into its place leaves an entry every later
+# session accepts as its own -- setup_fake_sysdata() keeps it, and
+# fake_sysdata_bindings() names it as the source proot mounts at
+# /proc/loadavg, where the guest can read *and write* it, since proot has
+# no read-only bind. That is the persistent case this module exists to
+# rule out, so a file this module wrote is one with exactly one link, and
+# anything else is dropped and written again.
 
 import os
+import stat
 
+from proot_distro import dirfd
 from proot_distro.constants import (
     DEFAULT_FAKE_KERNEL_RELEASE,
     DEFAULT_FAKE_KERNEL_VERSION,
@@ -35,16 +64,28 @@ _FAKE_LOADAVG = "0.12 0.07 0.02 2/165 765\n"
 
 _FAKE_OVERFLOW_ID = "65534\n"
 
-_FAKE_STAT = """\
-cpu  1957 0 2877 93280 262 342 254 87 0 0
-cpu0 31 0 226 12027 82 10 4 9 0 0
-cpu1 45 0 664 11144 21 263 233 12 0 0
-cpu2 494 0 537 11283 27 10 3 8 0 0
-cpu3 359 0 234 11723 24 26 5 7 0 0
-cpu4 295 0 268 11772 10 12 2 12 0 0
-cpu5 270 0 251 11833 15 3 1 10 0 0
-cpu6 430 0 520 11386 30 8 1 12 0 0
-cpu7 30 0 172 12108 50 8 1 13 0 0
+# One snapshot row per CPU: the ten counters of a /proc/stat "cpuN" line
+# (user nice system idle iowait irq softirq steal guest guest_nice) in
+# USER_HZ ticks, each CPU about 120 s into a 124 s uptime. fake_stat()
+# lays them over however many CPUs the host has, cycling through the rows
+# when it has more than eight.
+_FAKE_CPU_ROWS = (
+    (31, 0, 226, 12027, 82, 10, 4, 9, 0, 0),
+    (45, 0, 664, 11144, 21, 263, 233, 12, 0, 0),
+    (494, 0, 537, 11283, 27, 10, 3, 8, 0, 0),
+    (359, 0, 234, 11723, 24, 26, 5, 7, 0, 0),
+    (295, 0, 268, 11772, 10, 12, 2, 12, 0, 0),
+    (270, 0, 251, 11833, 15, 3, 1, 10, 0, 0),
+    (430, 0, 520, 11386, 30, 8, 1, 12, 0, 0),
+    (30, 0, 172, 12108, 50, 8, 1, 13, 0, 0),
+)
+_IDLE_COLUMN = 3
+_USER_HZ = 100
+_FAKE_UPTIME_SECONDS = "124.08"
+
+# The counters after the per-CPU lines. None of them depends on how many
+# CPUs there are.
+_FAKE_STAT_TAIL = """\
 intr 127541 38 290 0 0 0 0 4 0 1 0 0 25329 258 0 5777 277 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
 ctxt 140223
 btime 1680020856
@@ -54,7 +95,67 @@ procs_blocked 0
 softirq 75663 0 5903 6 25375 10774 0 243 11685 0 21677
 """
 
-_FAKE_UPTIME = "124.08 932.80\n"
+# What the guest's /proc/cpuinfo is read from. The host's: nothing here
+# fakes it, so it is the file fake_stat() has to agree with.
+_CPUINFO = "/proc/cpuinfo"
+
+
+def host_cpu_ids() -> list:
+    """Return the sorted ids of the CPUs /proc/cpuinfo lists.
+
+    The kernel lists the online CPUs there, by the same ids its real
+    /proc/stat uses for ``cpuN`` -- on Android a core that is switched
+    off disappears from both, leaving a gap in the numbering that a
+    ``range()`` would paper over. A kernel whose cpuinfo has no
+    ``processor : N`` lines (some architectures format it differently),
+    or a file that cannot be read, falls back to ``os.cpu_count()``, and
+    to one CPU when even that is unknown, so the list is never empty.
+    """
+    ids = set()
+    try:
+        with open(_CPUINFO, "rb") as fh:
+            for line in fh:
+                key, sep, value = line.partition(b":")
+                value = value.strip()
+                if sep and key.strip() == b"processor" and value.isdigit():
+                    ids.add(int(value))
+    except OSError:
+        pass
+    if not ids:
+        ids = set(range(os.cpu_count() or 1))
+    return sorted(ids)
+
+
+def _cpu_rows(cpus) -> list:
+    """Pair each id in *cpus* (CPU 0 when empty) with its snapshot counters."""
+    return [(cpu, _FAKE_CPU_ROWS[n % len(_FAKE_CPU_ROWS)])
+            for n, cpu in enumerate(cpus or [0])]
+
+
+def fake_stat(cpus) -> str:
+    """Return /proc/stat content with one ``cpuN`` line per id in *cpus*.
+
+    The aggregate ``cpu`` line is the column-wise sum of those lines, as
+    the kernel's is, so a tool that cross-checks the two (or divides one
+    by the other) sees them agree for any number of CPUs.
+    """
+    rows = _cpu_rows(cpus)
+    total = [sum(column) for column in zip(*(row for _cpu, row in rows))]
+    lines = ["cpu  " + " ".join(map(str, total))]
+    for cpu, row in rows:
+        lines.append(f"cpu{cpu} " + " ".join(map(str, row)))
+    return "\n".join(lines) + "\n" + _FAKE_STAT_TAIL
+
+
+def fake_uptime(cpus) -> str:
+    """Return /proc/uptime content consistent with fake_stat(*cpus*).
+
+    The second field is the idle time summed over every CPU, so it is
+    taken from the same rows as the idle column of ``cpu`` in /proc/stat.
+    """
+    idle = sum(row[_IDLE_COLUMN] for _cpu, row in _cpu_rows(cpus))
+    return f"{_FAKE_UPTIME_SECONDS} {idle / _USER_HZ:.2f}\n"
+
 
 _FAKE_VMSTAT = """\
 nr_free_pages 1743136
@@ -237,77 +338,304 @@ direct_map_level3_splits 0
 nr_unstable 0
 """
 
+_FAKE_VERSION = (
+    f"Linux version {DEFAULT_FAKE_KERNEL_RELEASE} (proot@termux) "
+    f"(gcc (GCC) 13.3.0, GNU ld (GNU Binutils) 2.42) "
+    f"{DEFAULT_FAKE_KERNEL_VERSION}\n"
+)
 
-def _write_if_missing(path: str, content: str) -> None:
-    if not os.path.exists(path):
-        with open(path, "w") as fh:
-            fh.write(content)
+# The fake /proc entries, in the order they are written and bound: the
+# name under sysdata/, the guest path it substitutes for, and the content.
+# The content is a string, written once and then left alone, or -- for the
+# entries that describe the CPUs -- a function of the host's CPU ids,
+# which is rewritten whenever its output changes (see setup_fake_sysdata).
+_FAKE_ENTRIES = (
+    ("loadavg", "/proc/loadavg", _FAKE_LOADAVG),
+    ("stat", "/proc/stat", fake_stat),
+    ("uptime", "/proc/uptime", fake_uptime),
+    ("version", "/proc/version", _FAKE_VERSION),
+    ("vmstat", "/proc/vmstat", _FAKE_VMSTAT),
+    ("sysctl_entry_cap_last_cap", "/proc/sys/kernel/cap_last_cap", "40\n"),
+    ("sysctl_inotify_max_user_watches",
+     "/proc/sys/fs/inotify/max_user_watches", "4096\n"),
+    ("sysctl_kernel_overflowuid", "/proc/sys/kernel/overflowuid",
+     _FAKE_OVERFLOW_ID),
+    ("sysctl_kernel_overflowgid", "/proc/sys/kernel/overflowgid",
+     _FAKE_OVERFLOW_ID),
+)
 
 
-def setup_fake_sysdata(rootfs: str) -> None:
+def sysdata_dir(rootfs: str) -> str:
+    """Path of the sysdata directory belonging to *rootfs*."""
+    return os.path.join(os.path.dirname(rootfs), "sysdata")
+
+
+def _ensure_dir_at(dir_fd: int, name: str, mode: int = None):
+    """Open the subdirectory *name*, creating it. Descriptor, or None.
+
+    O_NOFOLLOW throughout, so a symlink under the name is refused rather
+    than followed. Anything that is refused is then unlinked and the
+    directory made for real: this tree is written by nothing but the code
+    below, so an entry of the wrong type was planted, and leaving it
+    would keep the fake data permanently unavailable as well as unsafe.
+    *mode* is applied to the descriptor, never to the name.
+    """
+    fd = None
+    try:
+        fd = dirfd.opendir_at(dir_fd, name)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        try:
+            os.unlink(name, dir_fd=dir_fd)
+        except OSError:
+            return None
+    if fd is None:
+        try:
+            os.mkdir(name, 0o755, dir_fd=dir_fd)
+        except FileExistsError:
+            pass                    # lost a race with another writer
+        except OSError:
+            return None
+        try:
+            fd = dirfd.opendir_at(dir_fd, name)
+        except OSError:
+            return None
+    if mode is not None:
+        try:
+            os.fchmod(fd, mode)
+        except OSError:
+            pass
+    return fd
+
+
+def _is_own_file(st) -> bool:
+    """True when *st* describes a file this module could have written.
+
+    A plain file with exactly one link. The link count is half the test
+    because a hardlink is not a distinct kind of entry -- it is the file
+    itself under a second name, so S_ISREG alone accepts one a guest made
+    to a host file and every later session then treats that inode as its
+    own fake /proc content. Nothing here ever creates a second link to
+    anything it writes, so st_nlink != 1 means the entry was planted.
+    """
+    return stat.S_ISREG(st.st_mode) and st.st_nlink == 1
+
+
+def _write_if_missing(dir_fd: int, name: str, content: str) -> None:
+    """Create *name* under dir_fd with *content*, unless already present.
+
+    "Present" means a plain file with one link: an entry of any other
+    type -- or one that is also linked from somewhere else -- is not one
+    this module wrote, so it is removed and the real file created in its
+    place. O_CREAT|O_EXCL|O_NOFOLLOW then guarantees the bytes go into a
+    new inode inside this directory and nowhere else. Unlinking the name
+    leaves whatever else the inode is linked from untouched, which is the
+    point: a host file that was linked here keeps its content and simply
+    stops being this container's /proc/loadavg.
+    """
+    try:
+        st = dirfd.lstat_at(dir_fd, name)
+    except FileNotFoundError:
+        st = None
+    except OSError:
+        return
+    if st is not None:
+        if _is_own_file(st):
+            return
+        try:
+            os.unlink(name, dir_fd=dir_fd)
+        except OSError:
+            return
+
+    try:
+        fd = dirfd.open_file_at(
+            dir_fd, name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644,
+        )
+    except OSError:
+        return
+    try:
+        data = content.encode()
+        while data:
+            data = data[os.write(fd, data):]
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _holds(dir_fd: int, name: str, data: bytes) -> bool:
+    """True when *name* is a file this module wrote, containing *data*."""
+    try:
+        fd, st = dirfd.open_regular_at(dir_fd, name, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        with os.fdopen(fd, "rb") as fh:
+            fd = None
+            return (_is_own_file(st) and st.st_size == len(data)
+                    and fh.read(len(data) + 1) == data)
+    except OSError:
+        return False
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _write_current(dir_fd: int, name: str, content: str) -> None:
+    """Make *name* under dir_fd a plain file holding exactly *content*.
+
+    For the entries whose content follows the host (see fake_stat), which
+    unlike _write_if_missing() cannot leave an existing file alone: the
+    CPU count it was written for may no longer be the host's -- an Android
+    kernel takes cores offline and brings them back, and a container's
+    directory can be restored onto another device. A file that already
+    holds *content* is not touched.
+
+    Otherwise the new content goes into a fresh O_EXCL temporary in the
+    same directory and is renamed over the name. rename(2) replaces the
+    directory entry and follows nothing at the destination, so a symlink
+    or a hardlink planted as *name* is swapped out rather than written
+    through, with no window in which the entry is missing or half-written
+    for a session starting at the same moment. A directory in the way
+    makes the rename fail; it is left alone, as _write_if_missing() does.
+    """
+    data = content.encode()
+    if _holds(dir_fd, name, data):
+        return
+    tmp = dirfd.temp_name(name, f".{os.getpid()}.{os.urandom(4).hex()}.tmp")
+    try:
+        fd, _st = dirfd.open_new_at(dir_fd, tmp, 0o644)
+    except OSError:
+        return
+    try:
+        try:
+            view = data
+            while view:
+                view = view[os.write(fd, view):]
+        finally:
+            os.close(fd)
+        os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except OSError:
+        pass
+    finally:
+        # Nothing left under the temporary's name after a rename, and a
+        # failed write or rename (or an interrupt) must not leave it.
+        dirfd.unlink_quietly(dir_fd, tmp)
+
+
+def setup_fake_sysdata(rootfs: str, *, container_fd=None) -> None:
     """Create fake /proc and /sys stubs required by proot on Android.
 
     *rootfs* is the absolute path to the container's rootfs directory
     (e.g. ``$RUNTIME_DIR/containers/<name>/rootfs``).  Fake files are
     written to a sibling ``sysdata/`` directory, not into the rootfs.
+    Most are written once; ``stat`` and ``uptime`` are regenerated for
+    the host's current CPU list, so ``/proc/stat`` always has the same
+    ``cpuN`` lines as the ``/proc/cpuinfo`` the guest reads beside it.
+
+    *container_fd* is that sibling's parent -- `containers/<name>` --
+    when the caller has pinned it, and a caller that has one must pass
+    it. Everything below here is already named as (dir_fd, entry), but
+    the walk started at `os.path.dirname(rootfs)`, a name that is
+    guest-writable on Termux and that `login` resolves while holding
+    only a shared lock. This directory is *created* and chmod'ed 0700
+    and its files written, so a re-pointed name meant doing all of that
+    somewhere else.
     """
-    sysdata_dir = os.path.join(os.path.dirname(rootfs), "sysdata")
-    sys_empty = os.path.join(sysdata_dir, "sys_empty")
-    os.makedirs(sys_empty, exist_ok=True)
-    os.chmod(sysdata_dir, 0o700)
+    try:
+        parent_fd = (dirfd.reopen(container_fd) if container_fd is not None
+                     else dirfd.opendir(os.path.dirname(rootfs)))
+    except OSError:
+        return
+    try:
+        dir_fd = _ensure_dir_at(parent_fd, "sysdata", mode=0o700)
+    finally:
+        os.close(parent_fd)
+    if dir_fd is None:
+        return
 
-    fake_version = (
-        f"Linux version {DEFAULT_FAKE_KERNEL_RELEASE} (proot@termux) "
-        f"(gcc (GCC) 13.3.0, GNU ld (GNU Binutils) 2.42) "
-        f"{DEFAULT_FAKE_KERNEL_VERSION}\n"
-    )
-
-    _write_if_missing(os.path.join(sysdata_dir, "loadavg"), _FAKE_LOADAVG)
-    _write_if_missing(os.path.join(sysdata_dir, "stat"), _FAKE_STAT)
-    _write_if_missing(os.path.join(sysdata_dir, "uptime"), _FAKE_UPTIME)
-    _write_if_missing(os.path.join(sysdata_dir, "version"), fake_version)
-    _write_if_missing(os.path.join(sysdata_dir, "vmstat"), _FAKE_VMSTAT)
-    _write_if_missing(
-        os.path.join(sysdata_dir, "sysctl_entry_cap_last_cap"), "40\n"
-    )
-    _write_if_missing(
-        os.path.join(sysdata_dir, "sysctl_inotify_max_user_watches"),
-        "4096\n",
-    )
-    _write_if_missing(
-        os.path.join(sysdata_dir, "sysctl_kernel_overflowuid"),
-        _FAKE_OVERFLOW_ID,
-    )
-    _write_if_missing(
-        os.path.join(sysdata_dir, "sysctl_kernel_overflowgid"),
-        _FAKE_OVERFLOW_ID,
-    )
+    try:
+        empty_fd = _ensure_dir_at(dir_fd, "sys_empty")
+        if empty_fd is not None:
+            os.close(empty_fd)
+        cpus = host_cpu_ids()
+        for name, _real, content in _FAKE_ENTRIES:
+            if callable(content):
+                _write_current(dir_fd, name, content(cpus))
+            else:
+                _write_if_missing(dir_fd, name, content)
+    finally:
+        os.close(dir_fd)
 
 
-def fake_proc_bindings(rootfs: str) -> list:
-    """Return --bind args for fake /proc entries unreadable on Android.
+def _is_own_dir(st) -> bool:
+    """True when *st* describes a plain directory.
 
-    *rootfs* is the absolute path to the container's rootfs directory.
+    No link-count test: a directory cannot be hardlinked, so the type is
+    the whole of it.
     """
-    sysdata_dir = os.path.join(os.path.dirname(rootfs), "sysdata")
+    return stat.S_ISDIR(st.st_mode)
+
+
+def _accepts_at(dir_fd: int, name: str, predicate) -> bool:
+    """True when *name* under dir_fd is an entry *predicate* accepts."""
+    try:
+        st = dirfd.lstat_at(dir_fd, name)
+    except OSError:
+        return False
+    return predicate(st)
+
+
+def _open_sysdata_dir(rootfs: str, container_fd):
+    """Open the container's sysdata/ directory. Descriptor, or None.
+
+    From the pinned container directory when the caller has one; see
+    setup_fake_sysdata for why that matters.
+    """
+    if container_fd is None:
+        return dirfd.opendir_under(os.path.dirname(rootfs), ("sysdata",))
+    try:
+        return dirfd.descend_at(container_fd, ("sysdata",))
+    except OSError:
+        return None
+
+
+def fake_sysdata_bindings(rootfs: str, *, container_fd=None) -> list:
+    """Return --bind args for the fake /proc and /sys entries of *rootfs*.
+
+    A /proc entry the host can already read is left alone, so a stub
+    stands in only where the real file is blocked or missing.
+
+    Only entries this module could verify are bound: sys_empty as a real
+    directory, each /proc substitute as a plain file with one link -- a
+    second link means the inode is reachable under some other name too,
+    which is exactly how a guest hands a host file to the next session as
+    its /proc/loadavg (see _is_own_file). A directory needs no such test:
+    it cannot be hardlinked. proot still resolves the source by name when
+    it mounts it, so a session running against the same container can
+    re-point one in between; what the checks remove is the persistent
+    case, where a guest leaves a symlink or a link to a host file behind
+    and every later session mounts it into the guest.
+    """
+    base = sysdata_dir(rootfs)
+    dir_fd = _open_sysdata_dir(rootfs, container_fd)
+    if dir_fd is None:
+        return []
+
     bindings = []
-    checks = [
-        ("/proc/loadavg",                        "loadavg"),
-        ("/proc/stat",                            "stat"),
-        ("/proc/uptime",                          "uptime"),
-        ("/proc/version",                         "version"),
-        ("/proc/vmstat",                          "vmstat"),
-        ("/proc/sys/kernel/cap_last_cap",         "sysctl_entry_cap_last_cap"),
-        ("/proc/sys/fs/inotify/max_user_watches", "sysctl_inotify_max_user_watches"),
-        ("/proc/sys/kernel/overflowuid",           "sysctl_kernel_overflowuid"),
-        ("/proc/sys/kernel/overflowgid",           "sysctl_kernel_overflowgid"),
-    ]
-    for real, fake_name in checks:
-        try:
-            with open(real, "rb") as fh:
-                fh.read(1)
-        except OSError:
-            bindings.append(
-                f"--bind={os.path.join(sysdata_dir, fake_name)}:{real}"
-            )
+    try:
+        if _accepts_at(dir_fd, "sys_empty", _is_own_dir):
+            bindings.append(f"--bind={base}/sys_empty:/sys/fs/selinux")
+        for name, real, _content in _FAKE_ENTRIES:
+            try:
+                with open(real, "rb") as fh:
+                    fh.read(1)
+                continue            # the real entry is readable as it is
+            except OSError:
+                pass
+            if _accepts_at(dir_fd, name, _is_own_file):
+                bindings.append(f"--bind={os.path.join(base, name)}:{real}")
+    finally:
+        os.close(dir_fd)
     return bindings

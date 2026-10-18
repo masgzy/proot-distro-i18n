@@ -28,8 +28,8 @@
 # taken over by another process for interactive input — e.g., the pinentry
 # triggered by piping a backup into 'gpg -c'. In that state any of our
 # writes (info lines, progress bars) would land on top of the other
-# program's display. msg() and the backup progress bar consult this so
-# that piping into curses/no-echo consumers stays clean.
+# program's display. msg() and the progress bars (progress.py) consult
+# this so that piping into curses/no-echo consumers stays clean.
 #
 # A process-global "quiet" flag is also exported: set_quiet(True) (called
 # by command handlers when --quiet was passed) makes is_quiet() return True
@@ -150,6 +150,23 @@ def tty_safe_for_writes() -> bool:
     return bool(lflag & termios.ECHO) and bool(lflag & termios.ICANON)
 
 
+def terminal_width(default: int = 80) -> int:
+    """Return the terminal's column count, or *default* when unknown.
+
+    stderr is probed first because that is where the commands that lay
+    out columns (`ps`, `list --image`, `search`) render; stdout is the fallback
+    for the case where only it is still attached to the terminal.
+    """
+    for fd in (2, 1):
+        try:
+            cols = os.get_terminal_size(fd).columns
+        except (OSError, ValueError):
+            continue
+        if cols > 0:
+            return cols
+    return default
+
+
 _quiet = False
 
 
@@ -216,3 +233,64 @@ def warn(text: str):
 def crit_error(text: str):
     """Emit an 'Error: text' line in red. Caller typically calls sys.exit(1)."""
     msg(f"{C['BRED']}{_('Error')}: {C['RED']}{text}{C['RST']}")
+
+
+# Characters that get a readable escape rather than a numeric one.
+_QUOTE_MAP = {
+    "\\": "\\\\",
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+    "\x1b": "\\e",
+}
+
+
+def quote_path(text: str) -> str:
+    """Render *text* printable, C-style escapes for control characters.
+
+    Names inside a container rootfs, an archive, an image's metadata or a
+    registry's reply are chosen by whoever controls that content, and the
+    commands print them freely: `copy` and `sync` log every entry under
+    `--verbose`, the skip warning names the file it passed over, and an
+    OSError carries the name it failed on. A name holding ESC repaints the
+    terminal, hides the lines around it, or hands the emulator whatever
+    sequence follows it, so nothing below 0x20 — nor DEL — is allowed
+    through literally. Backslash is escaped too, so an escape this produced
+    cannot be confused with the same characters spelled out in a name.
+
+    A lone surrogate is escaped as well, as `\\udcff`. It is how a byte
+    that is not UTF-8 arrives -- out of argv, the environment, or a JSON
+    document's `\\udcff` -- and no stream can encode one: stderr renders
+    it with backslashreplace, which is where the spelling comes from, but
+    stdout is strict and raised UnicodeEncodeError on it.
+
+    Only the untrusted text is passed through here, never a whole message:
+    the colour codes the log helpers wrap it in are control characters by
+    definition.
+    """
+    out = []
+    for ch in text:
+        escaped = _QUOTE_MAP.get(ch)
+        if escaped is not None:
+            out.append(escaped)
+        elif ch < " " or ch == "\x7f":
+            out.append(f"\\x{ord(ch):02x}")
+        elif "\ud800" <= ch <= "\udfff":
+            out.append(f"\\u{ord(ch):04x}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def quote_error(exc: BaseException) -> str:
+    """The reason *exc* gives, safe to print next to a name of our own.
+
+    An OSError's `strerror` is the message alone — "No such file or
+    directory" — with no filename in it, which is what callers want: they
+    name the entry themselves, through quote_path, and adding str(exc)
+    would repeat it. Everything else here has only str(): a TarError, a
+    BuildError, a RuntimeError raised while an image was unpacked. Those
+    interpolate names into their message raw, so the whole string is
+    untrusted and goes through quote_path.
+    """
+    return quote_path(getattr(exc, "strerror", None) or str(exc))

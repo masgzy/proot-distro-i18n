@@ -31,27 +31,33 @@
 import json
 import os
 import re
-import shutil
+import stat
 import sys
 import tarfile
-import tempfile
 
-from proot_distro.atomic import atomic_replace
+from proot_distro import dirfd, statedir
+from proot_distro.atomic import atomic_write
 from proot_distro.constants import BASE_CACHE_DIR, PROGRAM_NAME
-from proot_distro.message import C, msg, log_info, log_error, crit_error
+from proot_distro.message import (
+    C, msg, log_info, log_error, crit_error, quote_path,
+)
 from proot_distro.progress import clear_bar
 from proot_distro.locking import ContainerLock
 from proot_distro.arch import get_device_cpu_arch, normalize_arch
 from proot_distro.names import is_valid_name, require_valid_name
 from proot_distro.paths import (
     container_dir, container_manifest, container_rootfs,
+    container_is_installed, open_container_pair,
 )
 from proot_distro.sysdata import setup_fake_sysdata
-from proot_distro.helpers.docker import derive_alias, pull_image
+from proot_distro.helpers.docker import (
+    InvalidReference, derive_alias, parse_reference, pull_image,
+)
 from proot_distro.helpers.rootfs import (
-    register_android_ids,
-    write_hosts,
-    write_resolv_conf,
+    open_etc,
+    register_android_ids_at,
+    write_hosts_at,
+    write_resolv_conf_at,
 )
 from proot_distro.helpers.download import download_file
 from proot_distro.commands.install_local import install_from_local_file
@@ -61,8 +67,8 @@ from proot_distro.i18n import _
 # Archive extensions stripped when deriving a container name from a filename.
 _ARCHIVE_EXTS = (
     ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz",
-    ".oci.tar.xz", ".oci.tar.gz", ".oci.tar",
-    ".tar.lzma", ".tlzma", ".tar",
+    ".oci.tar.xz", ".oci.tar.gz", ".oci.tar.zst", ".oci.tar",
+    ".tar.lzma", ".tlzma", ".tar.zst", ".tzst", ".tar",
 )
 
 
@@ -99,6 +105,33 @@ def _derive_local_name(path: str) -> str:
     return base
 
 
+def _cache_temp_file(prefix: str) -> str:
+    """Create an empty temporary in the download cache. Returns its path.
+
+    tempfile.mkstemp(dir=BASE_CACHE_DIR) resolved that name, and the
+    cache root is a name a guest can re-point on Termux, so the whole
+    downloaded archive landed in whatever directory it led to. The
+    directory is walked down to instead and the file created O_EXCL off
+    the descriptor the walk validated.
+
+    Nothing writes *through* this name: it is only the destination
+    download_file() hands to atomic_replace(), which writes its own
+    temporary through a descriptor and renames it onto this entry --
+    and rename(2) replaces a symlink standing at the destination rather
+    than following it. What the name buys is a reservation, so two
+    installs running at once cannot pick the same one.
+    """
+    dir_fd = statedir.open_state_dir(BASE_CACHE_DIR, create=True)
+    try:
+        name = dirfd.temp_name(
+            prefix, f".{os.getpid()}.{os.urandom(4).hex()}.tmp",
+        )
+        os.close(dirfd.open_new_at(dir_fd, name, 0o600)[0])
+        return os.path.join(BASE_CACHE_DIR, name)
+    finally:
+        os.close(dir_fd)
+
+
 # ---------------------------------------------------------------------------
 # Command
 # ---------------------------------------------------------------------------
@@ -131,6 +164,18 @@ def command_install(args) -> None:
     # Decide between local-file, URL, and Docker-pull mode.
     local_path = os.path.expanduser(image_ref) if _is_local_path(image_ref) else None
     url = image_ref if _is_url(image_ref) else None
+
+    # Anything else is an image reference, and one Docker would refuse is
+    # refused here, before a container name is derived from it or a lock
+    # taken: `ubuntu@sha256:<hex>` used to surface as "cannot derive a
+    # valid container name", and `Ubuntu` as whatever the registry said
+    # about a repository no client can name.
+    if local_path is None and url is None:
+        try:
+            parse_reference(image_ref)
+        except InvalidReference as exc:
+            crit_error(f"cannot install '{quote_path(image_ref)}': {exc}.")
+            sys.exit(1)
 
     install_name = _resolve_install_name(
         image_ref, local_path, url, custom_container_name,
@@ -181,6 +226,15 @@ def _resolve_install_name(image_ref, local_path, url, custom_container_name):
     return derived
 
 
+def _is_regular_at(dir_fd: int, name: str) -> bool:
+    """True when *name* under dir_fd is a plain file, following nothing."""
+    try:
+        st = dirfd.lstat_at(dir_fd, name)
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode)
+
+
 def _run_install(
     install_name: str,
     image_ref: str,
@@ -193,7 +247,13 @@ def _run_install(
     container_path = container_dir(install_name)
     rootfs_dir = container_rootfs(install_name)
 
-    if os.path.isdir(rootfs_dir):
+    # Walked down to, not named: `containers/<name>` is guest-writable on
+    # Termux, and os.path.isdir() said "no" to a symlink pointing at a
+    # host directory with no rootfs in it, after which the whole install
+    # was extracted inside that directory. A planted component stops the
+    # command in open_container_pair(); what reaches here is either a
+    # real rootfs (refuse, the container exists) or nothing yet.
+    if container_is_installed(install_name):
         msg()
         crit_error(f"container '{install_name}' already exists. "
                    f"Specify a different name with '--name NAME'.")
@@ -219,35 +279,47 @@ def _run_install(
         )
         log_info(_("Installing '{display_ref}' as '{install_name}'...", display_ref = display_ref, install_name = install_name))
 
-    os.makedirs(rootfs_dir, exist_ok=True)
+    # Made level by level off the descriptor of the level above, for the
+    # same reason it is checked that way -- and *kept*: the extraction
+    # writes every member as (dir_fd, name) beneath this descriptor, so
+    # nothing between the check and the last byte written resolves
+    # containers/<name>/rootfs a second time. Closing it and handing the
+    # path down instead left the whole unpack open to a session that
+    # re-pointed the name, which lands the image (and the manifest that
+    # follows it) in a host directory of the session's choosing. The
+    # container directory comes back with it, for the sysdata stubs
+    # written beside the rootfs at the end.
+    container_fd, rootfs_fd = open_container_pair(install_name, create=True)
 
     def _cleanup() -> None:
-        try:
-            shutil.rmtree(container_path)
-        except OSError as exc:
-            log_error(_("Warning: could not remove partial container: {exc}", exc=exc))
+        # The tree being discarded is whatever the image or the archive
+        # produced, so it can be deeper than the interpreter's stack and
+        # can hold directories the image sealed. shutil.rmtree() managed
+        # neither: it recursed, and RecursionError is not an OSError, so
+        # the handler here let it past and the failed install took the
+        # command down with it instead of cleaning up. The walk reaches
+        # `containers` the same way everything else here does, so a
+        # planted parent cannot aim the removal at a host directory.
+        statedir.remove_state_tree(container_path)
 
     tmp_archive = None
     try:
         if local_path is not None:
             log_info(_("Extracting rootfs from archive..."))
-            metadata = install_from_local_file(local_path, rootfs_dir, dist_arch)
-        elif url is not None:
-            os.makedirs(BASE_CACHE_DIR, exist_ok=True)
-            fd, tmp_archive = tempfile.mkstemp(
-                prefix=f"dl_install_{install_name}.",
-                suffix=".tmp",
-                dir=BASE_CACHE_DIR,
+            metadata = install_from_local_file(
+                local_path, rootfs_fd, dist_arch,
             )
-            os.close(fd)
+        elif url is not None:
+            tmp_archive = _cache_temp_file(f"dl_install_{install_name}")
             log_info(_("Downloading archive..."))
             download_file(url, tmp_archive, insecure=allow_insecure)
             log_info(_("Extracting rootfs from archive..."))
-            metadata = install_from_local_file(tmp_archive, rootfs_dir, dist_arch)
+            metadata = install_from_local_file(
+                tmp_archive, rootfs_fd, dist_arch,
+            )
         else:
-            os.makedirs(BASE_CACHE_DIR, exist_ok=True)
             metadata = pull_image(
-                image_ref, rootfs_dir, dist_arch, insecure=allow_insecure
+                image_ref, rootfs_fd, dist_arch, insecure=allow_insecure
             )
 
         # Write manifest.json when metadata is available (Docker pull
@@ -263,24 +335,48 @@ def _run_install(
                 "image_config": metadata.get("image_config", {}),
             }
             try:
-                with atomic_replace(container_manifest(install_name)) as tmp:
-                    with open(tmp, "w") as fh:
-                        json.dump(manifest_data, fh, indent=2)
+                with atomic_write(
+                    container_manifest(install_name), "w",
+                ) as fh:
+                    json.dump(manifest_data, fh, indent=2)
             except OSError as exc:
                 log_error(_("Warning: could not write manifest.json: {exc}", exc = exc))
 
-        if os.path.isdir(os.path.join(rootfs_dir, "etc")):
-            log_info(_("Updating '/etc/resolv.conf'..."))
-            write_resolv_conf(rootfs_dir)
+        # The fixups are the last thing the install writes into the
+        # rootfs, and every one of them writes: a name resolved a second
+        # time is a name that can have been re-pointed since the
+        # extraction finished. `containers/<name>` is guest-writable on
+        # Termux -- it sits under the bound $TERMUX_PREFIX -- so
+        # os.path.isdir() on the composed path followed whatever a
+        # concurrent same-user process left under it, and the three
+        # writers then resolved it again, replacing etc/resolv.conf and
+        # etc/hosts and chmod'ing and appending to passwd-like files in a
+        # host directory of that process's choosing. `etc` is opened once
+        # off the descriptor the extraction itself wrote through, and the
+        # three fixups work from that one descriptor.
+        etc_fd = open_etc(rootfs_fd)
+        if etc_fd is not None:
+            try:
+                log_info(_("Updating '/etc/resolv.conf'..."))
+                write_resolv_conf_at(etc_fd)
 
-            log_info(_("Updating '/etc/hosts'..."))
-            write_hosts(rootfs_dir)
+                log_info(_("Updating '/etc/hosts'..."))
+                write_hosts_at(etc_fd)
 
-            if os.path.isfile(os.path.join(rootfs_dir, "etc", "passwd")):
-                log_info(_("Registering Android-specific UIDs and GIDs..."))
-                register_android_ids(rootfs_dir)
+                # os.path.isfile() answered for the *target* of a link an
+                # image shipped under the name, while the append that
+                # follows refuses one (O_NOFOLLOW) -- so the guard said
+                # yes to exactly the entries the work then declined. The
+                # lstat describes the entry itself, which is what decides
+                # whether register_android_ids_at has a passwd to append
+                # to at all.
+                if _is_regular_at(etc_fd, "passwd"):
+                    log_info(_("Registering Android-specific UIDs and GIDs..."))
+                    register_android_ids_at(etc_fd)
+            finally:
+                os.close(etc_fd)
 
-        setup_fake_sysdata(rootfs_dir)
+        setup_fake_sysdata(rootfs_dir, container_fd=container_fd)
 
     except KeyboardInterrupt:
         clear_bar()
@@ -301,6 +397,8 @@ def _run_install(
         _cleanup()
         raise
     finally:
+        os.close(rootfs_fd)
+        os.close(container_fd)
         if tmp_archive is not None:
             try:
                 os.remove(tmp_archive)

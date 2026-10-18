@@ -21,8 +21,27 @@ _proot_distro_get_containers() {
     fi
 }
 
-# 在 Termux/Android 上返回 0 (true): 三个独立指标中至少两个匹配，
-# 与 constants.py 中的 _detect_termux() 保持一致。
+# Cached OCI images, as `remove --image` accepts them. The manifest cache
+# is keyed by a hash, so the references are read back through the program
+# itself rather than derived from file names.
+_proot_distro_get_images() {
+    proot-distro list --image --quiet 2>/dev/null
+}
+
+# Returns 0 (true) when any of the given words appears in the command line.
+_proot_distro_has_word() {
+    local w needle
+    for w in "${words[@]}"; do
+
+        for needle in "$@"; do
+            [[ "${w}" == "${needle}" ]] && return 0
+        done
+    done
+    return 1
+}
+
+# Returns 0 (true) when running on Termux/Android: at least two of three
+# independent indicators must match, mirroring _detect_termux() in constants.py.
 _proot_distro_is_termux() {
     local score=0
     [[ -f /system/build.prop || -d /data/app ]] && ((score++))
@@ -41,8 +60,8 @@ _proot_distro() {
     local cur prev words cword
     _init_completion || return
 
-    local -r _all_commands="install remove rename reset login list ps kill backup restore
-        clear-cache copy sync run build push mirror help"
+    local -r _all_commands="install search remove rename reset login list ps kill backup
+        restore clear-cache copy sync run build push mirror help"
 
     # Complete the subcommand itself
     if [[ ${cword} -eq 1 ]]; then
@@ -71,9 +90,27 @@ _proot_distro() {
             ;;
 
         # -----------------------------------------------------------------------
-        remove)
+        search)
+            case "${prev}" in
+                -l|--limit)
+                    return ;;
+            esac
             if [[ "${cur}" == -* ]]; then
-                COMPREPLY=($(compgen -W "--verbose --quiet --help" -- "${cur}"))
+                COMPREPLY=($(compgen -W "-l --limit -q --quiet -h --help" -- "${cur}"))
+            fi
+            ;;
+
+        # -----------------------------------------------------------------------
+        remove)
+            case "${prev}" in
+                -a|--architecture)
+                    COMPREPLY=($(compgen -W "aarch64 arm i686 riscv64 x86_64" -- "${cur}"))
+                    return ;;
+            esac
+            if [[ "${cur}" == -* ]]; then
+                COMPREPLY=($(compgen -W "-i --image -a --architecture --verbose --quiet --help" -- "${cur}"))
+            elif _proot_distro_has_word "-i" "--image"; then
+                COMPREPLY=($(compgen -W "$(_proot_distro_get_images)" -- "${cur}"))
             else
                 COMPREPLY=($(compgen -W "$(_proot_distro_get_containers)" -- "${cur}"))
             fi
@@ -130,7 +167,7 @@ _proot_distro() {
 
         # -----------------------------------------------------------------------
         list)
-            COMPREPLY=($(compgen -W "-q --quiet -h --help" -- "${cur}"))
+            COMPREPLY=($(compgen -W "-i --image -q --quiet -h --help" -- "${cur}"))
             ;;
 
         # -----------------------------------------------------------------------
@@ -159,7 +196,7 @@ _proot_distro() {
                     _filedir
                     return ;;
                 -c|--compress)
-                    COMPREPLY=($(compgen -W "gzip bzip2 xz none" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "gzip bzip2 xz zstd none" -- "${cur}"))
                     return ;;
             esac
             if [[ "${cur}" == -* ]]; then
@@ -174,13 +211,13 @@ _proot_distro() {
             if [[ "${cur}" == -* ]]; then
                 COMPREPLY=($(compgen -W "--verbose --quiet --help" -- "${cur}"))
             else
-                _filedir '@(tar|tar.gz|tgz|tar.bz2|tbz2|tar.xz|txz)'
+                _filedir '@(tar|tar.gz|tgz|tar.bz2|tbz2|tar.xz|txz|tar.zst|tzst)'
             fi
             ;;
 
         # -----------------------------------------------------------------------
         clear-cache)
-            COMPREPLY=($(compgen -W "--verbose --quiet --help" -- "${cur}"))
+            COMPREPLY=($(compgen -W "--orphan --build-cache --verbose --quiet --help" -- "${cur}"))
             ;;
 
         # -----------------------------------------------------------------------
@@ -327,7 +364,7 @@ _proot_distro() {
 
         # -----------------------------------------------------------------------
         help)
-            local topics="install remove rename reset login list ps kill backup restore clear-cache copy sync run build push mirror"
+            local topics="install search remove rename reset login list ps kill backup restore clear-cache copy sync run build push mirror"
             COMPREPLY=($(compgen -W "${topics}" -- "${cur}"))
             ;;
 

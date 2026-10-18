@@ -9,40 +9,43 @@ import pytest
 from proot_distro import arch
 
 
+def _header(tmp_path, builders, *a, **kw):
+    """The bytes _elf_arch() judges: written by the builder, read back."""
+    p = tmp_path / "bin"
+    builders.write_elf(str(p), *a, **kw)
+    return p.read_bytes()[:arch._ELF_HEADER_BYTES]
+
+
 @pytest.mark.parametrize("name", ["i686", "arm", "x86_64", "aarch64", "riscv64"])
 def test_elf_arch_detects_each(tmp_path, builders, name):
-    p = tmp_path / "bin"
-    builders.write_elf(str(p), name)
-    assert arch._elf_arch(str(p)) == name
+    assert arch._elf_arch(_header(tmp_path, builders, name)) == name
 
 
 def test_elf_arch_big_endian(tmp_path, builders):
-    p = tmp_path / "bin"
-    builders.write_elf(str(p), "aarch64", little_endian=False)
-    assert arch._elf_arch(str(p)) == "aarch64"
+    header = _header(tmp_path, builders, "aarch64", little_endian=False)
+    assert arch._elf_arch(header) == "aarch64"
 
 
 def test_elf_arch_truncated_returns_empty(tmp_path, builders):
-    p = tmp_path / "bin"
-    builders.write_elf(str(p), "x86_64", truncated=True)
-    assert arch._elf_arch(str(p)) == ""
+    header = _header(tmp_path, builders, "x86_64", truncated=True)
+    assert arch._elf_arch(header) == ""
 
 
 def test_elf_arch_bad_magic_returns_empty(tmp_path, builders):
-    p = tmp_path / "bin"
-    builders.write_elf(str(p), "x86_64", valid_magic=False)
-    assert arch._elf_arch(str(p)) == ""
+    header = _header(tmp_path, builders, "x86_64", valid_magic=False)
+    assert arch._elf_arch(header) == ""
 
 
-def test_elf_arch_unknown_machine_returns_empty(tmp_path):
-    p = tmp_path / "bin"
+def test_elf_arch_unknown_machine_returns_empty():
     # Valid ELF magic but e_machine = 0 (unmapped).
-    p.write_bytes(b"\x7fELF\x02\x01" + b"\x00" * 14)
-    assert arch._elf_arch(str(p)) == ""
+    assert arch._elf_arch(b"\x7fELF\x02\x01" + b"\x00" * 14) == ""
 
 
-def test_elf_arch_missing_file(tmp_path):
-    assert arch._elf_arch(str(tmp_path / "nope")) == ""
+def test_elf_arch_of_nothing_read_returns_empty():
+    # What read_guest_bytes() answers for a file that is not there, not
+    # readable, or not a regular file.
+    assert arch._elf_arch(None) == ""
+    assert arch._elf_arch(b"") == ""
 
 
 def test_detect_installed_arch_from_rootfs(tmp_path, builders):
@@ -127,3 +130,95 @@ def test_emulator_override_used_when_valid(tmp_path):
     assert args[:2] == ["-q", str(emu)]
     # Any extra entries are android system --bind args.
     assert all(a.startswith("--bind=") for a in args[2:])
+
+
+def test_emulator_override_relative_is_made_absolute(tmp_path, monkeypatch):
+    # Both callers exec proot from inside the rootfs, so a relative
+    # emulator path would be resolved there rather than here.
+    emu = tmp_path / "qemu-fake"
+    emu.write_text("#!/bin/sh\n")
+    emu.chmod(emu.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.chdir(tmp_path)
+
+    args = arch.get_emulator_args("aarch64", "x86_64",
+                                  emulator_override="qemu-fake")
+    assert args[0] == "-q"
+    assert os.path.isabs(args[1])
+    assert os.path.samefile(args[1], str(emu))
+
+
+def test_emulator_from_a_relative_path_entry_is_made_absolute(
+    tmp_path, monkeypatch
+):
+    # A relative PATH entry makes shutil.which() answer relatively.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    emu = bin_dir / "qemu-aarch64"
+    emu.write_text("#!/bin/sh\n")
+    emu.chmod(emu.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", "bin")
+
+    args = arch.get_emulator_args("aarch64", "x86_64")
+    assert args[0] == "-q"
+    assert os.path.isabs(args[1])
+    assert os.path.samefile(args[1], str(emu))
+
+
+# ---------------------------------------------------------------------------
+# get_proot_bin — the string both exec paths hand to a PATH the image sets
+# ---------------------------------------------------------------------------
+
+def test_proot_bin_is_absolute(tmp_path, monkeypatch):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    proot = bin_dir / "proot"
+    proot.write_text("#!/bin/sh\n")
+    proot.chmod(proot.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.delenv("PD_PROOT_BIN", raising=False)
+
+    assert arch.get_proot_bin() == str(proot)
+
+
+def test_proot_bin_from_a_relative_path_entry_is_made_absolute(
+    tmp_path, monkeypatch
+):
+    # A relative PATH entry makes shutil.which() answer relatively; the
+    # answer is resolved here, while the cwd is still this process's own.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    proot = bin_dir / "proot"
+    proot.write_text("#!/bin/sh\n")
+    proot.chmod(proot.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", "bin")
+    monkeypatch.delenv("PD_PROOT_BIN", raising=False)
+
+    resolved = arch.get_proot_bin()
+    assert os.path.isabs(resolved)
+    assert os.path.samefile(resolved, str(proot))
+
+
+def test_proot_bin_never_falls_back_to_a_bare_name(tmp_path, monkeypatch,
+                                                   capsys):
+    # "proot" with no directory in it would be looked up again by the
+    # exec, in the PATH of the *child* environment — which an image's Env
+    # supplies.
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    monkeypatch.delenv("PD_PROOT_BIN", raising=False)
+
+    with pytest.raises(SystemExit) as exc:
+        arch.get_proot_bin()
+    assert exc.value.code == 1
+    assert "does not exist" in capsys.readouterr().err
+
+
+def test_proot_bin_override_is_made_absolute(tmp_path, monkeypatch):
+    proot = tmp_path / "proot-static"
+    proot.write_text("#!/bin/sh\n")
+    proot.chmod(proot.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PD_PROOT_BIN", "proot-static")
+
+    assert arch.get_proot_bin() == str(proot)

@@ -2,10 +2,13 @@
 # (proot_distro.commands.install_local) — crafted digests in index.json must
 # not escape the blob layout, and hostile layer content must stay in rootfs.
 
+import io
 import os
+import tarfile
 
 import pytest
 
+from _builders import install_local_into
 from proot_distro.commands import install_local
 
 
@@ -36,7 +39,7 @@ def test_install_oci_with_traversal_index_digest_fails(tmp_path, builders):
     # The crafted index manifest digest is rejected by validate_digest before
     # any path is built from it.
     with pytest.raises(RuntimeError):
-        install_local.install_from_local_file(str(arc), str(root), "x86_64")
+        install_local_into(str(arc), str(root), "x86_64")
 
 
 def test_install_oci_outer_hardlink_layer_rejected(tmp_path, builders):
@@ -65,7 +68,7 @@ def test_install_oci_outer_hardlink_layer_rejected(tmp_path, builders):
         }],
     )
     with pytest.raises(RuntimeError, match="not a regular file"):
-        install_local.install_from_local_file(str(arc), str(root), "x86_64")
+        install_local_into(str(arc), str(root), "x86_64")
 
 
 def test_install_oci_outer_symlink_layer_rejected(tmp_path, builders):
@@ -88,7 +91,7 @@ def test_install_oci_outer_symlink_layer_rejected(tmp_path, builders):
         }],
     )
     with pytest.raises(RuntimeError, match="not a regular file"):
-        install_local.install_from_local_file(str(arc), str(root), "x86_64")
+        install_local_into(str(arc), str(root), "x86_64")
 
 
 def test_install_oci_outer_hardlink_index_rejected(tmp_path, builders):
@@ -111,7 +114,7 @@ def test_install_oci_outer_hardlink_index_rejected(tmp_path, builders):
         }],
     )
     with pytest.raises(RuntimeError, match="not a regular file"):
-        install_local.install_from_local_file(str(arc), str(root), "x86_64")
+        install_local_into(str(arc), str(root), "x86_64")
 
 
 def test_install_oci_with_hostile_layer_contained(tmp_path, builders):
@@ -129,7 +132,7 @@ def test_install_oci_with_hostile_layer_contained(tmp_path, builders):
         {"name": "evil", "type": "hardlink", "linkname": "../../../etc/shadow"},
     ]], arch="x86_64")
 
-    meta = install_local.install_from_local_file(str(arc), str(root), "x86_64")
+    meta = install_local_into(str(arc), str(root), "x86_64")
 
     assert open(os.path.join(str(root), "etc", "ok"), "rb").read() == b"OK"
     assert not os.path.exists(os.path.join(str(root), "evil"))
@@ -138,3 +141,118 @@ def test_install_oci_with_hostile_layer_contained(tmp_path, builders):
     # Local OCI returns metadata so install can write manifest.json.
     assert meta is not None
     assert meta["arch"] == "x86_64"
+
+
+# ---------------------------------------------------------------------------
+# Bounded indexing and bounded reads.
+# ---------------------------------------------------------------------------
+#
+# The archive is a stranger's -- `install ./img.tar`, or an http(s)://
+# URL -- and both the number of members it declares and the size it gives
+# each one are its own choice. tf.getmembers() held a TarInfo for every
+# member and the JSON readers pulled a whole member into memory, so how
+# much this process allocates was the archive's to decide.
+
+def _oci_with_extra_members(tmp_path, builders, names):
+    """A valid one-layer OCI archive carrying *names* as extra members."""
+    arc = tmp_path / "img.oci.tar"
+    builders.make_oci_archive(
+        str(arc),
+        [[{"name": "etc/hostname", "type": "file", "data": b"g"}]],
+        outer_extra_members=[
+            {"name": n, "type": "file", "data": b""} for n in names
+        ],
+    )
+    return arc
+
+
+def test_unaddressable_members_are_not_indexed(tmp_path, builders):
+    """Only the names _oci_open_member() can ask for get a TarInfo."""
+    arc = _oci_with_extra_members(
+        tmp_path, builders,
+        ["junk/a", "junk/b", "oci-layout.bak", "blobs/sha256/zz-not-hex"],
+    )
+    with tarfile.open(str(arc), "r:*") as tf:
+        member_map = install_local._index_oci_members(tf)
+    assert "index.json" in member_map
+    assert all(
+        name == "index.json" or name.startswith("blobs/sha256/")
+        for name in member_map
+    )
+    assert not any("junk" in name for name in member_map)
+
+
+def test_member_count_is_capped(tmp_path, builders, monkeypatch):
+    monkeypatch.setattr(install_local, "_MAX_OCI_MEMBERS", 4)
+    arc = _oci_with_extra_members(
+        tmp_path, builders, [f"junk/{i}" for i in range(20)],
+    )
+    with tarfile.open(str(arc), "r:*") as tf:
+        with pytest.raises(RuntimeError, match="more than 4 entries"):
+            install_local._index_oci_members(tf)
+
+
+def test_install_refuses_an_archive_with_too_many_members(
+        tmp_path, builders, monkeypatch):
+    monkeypatch.setattr(install_local, "_MAX_OCI_MEMBERS", 4)
+    root = tmp_path / "rootfs"
+    root.mkdir()
+    arc = _oci_with_extra_members(
+        tmp_path, builders, [f"junk/{i}" for i in range(20)],
+    )
+    with pytest.raises(RuntimeError, match="refusing to index it"):
+        install_local_into(str(arc), str(root), "x86_64")
+    # Nothing was applied.
+    assert os.listdir(str(root)) == []
+
+
+def _rewrite_index(arc_path, payload: bytes):
+    """Rebuild *arc_path* with index.json replaced by *payload*."""
+    src = tarfile.open(arc_path)
+    members = [(m, src.extractfile(m).read() if m.isreg() else None)
+               for m in src.getmembers()]
+    src.close()
+    with tarfile.open(arc_path, "w") as tf:
+        for m, data in members:
+            if m.name == "index.json":
+                data = payload
+                m.size = len(data)
+            tf.addfile(m, io.BytesIO(data) if data is not None else None)
+
+
+@pytest.mark.parametrize("payload", [
+    b"not json at all",                       # not JSON
+    b'["a list"]',                            # JSON, wrong shape
+    b'{"manifests": "not-a-list"}',           # object, wrong member
+    b'{"manifests": ["a string"]}',           # entry is not a descriptor
+    b'{"manifests": [{"size": 3}]}',          # descriptor names no digest
+    b'{"manifests": [{"digest": 7}]}',        # digest is not a string
+])
+def test_malformed_index_json_is_a_runtime_error(tmp_path, builders, payload):
+    # The archive is a stranger's file. Every one of these used to leave
+    # install's handler as a ValueError, an AttributeError, a TypeError
+    # or a KeyError -- none of which it catches.
+    root = tmp_path / "rootfs"
+    root.mkdir()
+    arc = tmp_path / "img.oci.tar"
+    builders.make_oci_archive(
+        str(arc), [[{"name": "etc/hostname", "type": "file", "data": b"g"}]],
+    )
+    _rewrite_index(str(arc), payload)
+    with pytest.raises(RuntimeError):
+        install_local_into(str(arc), str(root), "x86_64")
+    assert os.listdir(str(root)) == []
+
+
+def test_oversized_json_member_is_refused(tmp_path, builders, monkeypatch):
+    """index.json is read to a ceiling, not to whatever the header says."""
+    monkeypatch.setattr(install_local, "_MAX_JSON_BYTES", 64)
+    root = tmp_path / "rootfs"
+    root.mkdir()
+    arc = tmp_path / "img.oci.tar"
+    builders.make_oci_archive(
+        str(arc), [[{"name": "etc/hostname", "type": "file", "data": b"g"}]],
+    )
+    with pytest.raises(RuntimeError, match="larger than 64 bytes"):
+        install_local_into(str(arc), str(root), "x86_64")
+    assert os.listdir(str(root)) == []

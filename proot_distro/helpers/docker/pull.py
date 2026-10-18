@@ -25,26 +25,40 @@
 #      a token + the missing layers need to be fetched.
 #   2. On manifest miss, resolve the registry manifest. Manifest-list
 #      indexes are unwrapped to the arch-specific child manifest.
-#   3. For each layer: skip when cached, otherwise download_blob. Apply
-#      the layer onto the supplied rootfs directory.
+#   3. For each layer: skip when a cached blob re-hashes to its digest,
+#      otherwise download_blob. Apply the layer onto the supplied rootfs
+#      directory.
 #   4. Return a small metadata dict the caller can use to write
 #      containers/<name>/manifest.json and surface image labels.
+#
+# Everything addressed by digest is checked against it before use: the
+# arch-specific manifest fetched out of an index, the config blob, and
+# every layer blob — whether it arrived over the network or was already
+# sitting in the cache. Neither a cache file's name nor a registry's
+# word is treated as evidence of content. A reference pinned by digest
+# extends that to the top of the chain, and to a manifest-cache hit.
 
 import json
 import os
 import urllib.error
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from proot_distro.compress import ZSTD_AVAILABLE, unsupported_msg
 from proot_distro.constants import PROGRAM_NAME
-from proot_distro.message import log_info, log_error
+from proot_distro.message import log_info, log_error, warn
 from proot_distro.progress import fmt_size
-from proot_distro.helpers.download import retry_http
+from proot_distro.helpers.download import (
+    NETWORK_ERRORS, declared_length, new_request, require_complete_body,
+    retry_http,
+)
 from proot_distro.helpers.docker.cache import (
-    all_layers_cached,
-    layer_cache_path,
+    annotate_manifest_cache,
     load_manifest_cache,
+    load_manifest_documents,
+    manifest_layers,
+    require_data_digest,
     save_manifest_cache,
+    split_digest,
+    open_verified_layer,
 )
 from proot_distro.helpers.docker.layers import apply_layer, download_blob
 from proot_distro.helpers.docker.media import (
@@ -53,11 +67,14 @@ from proot_distro.helpers.docker.media import (
     OCI_INDEX_MEDIA,
     OCI_MANIFEST_MEDIA,
 )
-from proot_distro.helpers.docker.refs import ARCH_TO_DOCKER, parse_image_ref
+from proot_distro.helpers.docker.refs import ARCH_TO_DOCKER, parse_reference
 from proot_distro.helpers.docker.transport import (
     auth_denied_msg,
     auth_note,
+    MAX_METADATA_BYTES,
+    decode_json_object,
     get_auth_token,
+    insecure_for,
     opener,
     _ua,
 )
@@ -78,25 +95,93 @@ _ACCEPT_HEADER = ", ".join([
 ])
 
 
-def _get_manifest(
+def _manifest_body(
     repo: str, ref: str, token: str, base: str,
     insecure: bool = False,
-) -> dict:
+) -> tuple:
+    """Fetch the manifest *ref* names. Returns (body, Content-Type).
+
+    *ref* is a tag or a digest; the body answering a digest is checked
+    against it before it is returned.
+    """
     url = f"{base}/v2/{repo}/manifests/{ref}"
     headers = {**_ua(), "Accept": _ACCEPT_HEADER}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(url, headers=headers)
+    req = new_request(url, headers=headers)
 
     def _attempt():
         with opener(insecure).open(req) as resp:
-            return resp.read(), resp.headers.get("Content-Type", "")
+            # Metadata, held whole in memory and subscripted below; how
+            # much of it there is is the registry's choice, so one byte
+            # past the ceiling is the refusal.
+            body = resp.read(MAX_METADATA_BYTES + 1)
+            declared = declared_length(resp)
+            ct = resp.headers.get("Content-Type", "")
+        if len(body) > MAX_METADATA_BYTES:
+            raise RuntimeError(
+                f"Manifest for '{repo}' is larger than "
+                f"{MAX_METADATA_BYTES} bytes; refusing to read it."
+            )
+        # A Content-Length body cut short raises nothing on its own (see
+        # download.require_complete_body); a manifest fetched by tag has
+        # no digest to catch it either, and one that still parses as
+        # JSON is then the image installed. After the cap, never before
+        # it: a body past the cap is short of its own length by
+        # construction, and that is the refusal above.
+        require_complete_body(len(body), declared, f"Manifest for '{repo}'")
+        return body, ct
 
     body, ct = retry_http(_attempt, what=f"Fetching manifest {ref}")
-    data = json.loads(body)
+    # A reference containing ':' is a digest, not a tag: the registry's
+    # answer is content-addressed, so it has to hash to what we asked
+    # for. This is the only check standing between a hostile mirror (or
+    # an --allow-insecure MITM) and an arbitrary layer list.
+    if ":" in ref:
+        require_data_digest(body, ref, what=f"Manifest for '{repo}'")
+    return body, ct
+
+
+def _parse_manifest(body: bytes, ct: str, ref: str) -> dict:
+    """The manifest document *body*, with its media type under `_ct`."""
+    data = decode_json_object(body, f"Fetching manifest {ref}")
     # Prefer the Content-Type header; fall back to the mediaType field.
-    data["_ct"] = ct.split(";")[0].strip() or data.get("mediaType", "")
+    media = data.get("mediaType", "")
+    data["_ct"] = ct.split(";")[0].strip() or (
+        media if isinstance(media, str) else ""
+    )
     return data
+
+
+def _get_manifest(
+    repo: str, ref: str, token: str, base: str,
+    insecure: bool = False,
+) -> dict:
+    body, ct = _manifest_body(repo, ref, token, base, insecure)
+    return _parse_manifest(body, ct, ref)
+
+
+def _is_index(manifest: dict) -> bool:
+    """True when *manifest* is a multi-arch index rather than an image."""
+    return manifest["_ct"] in _MANIFEST_LIST_TYPES or "manifests" in manifest
+
+
+def _entry_platform(entry):
+    """Return an index entry's platform object, or None when it has none.
+
+    Both the entry and its platform are whatever the registry sent, and
+    an index whose entries are strings (or whose platform is a list) used
+    to end the pull in an AttributeError partway down _pick_platform. An
+    entry that cannot be read simply does not match, which is the same
+    outcome as one describing another architecture. An entry that is a
+    proper object with no platform at all still answers {}, as it always
+    did: it matches nothing either, but it is listed among the platforms
+    the image does offer.
+    """
+    if not isinstance(entry, dict):
+        return None
+    plat = entry.get("platform", {})
+    return plat if isinstance(plat, dict) else None
 
 
 def _pick_platform(
@@ -105,7 +190,9 @@ def _pick_platform(
     """Find the manifest list entry matching arch (and optionally variant)."""
     # Exact match first (arch + non-empty variant must match).
     for entry in entries:
-        plat = entry.get("platform", {})
+        plat = _entry_platform(entry)
+        if plat is None:
+            continue
         if plat.get("os", "linux") != "linux":
             continue
         if plat.get("architecture") != arch:
@@ -116,15 +203,17 @@ def _pick_platform(
 
     # Variant-agnostic fallback.
     for entry in entries:
-        plat = entry.get("platform", {})
+        plat = _entry_platform(entry)
+        if plat is None:
+            continue
         if (plat.get("os", "linux") == "linux"
                 and plat.get("architecture") == arch):
             return entry
 
     available = []
     for e in entries:
-        plat = e.get("platform", {})
-        if plat.get("os", "linux") != "linux":
+        plat = _entry_platform(e)
+        if plat is None or plat.get("os", "linux") != "linux":
             continue
         a = plat.get("architecture", "?")
         v = plat.get("variant", "")
@@ -136,55 +225,213 @@ def _pick_platform(
     )
 
 
+def _child_digest(index: dict, arch: str, image_ref: str) -> str:
+    """The digest of *arch*'s image manifest in the multi-arch *index*."""
+    docker_arch, docker_variant = ARCH_TO_DOCKER.get(arch, (arch, ""))
+    entries = index.get("manifests", [])
+    if not isinstance(entries, list):
+        raise RuntimeError(
+            f"Manifest index for '{image_ref}' is malformed: "
+            f"'manifests' is not a list."
+        )
+    target = _pick_platform(
+        entries, docker_arch, docker_variant, image_ref,
+    )
+    digest = target.get("digest")
+    if not isinstance(digest, str) or not digest:
+        raise RuntimeError(
+            f"Manifest index for '{image_ref}' names the {arch} image "
+            f"with no usable digest."
+        )
+    # Checked before it becomes part of a URL: the index is the
+    # registry's word (or, for a tag, nobody's), and the manifest behind
+    # the digest is verified against it only once it has been fetched.
+    split_digest(digest)
+    return digest
+
+
+def _resolve_pinned(image_ref: str, pin: str, arch: str, fetch) -> tuple:
+    """Follow the digest *pin* down to *arch*'s image manifest.
+
+    Returns (manifest, documents): the image manifest, and the raw bytes
+    of every document on the way to it keyed by digest -- the pinned one
+    itself and, when the pin names a multi-arch index, the child picked
+    out of it. *fetch(digest)* hands back the bytes behind a digest, and
+    every one of them is checked against the digest that asked for it
+    here, whichever *fetch* it is: the registry's, or the manifest
+    cache's record of what the registry said the last time.
+
+    The media type is read off the document and never off a response
+    header, since only the document is covered by the pin -- and so a
+    pull and a later cache hit decide the same way what each one is.
+    """
+    documents = {}
+    body = require_data_digest(
+        fetch(pin), pin, what=f"Manifest for '{image_ref}'")
+    documents[pin] = body
+    manifest = _parse_manifest(body, "", pin)
+    if _is_index(manifest):
+        child = _child_digest(manifest, arch, image_ref)
+        body = require_data_digest(
+            fetch(child), child, what=f"Manifest for '{image_ref}'")
+        documents[child] = body
+        manifest = _parse_manifest(body, "", child)
+    return manifest, documents
+
+
 def _resolve_single_manifest(
-    image_ref: str, arch: str, insecure: bool = False
+    image_ref: str, ref, arch: str, insecure: bool = False
 ) -> tuple:
-    """Return (single_image_manifest, token, repo, base) for the arch."""
-    registry, repo, tag = parse_image_ref(image_ref)
+    """Return (single_image_manifest, token, base, documents) for the arch.
 
-    log_info(_("Authenticating with registry{_arg0}...", _arg0 = auth_note()))
-    token, base = get_auth_token(repo, registry, insecure=insecure)
+    *documents* is what _resolve_pinned gathered for a pinned reference,
+    and empty for a tag: a tag names no content, so there is nothing a
+    later cache hit could check the manifest against.
+    """
+    log_info(f"Authenticating with registry{auth_note()}...")
+    token, base = get_auth_token(ref.repo, ref.registry, insecure=insecure)
 
-    log_info(_("Fetching manifest for '{image_ref}'...", image_ref = image_ref))
-    manifest = _get_manifest(repo, tag, token, base, insecure)
-
-    if manifest["_ct"] in _MANIFEST_LIST_TYPES or "manifests" in manifest:
-        docker_arch, docker_variant = ARCH_TO_DOCKER.get(arch, (arch, ""))
-        target = _pick_platform(
-            manifest.get("manifests", []),
-            docker_arch,
-            docker_variant,
-            image_ref,
+    log_info(f"Fetching manifest for '{image_ref}'...")
+    if ref.digest:
+        manifest, documents = _resolve_pinned(
+            image_ref, ref.digest, arch,
+            lambda digest: _manifest_body(
+                ref.repo, digest, token, base, insecure)[0],
         )
-        log_info(_("Fetching {arch} manifest...", arch = arch))
-        manifest = _get_manifest(
-            repo, target["digest"], token, base, insecure
-        )
+        return manifest, token, base, documents
 
-    return manifest, token, repo, base
+    manifest = _get_manifest(ref.repo, ref.tag, token, base, insecure)
+    if _is_index(manifest):
+        digest = _child_digest(manifest, arch, image_ref)
+        log_info(f"Fetching {arch} manifest...")
+        manifest = _get_manifest(ref.repo, digest, token, base, insecure)
+
+    return manifest, token, base, {}
+
+
+def _download_config(
+    repo: str, cfg_digest: str, token: str, base: str,
+    insecure: bool = False,
+) -> bytes:
+    """The image config blob *cfg_digest* names, checked against it.
+
+    Raises: a network failure as itself, and a RuntimeError for a blob
+    too large to be a config, for one that does not hash to its digest,
+    and for a digest that is not one -- which is refused before it can
+    become part of a URL.
+    """
+    split_digest(cfg_digest)
+    url = f"{base}/v2/{repo}/blobs/{cfg_digest}"
+    headers = {**_ua()}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = new_request(url, headers=headers)
+
+    def _attempt():
+        # A config blob is metadata: parsed whole, never streamed,
+        # so its size is the registry's choice of allocation.
+        with opener(insecure).open(req) as resp:
+            data = resp.read(MAX_METADATA_BYTES + 1)
+            declared = declared_length(resp)
+        if len(data) > MAX_METADATA_BYTES:
+            raise RuntimeError(
+                f"Image config blob is larger than "
+                f"{MAX_METADATA_BYTES} bytes; refusing to read it."
+            )
+        # Before the digest check below, as in the layer download:
+        # a connection that ended early is retried as what it is
+        # rather than surfacing as the registry serving the wrong
+        # bytes, which is fatal and not retried.
+        require_complete_body(len(data), declared, "Image config blob")
+        return data
+
+    body = retry_http(_attempt, what="Fetching image config")
+    return require_data_digest(body, cfg_digest, what="Image config blob")
+
+
+def _parse_config(body: bytes) -> dict:
+    """The image config in *body*, or {} for one that is not an object.
+
+    `run` and `login` read Entrypoint/Cmd/Env out of this, and it is
+    persisted into the manifest cache; a document that is not an object
+    answers no such question, so it is the same as not having one.
+    """
+    try:
+        config = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return {}
+    return config if isinstance(config, dict) else {}
 
 
 def _fetch_config_blob(
     repo: str, cfg_digest: str, token: str, base: str,
     insecure: bool = False,
 ) -> dict:
-    """Fetch the image config blob; return parsed dict (empty on error)."""
+    """Fetch the image config blob; return parsed dict (empty on error).
+
+    A blob that does not hash to *cfg_digest* is fatal rather than
+    empty: this config supplies Entrypoint/Cmd/Env, which `run` and
+    `login` go on to execute, and it is persisted into the manifest
+    cache. An unreachable or unparsable config is merely degraded and
+    still answers {} the way it always has -- for a tag. A pinned
+    reference fetches its config through _download_config directly and
+    takes none of that leniency (see _pull_layers).
+    """
     if not cfg_digest:
         return {}
     try:
-        url = f"{base}/v2/{repo}/blobs/{cfg_digest}"
-        headers = {**_ua()}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        req = urllib.request.Request(url, headers=headers)
-
-        def _attempt():
-            with opener(insecure).open(req) as resp:
-                return resp.read()
-
-        return json.loads(retry_http(_attempt, what="Fetching image config"))
+        body = _download_config(repo, cfg_digest, token, base, insecure)
+    except RuntimeError:
+        # Too large, or not the blob the digest names: a refusal, not a
+        # degraded config, since each says something about the blob
+        # rather than about reaching it.
+        raise
     except Exception:
         return {}
+    return _parse_config(body)
+
+
+def _config_digest(manifest: dict) -> str:
+    """The config digest *manifest* names, '' when it names none."""
+    config = manifest.get("config", {})
+    digest = config.get("digest", "") if isinstance(config, dict) else ""
+    return digest if isinstance(digest, str) else ""
+
+
+def _usable_cached_layers(layers: list) -> dict:
+    """Return ``{digest: fd}`` for every layer blob already usable.
+
+    Usable means present *and* hashing to its own digest. A blob that
+    fails is dropped by open_verified_layer(), so it is simply absent
+    here and gets downloaded again like any other missing layer.
+
+    Deciding this once per pull, before the first apply, is what keeps
+    the cost at one hash per blob: the "is it all cached?" question and
+    the per-layer "download or reuse?" question read the same answer.
+
+    The descriptors are held open for the rest of the pull, which is
+    what makes that one hash count for the apply as well — the bytes
+    extracted are the ones hashed here, not whatever the name refers to
+    by then. pull_image closes them.
+    """
+    usable = {}
+    for layer in layers:
+        digest = layer.get("digest")
+        if not digest or digest in usable:
+            continue
+        fd = open_verified_layer(digest)
+        if fd is not None:
+            usable[digest] = fd
+    return usable
+
+
+def _close_all(fds) -> None:
+    """Close every descriptor in *fds*, ignoring failures."""
+    for fd in fds:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def _get_download_workers() -> int:
@@ -201,111 +448,28 @@ def _get_download_workers() -> int:
     return max(1, min(n, 8))
 
 
-def _download_layers_concurrent(
-    layers_to_download: list,
-    repo: str,
-    token: str,
-    base: str,
-    insecure: bool,
-    n_layers: int,
-    image_ref: str,
-) -> dict:
-    """Download multiple layer blobs concurrently.
-
-    *layers_to_download* is a list of ``(index, layer_dict)`` tuples for
-    layers that are not in the local cache.
-
-    Returns ``{digest: local_path}``. On the first failure, remaining
-    un-started futures are cancelled and the error is re-raised so the
-    caller can translate 401/403 into ``auth_denied_msg``.
-    """
-    n = len(layers_to_download)
-    max_workers = min(_get_download_workers(), n)
-
-    if max_workers <= 1 or n <= 1:
-        # Serial path — keeps per-layer progress bars.
-        results = {}
-        for idx, layer in layers_to_download:
-            digest = layer["digest"]
-            short_id = digest.split(":")[-1][:12]
-            size = layer.get("size", 0)
-            size_str = f" ({fmt_size(size)})" if size else ""
-            log_info(f"{short_id}: Downloading layer "
-                     f"{idx + 1}/{n_layers}{size_str}...")
-            try:
-                results[digest] = download_blob(
-                    repo, digest, token, base, insecure,
-                )
-            except urllib.error.HTTPError as dl_err:
-                if dl_err.code in (401, 403):
-                    raise RuntimeError(
-                        auth_denied_msg(image_ref, dl_err.code)
-                    ) from dl_err
-                raise
-        return results
-
-    # Concurrent path — quiet per-layer bars to avoid terminal clobbering.
-    log_info(_("Downloading {n} layer(s) with {workers} parallel workers...",
-               n=n, workers=max_workers))
-
-    results: dict = {}
-    first_error: tuple | None = None
-
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        future_to_info: dict = {}
-        for idx, layer in layers_to_download:
-            digest = layer["digest"]
-            short_id = digest.split(":")[-1][:12]
-            size = layer.get("size", 0)
-            size_str = f" ({fmt_size(size)})" if size else ""
-            log_info(f"{short_id}: Queued layer {idx + 1}/{n_layers}{size_str}")
-            future = pool.submit(
-                download_blob,
-                repo, digest, token, base, insecure,
-                quiet=True,
-            )
-            future_to_info[future] = (idx, digest, short_id)
-
-        done = 0
-        for future in as_completed(future_to_info):
-            idx, digest, short_id = future_to_info[future]
-            if first_error is not None:
-                # An earlier future already failed; just drain remaining.
-                continue
-            try:
-                path = future.result()
-                results[digest] = path
-                done += 1
-                log_info(f"{short_id}: Downloaded "
-                         f"({done}/{n})")
-            except Exception as exc:
-                first_error = (idx, digest, short_id, exc)
-                # Cancel un-started futures so we don't waste bandwidth.
-                for f in future_to_info:
-                    f.cancel()
-
-    if first_error is not None:
-        idx, digest, short_id, exc = first_error
-        if isinstance(exc, urllib.error.HTTPError) and exc.code in (401, 403):
-            raise RuntimeError(
-                auth_denied_msg(image_ref, exc.code)
-            ) from exc
-        raise RuntimeError(
-            f"Failed to download layer {short_id} for '{image_ref}': {exc}"
-        ) from exc
-
-    return results
-
-
 def pull_image(
-    image_ref: str, rootfs_dir: str, arch: str, insecure: bool = False
+    image_ref: str, rootfs_fd: int, arch: str, insecure: bool = False
 ) -> dict:
-    """Pull an OCI/Docker image and extract all layers into *rootfs_dir*.
+    """Pull an OCI/Docker image into the tree *rootfs_fd* names.
+
+    The rootfs is a **descriptor**, not a path: `install` validates
+    containers/<name>/rootfs with an O_NOFOLLOW walk and hands the
+    result straight down, so nothing between that check and the last
+    member written resolves the name a second time.
 
     The manifest is checked in the local cache first. If cached and
-    every layer is present, the install runs entirely without network
-    access. If the manifest is cached but some layers are missing, only
-    an auth token is fetched before downloading the missing layers.
+    every layer blob is present *and* re-hashes to its digest, the
+    install runs entirely without network access. If the manifest is
+    cached but some layers are missing or fail that check, only an auth
+    token is fetched before downloading them again.
+
+    A reference pinned by digest (`debian:12@sha256:…`) is pulled by that
+    digest, and everything under it is checked against it: the document
+    the pin names, the arch's manifest when that is an index, the config
+    and the layers. A cache hit is held to the same chain (_cached_pin),
+    so the pin decides what is installed even offline, and even when the
+    manifest cache has been written by someone else.
 
     Layer downloads run concurrently (default 4 threads, configurable
     via ``PD_PARALLEL_DOWNLOADS``). Layers are applied to *rootfs_dir*
@@ -323,31 +487,102 @@ def pull_image(
     expected to persist these into ``containers/<name>/manifest.json``
     so `run`, `reset`, and `login` can later read image_config.
     """
+    # Every way into a pull goes through the grammar here, whatever the
+    # caller checked: the reference is about to become URLs, a token
+    # scope and a cache key. InvalidReference is a RuntimeError, which is
+    # what this function promises its callers.
+    ref = parse_reference(image_ref)
+    # Descriptors on verified cached blobs, held for the whole pull so the
+    # hash taken below is the one the apply reads through; closed in the
+    # finally, on every path out including a failed download.
+    usable: dict = {}
+
+    if ref.digest:
+        manifest, image_config = _cached_pin(image_ref, ref, arch)
+    else:
+        manifest, _repo, image_config = load_manifest_cache(image_ref, arch)
+    # Docker Hub is verified HTTPS whatever --allow-insecure says; decided
+    # here, once, so no request below can be made on the insecure opener.
+    insecure = insecure_for(ref.registry, insecure)
+    try:
+        return _pull_layers(
+            image_ref, rootfs_fd, arch, insecure,
+            manifest, image_config, ref, usable,
+        )
+    finally:
+        _close_all(usable.values())
+
+
+def _cached_pin(image_ref: str, ref, arch: str) -> tuple:
+    """(manifest, image_config) for a pinned reference, or (None, {}).
+
+    A manifest-cache entry is a file a guest can write on Termux, where
+    BASE_CACHE_DIR sits under the bound $TERMUX_PREFIX, so for a tag the
+    program has only ever had its word for which layers and which config
+    the image has -- a tag names no content to check that against. A pin
+    does. The entry keeps the raw documents the pull verified, and a hit
+    re-verifies every one of them against the digest that names it:
+    the pin itself, the child an index points at, and the config. The
+    entry's own `manifest` and `image_config` fields are not consulted.
+
+    Anything short of that chain is a miss, and the pull goes to the
+    registry exactly as if nothing were cached; a chain that is there
+    and fails is said out loud first.
+    """
+    documents = load_manifest_documents(image_ref, arch)
+    if not documents:
+        return None, {}
+
+    def fetch(digest):
+        body = documents.get(digest)
+        if body is None:
+            raise RuntimeError(f"{digest} is not recorded")
+        return body
+
+    try:
+        manifest, _chain = _resolve_pinned(image_ref, ref.digest, arch, fetch)
+        cfg_digest = _config_digest(manifest)
+        image_config = {}
+        if cfg_digest:
+            image_config = _parse_config(require_data_digest(
+                fetch(cfg_digest), cfg_digest, what="Image config blob"))
+    except RuntimeError:
+        warn(f"The cached manifest for '{image_ref}' ({arch}) does not "
+             f"verify against its digest; fetching it again.")
+        return None, {}
+    return manifest, image_config
+
+
+def _pull_layers(image_ref, rootfs_fd, arch, insecure,
+                 manifest, image_config, ref, usable):
+    """pull_image's body, with the caller owning the descriptor cleanup.
+
+    The repository and registry come from the reference, never from the
+    cache entry: they are where the missing layers are fetched from, and
+    the entry is a file this program does not own.
+    """
     token = None
     base = None
-
-    manifest, repo, image_config = load_manifest_cache(image_ref, arch)
-    registry = parse_image_ref(image_ref)[0]
+    repo, registry = ref.repo, ref.registry
 
     if manifest is not None:
-        layers = manifest.get("layers", [])
-        if all_layers_cached(layers):
-            log_info(_("Image '{image_ref}' ({arch}) is cached.", image_ref = image_ref, arch = arch))
+        # The hit proves which image this entry holds; record it when the
+        # entry is an old one that never stored its own reference.
+        annotate_manifest_cache(image_ref, arch)
+        layers = manifest_layers(manifest, image_ref)
+        usable.update(_usable_cached_layers(layers))
+        missing = sum(1 for layer in layers if layer["digest"] not in usable)
+        if not missing:
+            log_info(f"Image '{image_ref}' ({arch}) is cached.")
         else:
-            # Count missing layers in a single pass instead of re-iterating.
-            missing_layers = [
-                (i, layer) for i, layer in enumerate(layers)
-                if not os.path.isfile(layer_cache_path(layer["digest"]))
-            ]
-            missing = len(missing_layers)
-            log_info(_("Downloading {missing} missing layer(s) for '{image_ref}' ({arch})...",
-                        missing=missing, image_ref=image_ref, arch=arch))
+            log_info(f"Downloading {missing} missing "
+                     f"layer(s) for '{image_ref}' ({arch})...")
             try:
                 log_info(_("Authenticating with registry{_arg0}...", _arg0 = auth_note()))
                 token, base = get_auth_token(
                     repo, registry, insecure=insecure
                 )
-            except (urllib.error.URLError, OSError) as net_err:
+            except NETWORK_ERRORS as net_err:
                 if isinstance(net_err, urllib.error.HTTPError):
                     if net_err.code in (401, 403):
                         raise RuntimeError(
@@ -372,10 +607,24 @@ def pull_image(
         # 原版 bug: 此分支缺失，manifest 为 None 时直接到 layers =
         # manifest.get(...) 导致 AttributeError。
         try:
-            manifest, token, repo, base = _resolve_single_manifest(
-                image_ref, arch, insecure
+            manifest, token, base, documents = _resolve_single_manifest(
+                image_ref, ref, arch, insecure
             )
-        except (urllib.error.URLError, OSError) as net_err:
+            cfg_digest = _config_digest(manifest)
+            if ref.digest:
+                # All of it or none of it: an image delivered without the
+                # config its pin names is not the image the pin names, so
+                # the leniency _fetch_config_blob allows a tag is not
+                # extended here -- and the bytes are kept, so that a later
+                # hit can check them again.
+                image_config = {}
+                if cfg_digest:
+                    body = _download_config(
+                        repo, cfg_digest, token, base, insecure
+                    )
+                    documents[cfg_digest] = body
+                    image_config = _parse_config(body)
+        except NETWORK_ERRORS as net_err:
             if isinstance(net_err, urllib.error.HTTPError):
                 if net_err.code in (401, 403):
                     raise RuntimeError(
@@ -386,20 +635,25 @@ def pull_image(
                         f"Image not found: '{image_ref}' does not exist "
                         f"on the registry."
                     ) from net_err
-            log_error(_("No cached manifest found for '{image_ref}' ({arch}).", image_ref = image_ref, arch = arch))
+            log_error(_("No cached manifest found for '{image_ref}' ({arch}).",
+                        image_ref = image_ref, arch = arch))
             raise RuntimeError(
                 f"Network error: {net_err}\n"
                 f"Tip: run '{PROGRAM_NAME} mirror test' to check "
                 f"mirror reachability and switch to a faster one "
                 f"with '{PROGRAM_NAME} mirror use <ID>'."
             ) from net_err
-        cfg_digest = manifest.get("config", {}).get("digest", "")
-        image_config = _fetch_config_blob(
-            repo, cfg_digest, token, base, insecure
+        if not ref.digest:
+            image_config = _fetch_config_blob(
+                repo, cfg_digest, token, base, insecure
+            )
+        save_manifest_cache(image_ref, arch, manifest, repo, image_config,
+                            documents=documents)
+        usable.update(
+            _usable_cached_layers(manifest_layers(manifest, image_ref))
         )
-        save_manifest_cache(image_ref, arch, manifest, repo, image_config)
 
-    layers = manifest.get("layers", [])
+    layers = manifest_layers(manifest, image_ref)
     if not layers:
         raise RuntimeError(
             f"Manifest for '{image_ref}' contains no filesystem layers."
@@ -411,39 +665,65 @@ def pull_image(
     to_download: list = []
     layer_paths: dict = {}
     for i, layer in enumerate(layers):
+        # manifest_layers has vouched for the digest; the rest of a
+        # descriptor is still the registry's to shape, and both of these
+        # are only ever read for a message or a substring test.
         digest = layer["digest"]
         media_type = layer.get("mediaType", "")
-        if "zstd" in media_type:
+        if not isinstance(media_type, str):
+            media_type = ""
+        if "zstd" in media_type and not ZSTD_AVAILABLE:
             raise RuntimeError(
-                f"Layer {i + 1}/{n_layers} uses zstd compression which is "
-                "not supported by Python's tarfile module. "
-                "Try a different image tag that ships gzip-compressed layers."
+                unsupported_msg(f"Layer {i + 1}/{n_layers}")
+                + " Try a different image tag that ships gzip-compressed "
+                  "layers."
             )
 
-        cached_path = layer_cache_path(digest)
-        if os.path.isfile(cached_path):
-            short_id = digest.split(":")[-1][:12]
+        short_id = digest.split(":")[-1][:12]
+        # A cached descriptor belongs to `usable` and is closed with it —
+        # the same layer may be listed twice, and extraction rewinds — while
+        # a freshly downloaded one is this iteration's to close.
+        layer_fd = usable.get(digest)
+        owned = layer_fd is None
+        if not owned:
             log_info(f"{short_id}: Layer {i + 1}/{n_layers} already cached, "
                      f"skipping download.")
-            layer_paths[digest] = cached_path
         else:
-            to_download.append((i, layer))
+            size = layer.get("size", 0)
+            size_str = (f" ({fmt_size(size)})"
+                        if isinstance(size, int) and size > 0 else "")
+            log_info(f"{short_id}: Downloading layer "
+                     f"{i + 1}/{n_layers}{size_str}...")
+            try:
+                layer_fd = download_blob(
+                    repo, digest, token or "", base, insecure
+                )
+            except NETWORK_ERRORS as dl_err:
+                # Read the same way as the two nets above: an HTTPError
+                # carrying 401/403 is the registry refusing this account,
+                # and everything else is the wire. Both leave as a
+                # RuntimeError, because that is what this function
+                # promises and what both callers rely on -- `install`
+                # reports one, `build`'s FROM turns one into a BuildError.
+                # A reset connection used to come out of the layer loop as
+                # itself, which `install` reported (URLError being an
+                # OSError) and `build` did not catch at all; a body that
+                # ended early is not even an OSError, so neither did. The
+                # blob's own integrity failure is a RuntimeError already
+                # and passes through untouched.
+                if (isinstance(dl_err, urllib.error.HTTPError)
+                        and dl_err.code in (401, 403)):
+                    raise RuntimeError(
+                        auth_denied_msg(image_ref, dl_err.code)
+                    ) from dl_err
+                raise RuntimeError(f"Network error: {dl_err}") from dl_err
 
-    # --- Phase 2: download missing layers (concurrently) ---
-    if to_download:
-        downloaded = _download_layers_concurrent(
-            to_download, repo, token or "", base, insecure,
-            n_layers, image_ref,
-        )
-        layer_paths.update(downloaded)
-
-    # --- Phase 3: apply layers in manifest order ---
-    for i, layer in enumerate(layers):
-        digest = layer["digest"]
-        short_id = digest.split(":")[-1][:12]
-        log_info(_("{short_id}: Applying layer {index}/{n_layers}...",
-                    short_id=short_id, index=i + 1, n_layers=n_layers))
-        apply_layer(layer_paths[digest], rootfs_dir)
+        log_info(f"{short_id}: Applying layer {i + 1}/{n_layers}...")
+        try:
+            apply_layer(layer_fd, rootfs_fd, digest=digest)
+        finally:
+            if owned:
+                _close_all((layer_fd,))
 
     return {
         "manifest": manifest,

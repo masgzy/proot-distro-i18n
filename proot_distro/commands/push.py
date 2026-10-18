@@ -27,15 +27,20 @@
 # is optional for self-hosted registries that allow anonymous push.
 
 import sys
-import urllib.error
 
-from proot_distro.message import C, msg, log_info, log_error, crit_error
+from proot_distro.message import (
+    C, msg, log_info, log_error, crit_error, quote_path,
+)
 from proot_distro.locking import BuildLock
 from proot_distro.arch import get_device_cpu_arch, normalize_arch
+from proot_distro.helpers.download import NETWORK_ERRORS
 from proot_distro.helpers.docker import (
+    InvalidReference,
     load_manifest_cache,
     parse_image_ref,
+    parse_tag_reference,
     push_image,
+    with_explicit_tag,
 )
 from proot_distro.progress import fmt_size
 from proot_distro.constants import PROGRAM_NAME
@@ -53,11 +58,18 @@ def command_push(args):
         crit_error(_("image reference is not specified (e.g. 'myrepo/myapp:1.0')."))
         sys.exit(1)
 
+    # Refused here, before the cache is asked about it, so a reference
+    # that is no reference -- or a digest, which is nothing a push can
+    # name -- is reported as what it is rather than as "no image found".
+    try:
+        parse_tag_reference(image_ref)
+    except InvalidReference as exc:
+        crit_error(f"cannot push '{quote_path(image_ref)}': {exc}.")
+        sys.exit(1)
+
     # Append :latest the same way build does, so users can push using the
     # short form even when they tagged the build with the implicit tag.
-    last = image_ref.split("/")[-1]
-    if ":" not in last:
-        image_ref = image_ref + ":latest"
+    image_ref = with_explicit_tag(image_ref)
 
     if override_arch:
         target_arch = normalize_arch(override_arch)
@@ -95,7 +107,7 @@ def command_push(args):
             sys.stderr.flush()
         log_error(_("Aborted by user."))
         sys.exit(1)
-    except (urllib.error.URLError, OSError) as exc:
+    except NETWORK_ERRORS as exc:
         if sys.stderr.isatty():
             sys.stderr.write("\r\033[K")
             sys.stderr.flush()

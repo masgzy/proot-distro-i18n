@@ -50,6 +50,7 @@ def test_install_allow_insecure_flag():
     ("bak", "backup"), ("bkp", "backup"),
     ("clear", "clear-cache"), ("cl", "clear-cache"),
     ("cp", "copy"),
+    ("s", "search"), ("se", "search"),
     ("h", "help"), ("he", "help"), ("hel", "help"),
 ])
 def test_alias_table(alias, canonical):
@@ -82,9 +83,51 @@ def test_each_subcommand_parses():
         (["run", "box"], "run"),
         (["login", "box"], "login"),
         (["kill", "box"], "kill"),
+        (["search", "ubuntu"], "search"),
     ]:
         args, _ = p.parse_known_args(argv)
         assert args.command == cmd
+
+
+def test_clear_cache_flags():
+    p = parser.build_parser()
+    args, unknown = p.parse_known_args(["clear-cache", "--build-cache"])
+    assert args.build_cache is True
+    assert args.orphan is False
+    assert unknown == []
+
+    # Not mutually exclusive: --build-cache is the same sweep with one
+    # root fewer, so asking for both is redundant rather than wrong.
+    args, _ = p.parse_known_args(["cl", "--orphan", "--build-cache"])
+    assert (args.orphan, args.build_cache) == (True, True)
+
+    args, _ = p.parse_known_args(["clear-cache"])
+    assert (args.orphan, args.build_cache) == (False, False)
+
+
+@pytest.mark.parametrize("flag", ["-l", "--limit"])
+def test_search_limit_flag(flag):
+    p = parser.build_parser()
+    args, unknown = p.parse_known_args(["search", "ubuntu", flag, "50"])
+    assert args.command == "search"
+    assert args.query == "ubuntu"
+    # Kept as a string; commands/search.py validates and reports on it.
+    assert args.limit == "50"
+    assert unknown == []
+
+
+def test_search_defaults():
+    p = parser.build_parser()
+    args, _ = p.parse_known_args(["se", "ubuntu"])
+    assert args.limit is None
+    assert args.quiet is False
+
+
+def test_search_missing_query_is_none():
+    p = parser.build_parser()
+    args, _ = p.parse_known_args(["search"])
+    assert args.query is None  # validated later by REQUIRED_ARGS
+    assert ("query",) == tuple(a for a, _ in parser.REQUIRED_ARGS["search"])
 
 
 def test_ps_quiet_flag():
@@ -160,3 +203,59 @@ def test_termux_only_flags_absent_off_termux():
     _args, unknown = p.parse_known_args(["login", "box", "--isolated"])
     # --isolated is only registered on Termux, so off-Termux it is unknown.
     assert "--isolated" in unknown
+
+
+def test_remove_positional_and_image_flag():
+    p = parser.build_parser()
+    args, unknown = p.parse_known_args(["remove", "box"])
+    assert args.target == "box"
+    assert args.image is False
+    assert args.override_arch is None
+    assert unknown == []
+
+    args, unknown = p.parse_known_args(
+        ["remove", "--image", "ubuntu:24.04", "-a", "aarch64"]
+    )
+    assert args.target == "ubuntu:24.04"
+    assert args.image is True
+    assert args.override_arch == "aarch64"
+    assert unknown == []
+
+
+@pytest.mark.parametrize("flag", ["-i", "--image"])
+def test_remove_image_short_and_long_flag(flag):
+    p = parser.build_parser()
+    args, unknown = p.parse_known_args(["rm", flag, "ubuntu:24.04"])
+    assert args.target == "ubuntu:24.04"
+    assert args.image is True
+    assert unknown == []
+
+
+@pytest.mark.parametrize("flag", ["-i", "--image"])
+def test_list_image_short_and_long_flag(flag):
+    p = parser.build_parser()
+    args, unknown = p.parse_known_args(["list", flag, "-q"])
+    assert args.image is True
+    assert args.quiet is True
+    assert unknown == []
+
+
+def test_list_image_defaults_off():
+    p = parser.build_parser()
+    args, _ = p.parse_known_args(["ls"])
+    assert args.image is False
+
+
+def test_required_args_for_switches_on_image_flag():
+    from types import SimpleNamespace
+    plain = parser.required_args_for("remove", SimpleNamespace(image=False))
+    assert [a for a, _ in plain] == ["target"]
+    assert "container name" in plain[0][1]
+
+    imaged = parser.required_args_for("remove", SimpleNamespace(image=True))
+    assert [a for a, _ in imaged] == ["target"]
+    assert "image reference" in imaged[0][1]
+
+    # Every other command falls through to the static table.
+    assert parser.required_args_for("install", SimpleNamespace()) == \
+        parser.REQUIRED_ARGS["install"]

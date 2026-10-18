@@ -4,8 +4,8 @@
 import os
 import tarfile
 
+from _builders import apply_layer_file, file_map_entry
 from proot_distro.helpers import layer_diff
-from proot_distro.helpers.docker.layers import apply_layer
 
 
 def _write(path, data=b"x"):
@@ -67,7 +67,7 @@ def test_write_layer_tar_roundtrip(tmp_path):
 
     dest = str(tmp_path / "dest")
     os.makedirs(dest)
-    apply_layer(out, dest)
+    apply_layer_file(out, dest)
     assert open(os.path.join(dest, "etc", "hostname"), "rb").read() == b"guest\n"
     assert open(os.path.join(dest, "usr", "bin", "tool"), "rb").read() == b"BINARY"
     assert os.readlink(os.path.join(dest, "etc", "alias")) == "hostname"
@@ -77,9 +77,10 @@ def test_write_files_layer_honors_chown(tmp_path):
     # write_files_layer preserves the entry's uid/gid — that is how
     # COPY --chown lands ownership in the layer (contrast with _add_entry,
     # which zeroes ownership for disk-snapshot layers).
+    src = str(tmp_path / "conf")
+    _write(src, b"cfg")
     file_map = {
-        "etc/conf": {"kind": "content", "data": b"cfg", "mode": 0o600,
-                     "uid": 1000, "gid": 1000, "mtime": 0},
+        "etc/conf": file_map_entry(src, mode=0o600, uid=1000, gid=1000),
         "etc/link": {"kind": "symlink", "target": "conf", "uid": 1000,
                      "gid": 1000, "mtime": 0},
     }
@@ -110,15 +111,17 @@ def test_write_layer_tar_zeroes_ownership(tmp_path):
 
 
 def test_write_files_layer_roundtrip(tmp_path):
+    src = str(tmp_path / "conf")
+    _write(src, b"cfg")
     file_map = {
-        "etc/conf": {"kind": "content", "data": b"cfg", "mode": 0o644},
+        "etc/conf": file_map_entry(src),
         "etc/link": {"kind": "symlink", "target": "conf"},
     }
     out = str(tmp_path / "files.tar.gz")
     layer_diff.write_files_layer(file_map, out)
     dest = str(tmp_path / "dest")
     os.makedirs(dest)
-    apply_layer(out, dest)
+    apply_layer_file(out, dest)
     assert open(os.path.join(dest, "etc", "conf"), "rb").read() == b"cfg"
     assert os.readlink(os.path.join(dest, "etc", "link")) == "conf"
 

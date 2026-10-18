@@ -35,7 +35,6 @@ import os
 import sys
 import urllib.error
 import urllib.parse
-import urllib.request
 
 from proot_distro.message import (
     C, is_quiet, log_info,
@@ -45,21 +44,49 @@ from proot_distro.progress import (
     clear_bar, fmt_size,
 )
 from proot_distro.helpers.docker.cache import (
-    layer_cache_path, load_manifest_cache,
+    blob_present, load_manifest_cache, manifest_layers, open_required_layer,
 )
 from proot_distro.helpers.docker.media import (
     OCI_MANIFEST_MEDIA, canonical_json,
 )
-from proot_distro.helpers.download import retry_http
-from proot_distro.helpers.docker.refs import parse_image_ref
+from proot_distro.helpers.download import (
+    NETWORK_TIMEOUT, new_request, retry_http,
+)
+from proot_distro.helpers.docker.refs import parse_tag_reference
 from proot_distro.helpers.docker.transport import (
     auth_note,
     get_auth_token,
+    insecure_for,
     opener,
     push_denied_msg,
+    same_auth_origin,
     _ua,
 )
 from proot_distro.i18n import _
+
+
+# The slowest rate at which a registry is assumed to commit a blob it has
+# received, in bytes per second. The PUT that completes an upload is
+# answered only once the blob is verified and moved into place -- a
+# re-hash of the whole thing where the registry keeps no running digest,
+# and on an object store a server-side copy -- so its silence grows with
+# the blob's size, and a large layer behind a slow backend can take
+# minutes. 1 MiB/s is far below any real storage, so this only ever
+# errs long.
+_COMMIT_RATE = 1024 * 1024
+
+
+def _upload_timeout(size: int) -> float:
+    """The timeout for the PUT completing an upload of *size* bytes.
+
+    download.NETWORK_TIMEOUT, or as long as committing that much would
+    take at _COMMIT_RATE, whichever is longer. A socket timeout is one
+    number for the whole request, so the sends of the body get it too;
+    that only makes a stalled upload slower to give up on, while a flat
+    one would give up on a large layer every registry legitimately
+    takes a while to accept -- and retry it, and give up again.
+    """
+    return max(NETWORK_TIMEOUT, size / _COMMIT_RATE)
 
 
 def _resolve_upload_url(base: str, location: str) -> str:
@@ -75,6 +102,24 @@ def _resolve_upload_url(base: str, location: str) -> str:
     return base.rstrip("/") + "/" + location
 
 
+def _headers_for(headers: dict, base: str, url: str) -> dict:
+    """*headers* for a request to *url*: the token only on the registry.
+
+    The Bearer token was issued for the registry at *base*, and the
+    upload Location is a header the registry's answer named -- an
+    absolute one can point anywhere. Reusing the same headers for the
+    PUT sent the token to whatever host it named; verified with a
+    `Location: https://evil.example/upload/1`. Docker's client keys its
+    authorizer on the registry it pinged and sends nothing to another
+    origin, and so does this: the request still goes (a registry may
+    legitimately hand out a pre-signed upload URL on a store of its
+    own), it simply goes without the credential.
+    """
+    if same_auth_origin(base, url):
+        return headers
+    return {k: v for k, v in headers.items() if k != "Authorization"}
+
+
 def _blob_exists(
     repo: str, digest: str, token: str, base: str, insecure: bool = False,
 ) -> bool:
@@ -83,7 +128,7 @@ def _blob_exists(
     headers = {**_ua()}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(url, method="HEAD", headers=headers)
+    req = new_request(url, method="HEAD", headers=headers)
 
     def _attempt():
         with opener(insecure).open(req) as resp:
@@ -152,7 +197,7 @@ def _upload_blob_bytes(
         # A retry re-opens the upload session: the POST yields a fresh upload
         # Location, then the monolithic (content-addressed) PUT re-sends the
         # same bytes — safe to repeat.
-        post_req = urllib.request.Request(
+        post_req = new_request(
             f"{base}/v2/{repo}/blobs/uploads/",
             data=b"",
             method="POST",
@@ -163,12 +208,12 @@ def _upload_blob_bytes(
         put_url = _resolve_upload_url(base, location)
         sep = "&" if "?" in put_url else "?"
         put_url = f"{put_url}{sep}digest={urllib.parse.quote(digest, safe='')}"
-        put_req = urllib.request.Request(
+        put_req = new_request(
             put_url,
             data=data,
             method="PUT",
             headers={
-                **headers,
+                **_headers_for(headers, base, put_url),
                 "Content-Type": "application/octet-stream",
                 "Content-Length": str(len(data)),
             },
@@ -182,20 +227,25 @@ def _upload_blob_bytes(
     retry_http(_attempt, what=f"Uploading {digest[:19]}")
 
 
-def _upload_blob_file(
-    repo: str, digest: str, file_path: str, token: str,
+def _upload_blob_fd(
+    repo: str, digest: str, src_fd: int, token: str,
     base: str, insecure: bool = False, label: str = "",
 ) -> None:
-    """Upload a blob from *file_path* (streamed, POST + monolithic PUT)."""
+    """Upload the blob behind *src_fd* (streamed, POST + monolithic PUT).
+
+    A descriptor rather than a path, so the bytes published are the ones
+    the digest check was made on — see cache.open_required_layer. Each
+    attempt rewinds it, since a retry re-streams from the start.
+    """
     headers = {**_ua()}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    size = os.path.getsize(file_path)
+    size = os.fstat(src_fd).st_size
 
     def _attempt():
         # A retry re-opens the upload session and re-streams the file from the
         # start, so each attempt is a complete, self-contained upload.
-        post_req = urllib.request.Request(
+        post_req = new_request(
             f"{base}/v2/{repo}/blobs/uploads/",
             data=b"",
             method="POST",
@@ -207,19 +257,22 @@ def _upload_blob_file(
         sep = "&" if "?" in put_url else "?"
         put_url = f"{put_url}{sep}digest={urllib.parse.quote(digest, safe='')}"
         try:
-            with open(file_path, "rb") as fh:
+            os.lseek(src_fd, 0, os.SEEK_SET)
+            with open(src_fd, "rb", closefd=False) as fh:
                 reader = _ProgressReader(fh, size, label or digest[:19])
-                put_req = urllib.request.Request(
+                put_req = new_request(
                     put_url,
                     data=reader,
                     method="PUT",
                     headers={
-                        **headers,
+                        **_headers_for(headers, base, put_url),
                         "Content-Type": "application/octet-stream",
                         "Content-Length": str(size),
                     },
                 )
-                with opener(insecure).open(put_req) as resp:
+                with opener(insecure).open(
+                    put_req, timeout=_upload_timeout(size),
+                ) as resp:
                     if not 200 <= resp.status < 300:
                         raise RuntimeError(
                             f"Blob upload failed for {digest}: HTTP {resp.status}"
@@ -244,7 +297,7 @@ def _put_manifest(
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(url, data=body, method="PUT", headers=headers)
+    req = new_request(url, data=body, method="PUT", headers=headers)
 
     def _attempt():
         with opener(insecure).open(req) as resp:
@@ -260,8 +313,9 @@ def _put_manifest(
 def _strip_private_keys(d: dict) -> dict:
     """Return a shallow copy of *d* without keys starting with '_'.
 
-    `_get_manifest` stuffs the response Content-Type into `_ct` for
-    internal use; that key must not be serialised back to the registry.
+    pull's `_parse_manifest` stuffs the media type into `_ct` for
+    internal use, and the manifest cache keeps it; that key must not be
+    serialised back to the registry.
     """
     return {k: v for k, v in d.items() if not k.startswith("_")}
 
@@ -282,22 +336,39 @@ def push_image(image_ref: str, arch: str, insecure: bool = False) -> dict:
     RuntimeError pointing the user at ``--allow-insecure`` — the same handling
     as the install command.
     """
-    manifest, repo, image_config = load_manifest_cache(image_ref, arch)
+    # The grammar first, as pull_image does, and a digest is no name to
+    # push under. The repository comes from the reference and not from
+    # the cache entry's `repo`: the entry is a file a guest can write on
+    # Termux, and the repository is where the upload, the push-scoped
+    # token and the tag all go -- so the entry used to decide which of
+    # the user's repositories `push <ref>` overwrote.
+    parsed = parse_tag_reference(image_ref)
+    registry, repo, tag = parsed.registry, parsed.repo, parsed.tag
+
+    manifest, _cached_repo, image_config = load_manifest_cache(
+        image_ref, arch)
     if manifest is None:
         raise RuntimeError(
             f"No cached manifest for '{image_ref}' ({arch}). Build image "
             f"first with: {PROGRAM_NAME} build -t {image_ref}"
         )
 
-    layers = manifest.get("layers", [])
+    # The cache entry is a file on disk, and on Termux that directory is
+    # guest-writable; a manifest that is not the shape the loop below
+    # subscripts is a traceback rather than a message without this.
+    layers = manifest_layers(manifest, image_ref)
     if not layers:
         raise RuntimeError(
             f"Cached manifest for '{image_ref}' has no filesystem layers."
         )
 
+    # Asked of the layer cache's own descriptor, not of a composed
+    # path: `oci_layers` is a name a guest can leave behind as a
+    # symlink, and os.path.isfile() follows one -- so a host directory's
+    # files answered for the blobs this push is about to upload.
     missing = [
         layer["digest"] for layer in layers
-        if not os.path.isfile(layer_cache_path(layer["digest"]))
+        if not blob_present(layer["digest"])
     ]
     if missing:
         raise RuntimeError(
@@ -306,14 +377,22 @@ def push_image(image_ref: str, arch: str, insecure: bool = False) -> dict:
             f"Rebuild the image to repopulate the cache."
         )
 
-    registry, _repo, tag = parse_image_ref(image_ref)
+    # Docker Hub is verified HTTPS whatever --allow-insecure says (see
+    # transport.insecure_for); every upload helper below gets this answer.
+    insecure = insecure_for(registry, insecure)
 
     # Re-canonicalize the image config and verify the digest. The manifest
     # carries config.digest, which the registry verifies against the bytes
     # we PUT. Round-tripping the dict through json.dump+json.load preserves
     # all keys, so the canonical form is reproducible here.
     config_bytes = canonical_json(image_config)
-    expected_cfg_digest = manifest.get("config", {}).get("digest", "")
+    cached_config = manifest.get("config", {})
+    expected_cfg_digest = (
+        cached_config.get("digest", "")
+        if isinstance(cached_config, dict) else ""
+    )
+    if not isinstance(expected_cfg_digest, str):
+        expected_cfg_digest = ""
     actual_cfg_digest = "sha256:" + hashlib.sha256(config_bytes).hexdigest()
     if expected_cfg_digest != actual_cfg_digest:
         raise RuntimeError(
@@ -343,8 +422,6 @@ def push_image(image_ref: str, arch: str, insecure: bool = False) -> dict:
     for i, layer in enumerate(layers):
         digest = layer["digest"]
         short_id = digest.split(":")[-1][:12]
-        path = layer_cache_path(digest)
-        size = os.path.getsize(path)
 
         try:
             if _blob_exists(repo, digest, token, base, insecure):
@@ -352,11 +429,23 @@ def push_image(image_ref: str, arch: str, insecure: bool = False) -> dict:
                          f"exists on registry, skipping upload.")
                 continue
 
-            log_info(f"{short_id}: Uploading layer {i + 1}/{n_layers} "
-                     f"({fmt_size(size)})...")
-            _upload_blob_file(
-                repo, digest, path, token, base, insecure, label=short_id,
-            )
+            # The registry hashes what we PUT and rejects a mismatch with
+            # an opaque 400; checking here names the real problem, and
+            # keeps a cache blob that was swapped for someone else's
+            # content from being published under this image's digest.
+            # The upload then streams the descriptor the check was made
+            # on, so the name cannot be re-pointed in between.
+            src_fd = open_required_layer(digest)
+            try:
+                size = os.fstat(src_fd).st_size
+                log_info(f"{short_id}: Uploading layer {i + 1}/{n_layers} "
+                         f"({fmt_size(size)})...")
+                _upload_blob_fd(
+                    repo, digest, src_fd, token, base, insecure,
+                    label=short_id,
+                )
+            finally:
+                os.close(src_fd)
             bytes_uploaded += size
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
