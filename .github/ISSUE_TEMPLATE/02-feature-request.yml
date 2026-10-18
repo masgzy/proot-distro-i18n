@@ -1,0 +1,18 @@
+name: "功能请求"
+description: "提出你希望 proot-distro 添加的功能"
+title: "[功能]: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        这是 PRoot Distro 的 bug 追踪器——一个用于管理发行版安装的 PRoot 辅助工具。请按所选的工单类型正确使用。
+
+        不保证特定功能一定会被实现。这取决于多种因素，包括功能复杂度以及功能是否符合项目目标和架构。
+  - type: textarea
+    attributes:
+      label: 功能描述
+      description: |
+        清晰简洁地描述你希望在 `proot-distro` 中看到的功能。
+    validations:
+      required: true

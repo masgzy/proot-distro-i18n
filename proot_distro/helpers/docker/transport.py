@@ -1,0 +1,734 @@
+#
+# Proot-Distro - manage proot containers.
+#
+# Created by Sylirre <sylirre@termux.dev> for Termux project.
+# Development assisted by Claude Code (https://claude.ai/code).
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+
+# Architecture: Registry HTTP plumbing used by both pull and push.
+# Three concerns live here:
+#
+#   - User-Agent header generation (so registries can spot us).
+#   - Authorization-stripping redirect handler — Docker Hub blob URLs
+#     redirect to CDN hosts that reject Bearer tokens with HTTP 400.
+#     Python's default redirect handler keeps headers across hops, so
+#     we subclass it to drop the header when the origin changes. It is
+#     a download.RedirectPolicyHandler, so which redirects are followed
+#     at all -- never off HTTPS unless --allow-insecure, never to another
+#     scheme -- is the rule every other request in the program obeys.
+#   - Token-exchange flow: PD_DOCKER_AUTH (username:password) is the
+#     single auth contract; the registry's WWW-Authenticate header
+#     tells us where to redeem it for a Bearer token.
+#
+# A credential goes only where it was addressed. same_auth_origin() is
+# the one rule for that: the redirect handler asks it before carrying a
+# header on to the next hop, and push asks it before carrying the Bearer
+# token to the upload Location a registry hands back. The token exchange
+# is the other side of the same coin -- PD_DOCKER_AUTH is sent as Basic
+# to whatever realm the registry's challenge names, since that is how
+# the protocol works (Docker Hub's realm is auth.docker.io, GitLab's is
+# gitlab.com for registry.gitlab.com, so the host is legitimately the
+# registry's to choose), but the realm has to be an https:// URL, or an
+# http:// one under --allow-insecure. A plaintext realm is a password on
+# the wire without the user having asked for plaintext anything.
+#
+# Everything a registry says about itself arrives here first, and none of
+# it is this program's to trust: how many bytes a metadata response holds
+# is the server's choice, and so is whether the body is JSON at all or an
+# object of the shape the caller is about to subscript. Bodies are read
+# through a ceiling (MAX_METADATA_BYTES) and decoded through
+# decode_json_object(), which turns a malformed or wrongly-shaped answer
+# into a RuntimeError -- the one exception type every command handler
+# already reports cleanly. A registry must not be able to end a command
+# in a traceback, and an --allow-insecure MITM or a hostile mirror must
+# not be able to end it in an allocation the size of the response.
+
+import base64
+import http.client
+import json
+import os
+import re
+import socket
+import ssl
+import urllib.error
+import urllib.parse
+import urllib.request
+
+from proot_distro.constants import PROGRAM_NAME, PROGRAM_VERSION
+from proot_distro.message import quote_path
+from proot_distro.helpers.download import (
+    NETWORK_ERRORS,
+    RedirectPolicyHandler,
+    certificate_error_msg,
+    declared_length,
+    http_opener,
+    is_cert_verification_error,
+    is_plaintext_http_tls_error,
+    new_request,
+    require_complete_body,
+    retry_http,
+    _tune_socket,
+    TunedHTTPSConnection,
+    TunedHTTPConnection,
+    TunedHTTPSHandler,
+    TunedHTTPHandler,
+)
+
+
+# 旧版硬编码的单一镜像源；现已通过 mirrors.resolve_registry_url() 动态读取。
+# 模块级 REGISTRY_URL 常量已移除（v6）——它会固化导入时的值，导致
+# `mirror use` 后本进程内不生效。所有调用方应使用 registry_base_url("")
+# 或 _resolve_registry_url() 动态获取。
+from proot_distro.mirrors import resolve_registry_url as _resolve_registry_url
+
+AUTH_URL = "https://auth.docker.io/token"
+
+# 官方 Docker Hub 的 registry 端点。配置了镜像源时，实际端点由
+# mirrors.resolve_registry_url() 动态返回（见 registry_base_url），
+# 本常量仅用于官方 Hub 的 token 换取流程。
+REGISTRY_URL = "https://registry-1.docker.io"
+
+# How large a metadata response may be before it is refused. Manifests,
+# manifest indexes, image configs, token grants and search pages are all
+# small documents -- a fat multi-arch index is tens of kilobytes -- and
+# nothing here streams, so every one of them is held whole in memory.
+# 16 MiB is orders of magnitude above any real one and still bounded,
+# the same ceiling install_local puts on the JSON inside an OCI archive.
+# Layer blobs are not metadata: they stream to disk and are bounded by
+# their own digest, not by this.
+MAX_METADATA_BYTES = 16 * 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
+# TCP socket 调优
+# ---------------------------------------------------------------------------
+#
+# Python 的 urllib.request 默认使用操作系统的 TCP 接收缓冲区大小，
+# 通常只有 8-64 KiB。在高延迟连接（如中国到海外镜像源，RTT 150-300ms）
+# 上，这严重限制吞吐量：
+#
+#   最大吞吐量 ≈ SO_RCVBUF / RTT
+#   8 KiB / 200ms  =  40 KB/s
+#   64 KiB / 200ms = 320 KB/s
+#   2 MiB / 200ms  = 10 MB/s  ← 我们的目标
+#
+# 将 SO_RCVBUF 设为 2 MiB 后，即使在 300ms RTT 的连接上也能达到
+# 7 MB/s 的单连接吞吐量，多线程并发后轻松超过 10 MB/s。
+#
+# 注意：操作系统可能将 SO_RCVBUF 限制在 /proc/sys/net/core/rmem_max
+# （Linux）或动态窗口上限以内。setsockopt 会静默截断到允许的最大值，
+# 不会报错。
+#
+# _tune_socket 和调优连接类定义在 helpers/download.py 中，
+# 供 transport.py 和 download.py 共用，避免循环导入。
+
+
+def _ua() -> dict:
+    return {"User-Agent": f"{PROGRAM_NAME}/{PROGRAM_VERSION}"}
+
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def same_auth_origin(from_url: str, to_url: str) -> bool:
+    """Whether a credential sent with *from_url* may also go to *to_url*.
+
+    An Authorization header is addressed to an origin -- scheme, host and
+    port -- and carrying it to another is handing the secret to whoever
+    answers there. The comparison used to be of the two netlocs, which
+    let a same-host redirect (or upload Location) that changed only the
+    scheme keep the header: https://reg.example -> http://reg.example
+    put the Bearer token, or the Basic password behind it, on the wire
+    in clear. The one scheme change allowed is an upgrade to HTTPS on the
+    default ports, which reaches the same server more securely; an
+    explicit port has to match the other side's default, since a port
+    the URL leaves out is the scheme's.
+
+    A URL that cannot be read -- a port that is not a number, no host at
+    all -- is not the same origin as anything.
+    """
+    try:
+        src = urllib.parse.urlsplit(from_url)
+        dst = urllib.parse.urlsplit(to_url)
+        src_host, dst_host = src.hostname, dst.hostname
+        src_port, dst_port = src.port, dst.port
+    except ValueError:
+        return False
+    if not src_host or src_host != dst_host:
+        return False
+    if src.scheme == dst.scheme:
+        default = _DEFAULT_PORTS.get(src.scheme)
+        return (src_port or default) == (dst_port or default)
+    return (
+        src.scheme == "http" and dst.scheme == "https"
+        and src_port in (None, 80) and dst_port in (None, 443)
+    )
+
+
+class AuthStrippingRedirectHandler(RedirectPolicyHandler):
+    """Strip the Authorization header when a redirect leaves the origin.
+
+    Docker Hub blob endpoints redirect to CDN pre-signed URLs. Those CDN
+    hosts return HTTP 400 when they receive a Bearer token. Python's
+    default redirect handler forwards all headers unchanged, so we
+    override it to drop Authorization whenever the redirect target is
+    not the origin the request was addressed to (same_auth_origin).
+
+    Whether a redirect is followed at all is the base class's question,
+    asked first: a redirect from HTTPS to plain HTTP is refused unless
+    *allow_plaintext* (--allow-insecure), and one that is followed there
+    still loses the header, since it is not the same origin.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_req is None:
+            return None
+        if not same_auth_origin(req.full_url, newurl):
+            new_req.headers.pop("Authorization", None)
+        return new_req
+
+
+def _build_opener(insecure: bool):
+    """An opener with cross-origin auth stripping and tuned TCP sockets.
+
+    The *insecure* variant skips certificate verification, so HTTPS
+    endpoints presenting an untrusted certificate can be reached under
+    ``--allow-insecure``, and lets a redirect step down from HTTPS to
+    plain HTTP, which the verifying one refuses (download.check_redirect).
+
+    Socket tuning (SO_RCVBUF before connect, TCP_NODELAY) is inherited
+    from download.http_opener, whose handler list installs the Tuned*
+    connection classes -- the fork's throughput optimisation.
+    """
+    return http_opener(
+        insecure=insecure,
+        redirect=AuthStrippingRedirectHandler(allow_plaintext=insecure),
+    )
+
+
+_verified_opener = _build_opener(False)
+# Eagerly build the insecure opener too — avoids a lazy-init race when
+# multiple threads call opener(insecure=True) concurrently. The cost
+# is one extra HTTPSHandler at import, which is negligible.
+_insecure_opener = _build_opener(True)
+
+
+def opener(insecure: bool = False):
+    """Return a shared opener; the insecure variant skips TLS cert checks."""
+    return _insecure_opener if insecure else _verified_opener
+
+
+def auth_opener():
+    """Return the shared (certificate-verifying) opener that strips Auth."""
+    return _verified_opener
+
+
+def _request_body(open_fn, req, what: str, limit: int = None) -> bytes:
+    """Open *req* via *open_fn* and return the response body, up to *limit*.
+
+    Transient network failures are retried (same policy as the URL
+    downloader). HTTP errors — including the expected 401 that carries the
+    Bearer challenge — and deterministic TLS failures are not retried; they
+    propagate to the caller, which knows how to handle them.
+
+    The body is metadata, held whole in memory by every caller, and how
+    much of it there is is the server's choice — a Content-Length says
+    nothing, since the bytes are what arrive. So one byte more than the
+    limit is read and its presence is the refusal, which is a
+    RuntimeError and therefore not retried: the answer would be the same
+    every time.
+    """
+    cap = MAX_METADATA_BYTES if limit is None else limit
+
+    def _attempt():
+        with open_fn(req) as resp:
+            data = resp.read(cap + 1)
+            declared = declared_length(resp)
+        if len(data) > cap:
+            raise RuntimeError(
+                f"{what}: the registry's response is larger than "
+                f"{cap} bytes; refusing to read it."
+            )
+        # After the cap, never before it: a body larger than the cap is
+        # short of its own Content-Length by construction, and that is
+        # the refusal above rather than a truncated answer.
+        require_complete_body(len(data), declared, what)
+        return data
+    return retry_http(_attempt, what=what)
+
+
+def _grant_token(data: dict, what: str) -> str:
+    """Pull the Bearer token out of a token-endpoint grant.
+
+    The value goes straight into an Authorization header, so it has to
+    be a string: a grant answering with a number or a nested object
+    would otherwise be formatted into the header and sent. An empty
+    grant is legitimate — a wide-open registry needs no token — and is
+    the one non-string this accepts.
+    """
+    token = data.get("token") or data.get("access_token", "")
+    if not token:
+        return ""
+    if not isinstance(token, str):
+        raise RuntimeError(
+            f"{what}: the registry's token grant is not a string."
+        )
+    # Nor may the string hold what a header cannot carry: a control
+    # character (a line break most of all) or anything past Latin-1.
+    # http.client refuses both with a ValueError from the middle of the
+    # next request, and its message quotes the header value -- so the
+    # refusal is made here, where it can say what is wrong without
+    # printing the token.
+    if any(ord(ch) < 0x20 or 0x7f <= ord(ch) < 0xa0 or ord(ch) > 0xff
+           for ch in token):
+        raise RuntimeError(
+            f"{what}: the registry's token grant holds characters an "
+            f"HTTP header cannot carry."
+        )
+    return token
+
+
+def decode_json_object(body: bytes, what: str) -> dict:
+    """Parse *body* as a JSON object, or raise RuntimeError saying so.
+
+    Every registry response this program reads is a JSON object whose
+    members the caller goes on to subscript. A body that is not JSON at
+    all, or that decodes to a list or a string, used to surface as a
+    ValueError or an AttributeError out of the middle of the pull —
+    a traceback, since no command handler catches those. RuntimeError is
+    the type they all already report.
+    """
+    try:
+        data = json.loads(body)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise RuntimeError(
+            f"{what}: the registry returned a malformed response "
+            f"(not valid JSON)."
+        ) from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"{what}: the registry returned an unexpected response "
+            f"(not a JSON object)."
+        )
+    return data
+
+
+def insecure_for(registry: str, insecure: bool) -> bool:
+    """Whether --allow-insecure reaches *registry* at all.
+
+    The flag is Docker's --insecure-registry: an opt-in for a registry
+    the user names, served over plain HTTP or behind a certificate that
+    does not verify. Docker Hub -- the empty registry, which `docker.io`
+    and `index.docker.io` also parse to -- is never one of those, and is
+    reached over verified HTTPS whatever the flag says, as Docker reaches
+    its official index. Its token exchange always was. Its manifests and
+    blobs were not: pull and push handed the flag to opener() whatever
+    the registry, so `install --allow-insecure alpine` fetched the tag's
+    manifest -- which no digest pins -- with certificate checks off and
+    the Bearer token on the request, and let a Hub redirect step down to
+    plain HTTP. Both pipelines ask this once, where they start, and pass
+    the answer down.
+    """
+    return bool(insecure and registry)
+
+
+def registry_base_url(registry: str, insecure: bool = False) -> str:
+    """Return the base URL for *registry* (empty string ⇒ Docker Hub).
+
+    HTTPS is used by default. When *insecure* is set the custom registry
+    is addressed over plain HTTP — the opt-in behaviour behind the
+    install command's ``--allow-insecure``. Docker Hub (empty registry)
+    is always served over HTTPS and ignores *insecure*.
+
+    Empty *registry* now resolves to the user-configured mirror (managed
+    by ``proot-distro mirror``); see mirrors.resolve_registry_url.
+    """
+    if not registry:
+        # 动态查询，使 `mirror use` 后无需重启 Python 进程即生效
+        return _resolve_registry_url()
+    scheme = "http" if insecure else "https"
+    return f"{scheme}://{registry}"
+
+
+def insecure_registry_msg(registry: str) -> str:
+    """Return the error shown when an HTTPS-only pull hits an HTTP registry."""
+    return (
+        f"Registry '{registry}' is served over plain HTTP, not HTTPS. "
+        f"proot-distro enforces TLS by default. If you trust this registry "
+        f"and the network path to it, re-run with '--allow-insecure' to "
+        f"permit the unencrypted connection."
+    )
+
+
+def _http_registry_reachable(registry: str, timeout: float = 6.0) -> bool:
+    """Return True if *registry* answers a /v2/ probe over plaintext HTTP.
+
+    Fallback used on the error path when the TLS error itself is not a
+    conclusive plaintext signal (see is_plaintext_http_tls_error), to
+    decide whether an HTTPS failure is because the registry is HTTP-only
+    (so we can point the user at ``--allow-insecure``) rather than simply
+    unreachable. Any HTTP-level response — including 401/404 — confirms the
+    host speaks HTTP on that endpoint.
+    """
+    try:
+        # Built inside the net, so a registry the URL cannot hold is "not
+        # reachable" rather than the question's own traceback.
+        req = new_request(f"http://{registry}/v2/", headers=_ua())
+        # The program's own opener, like every other request: urlopen()
+        # would follow a redirect to ftp:// as readily as to http://.
+        with http_opener().open(req, timeout=timeout) as resp:
+            resp.read(64)
+        return True
+    except urllib.error.HTTPError:
+        return True
+    except NETWORK_ERRORS:
+        return False
+
+
+def auth_denied_msg(image_ref: str, code: int) -> str:
+    """Return a descriptive error string for 401/403 registry responses."""
+    if os.environ.get("PD_DOCKER_AUTH"):
+        return (
+            f"Access denied to '{image_ref}' (HTTP {code}). "
+            f"Check that PD_DOCKER_AUTH=username:password is correct "
+            f"and the account has pull access to the image."
+        )
+    # Public image got 401/403 — most likely the mirror is misbehaving
+    # or the image name is wrong. Don't tell the user it's "private"
+    # because that's misleading for official images like 'ubuntu'.
+    return (
+        f"Access denied to '{image_ref}' (HTTP {code}). "
+        f"This is a public image — the mirror may not have it cached, "
+        f"or the image name may be wrong.\n"
+        f"Try: 1) {PROGRAM_NAME} mirror test --use-best  (switch to a working mirror)\n"
+        f"      2) Use full reference like 'library/ubuntu:latest' or 'ubuntu:24.04'\n"
+        f"      3) For private images, set PD_DOCKER_AUTH=username:password"
+    )
+
+
+def push_denied_msg(image_ref: str, code: int) -> str:
+    """Return a context-sensitive error string for 401/403 on push."""
+    if os.environ.get("PD_DOCKER_AUTH"):
+        return (
+            f"Push denied for '{image_ref}' (HTTP {code}). "
+            f"Check that PD_DOCKER_AUTH=username:password is correct "
+            f"and the account has push access to the repository."
+        )
+    return (
+        f"Push denied for '{image_ref}' (HTTP {code}). "
+        f"Set PD_DOCKER_AUTH=username:password to authenticate, or, "
+        f"for self-hosted registries that allow anonymous push, check "
+        f"the registry configuration."
+    )
+
+
+_CHALLENGE_PARAM_RE = re.compile(
+    r'(\w+)\s*=\s*(?:"([^"]*)"|([^",\s]+))'
+)
+
+
+def _parse_bearer_challenge(header_value: str) -> dict:
+    """Return the key=value pairs from a Bearer WWW-Authenticate header.
+
+    Per RFC 7235 each auth-param's value may be either a quoted-string
+    or a bare token. Practical registries (Docker Hub, GHCR, ECR) quote
+    everything, but the spec permits e.g.
+        Bearer realm=https://auth.example/token,service=svc
+    on a self-hosted registry. We accept both forms so the probe still
+    works against spec-compliant minimal implementations.
+    """
+    return {
+        key: (quoted if quoted else bare)
+        for key, quoted, bare in _CHALLENGE_PARAM_RE.findall(header_value)
+    }
+
+
+def env_basic_auth() -> str:
+    """Return a Basic auth header value from PD_DOCKER_AUTH, or ''.
+
+    Accepts 'username:password' — the colon is the required separator.
+    Returns '' when the variable is unset; raises RuntimeError when the
+    variable is set but contains no colon (wrong format).
+    """
+    raw = os.environ.get("PD_DOCKER_AUTH", "")
+    if not raw:
+        return ""
+    if ":" not in raw:
+        raise RuntimeError(
+            "PD_DOCKER_AUTH must be in 'username:password' format "
+            "(e.g. 'myuser:mypassword' or 'myuser:ghp_xxx'). "
+            "A bare token without a username cannot be used — registry "
+            "auth requires a token exchange with Basic credentials."
+        )
+    # The variable's own bytes: os.environ decodes them with
+    # surrogateescape, so a password byte that is not UTF-8 is a lone
+    # surrogate here, and strict UTF-8 raised UnicodeEncodeError out of
+    # the pull. os.fsencode() gives back exactly what was set.
+    return "Basic " + base64.b64encode(os.fsencode(raw)).decode()
+
+
+def _require_usable_realm(realm: str, registry: str, insecure: bool) -> None:
+    """Refuse a Bearer realm this program must not send credentials to.
+
+    The realm is a URL out of the registry's own challenge, and the token
+    request that follows carries PD_DOCKER_AUTH as a Basic header. Which
+    *host* it names is the registry's to choose -- the protocol puts the
+    token service wherever the operator likes, and Docker Hub, GitLab and
+    the rest all put it somewhere other than the registry -- but the
+    scheme is not. Only https:// keeps the password off the wire, and
+    http:// is what --allow-insecure means, for the registry and for its
+    realm alike. Anything else is refused outright: an unchecked realm
+    was a challenge's way of having this process open whatever it liked
+    -- file://, ftp://, data: -- and parse the result as a token grant.
+    The opener no longer speaks those schemes at all (download.
+    http_opener), which makes this the message rather than the only
+    thing standing in the way.
+    """
+    # The realm is the registry's text, and it goes to the terminal.
+    shown = quote_path(realm)
+    try:
+        parts = urllib.parse.urlsplit(realm)
+        host = parts.hostname
+    except ValueError:
+        # `https://[` and the like: urlsplit's ValueError used to come
+        # out of the middle of the pull as a traceback.
+        raise RuntimeError(
+            f"Registry '{registry}' directs authentication to '{shown}', "
+            f"which is not a valid URL. Refusing to send credentials there."
+        ) from None
+    scheme = parts.scheme.lower()
+    if scheme == "https" and host:
+        return
+    if scheme == "http" and host:
+        if insecure:
+            return
+        raise RuntimeError(
+            f"Registry '{registry}' directs authentication to '{shown}', "
+            f"which is served over plain HTTP, not HTTPS. proot-distro "
+            f"enforces TLS by default and will not send credentials in "
+            f"clear. If you trust this registry and the network path to "
+            f"it, re-run with '--allow-insecure' to permit the "
+            f"unencrypted connection."
+        )
+    raise RuntimeError(
+        f"Registry '{registry}' directs authentication to '{shown}', "
+        f"which is not an https:// URL (or an http:// one under "
+        f"'--allow-insecure'). Refusing to send credentials there."
+    )
+
+
+def get_auth_token(
+    repo: str, registry: str = "", actions: str = "pull",
+    insecure: bool = False,
+) -> tuple:
+    """Resolve a registry's base URL and an OAuth2 token for *repo*.
+
+    Returns ``(token, base_url)`` where *base_url* is the resolved
+    ``scheme://registry`` that every subsequent request for this image must
+    use. *token* is empty for wide-open registries.
+
+    `actions` is a comma-separated list of registry actions to request,
+    such as 'pull' (default), 'push', or 'pull,push'. The push flow
+    needs 'pull,push'; the pull flow uses the default 'pull'.
+
+    When PD_DOCKER_AUTH is set, its 'username:password' value is
+    forwarded as HTTP Basic auth to the registry's token endpoint,
+    enabling access to private images. PD_DOCKER_AUTH must always
+    contain a colon separating the username from the password/PAT.
+
+    Without PD_DOCKER_AUTH Docker Hub uses its well-known auth endpoint for
+    anonymous requests (always HTTPS). For any other registry the scheme and
+    Bearer realm are discovered with a single /v2/ probe:
+
+      * HTTPS is tried first — even under *insecure*, so a registry serving
+        an untrusted certificate is reached (cert verification is skipped
+        only when *insecure* is set).
+      * A certificate failure raises a RuntimeError pointing at
+        ``--allow-insecure`` (unless already insecure).
+      * A registry that answers the HTTPS probe with plaintext is HTTP-only:
+        under *insecure* it is retried over http://; otherwise a RuntimeError
+        points the user at ``--allow-insecure``.
+      * The realm the challenge names must be an https:// URL -- or an
+        http:// one under *insecure* -- before anything is sent to it
+        (see _require_usable_realm).
+    """
+    basic_auth = env_basic_auth()
+
+    if not registry:
+        # fork（镜像源支持）：Docker Hub 有两种情况：
+        #
+        # 1. base 是官方 Docker Hub（registry-1.docker.io）：
+        #    走 auth.docker.io 换取 Bearer token 的标准流程。
+        # 2. base 是镜像源（daocloud、1panel 等，经 `mirror use` 配置）：
+        #    镜像源是透明代理，可能 (a) 接受匿名请求、(b) 要求自己的
+        #    Bearer token（WWW-Authenticate 质询）、或 (c) 接受 Docker
+        #    Hub 的 token。先探测 /v2/，让镜像源告诉我们它要什么——
+        #    避免把 registry.docker.io 的 token 交给校验 service 字段
+        #    的镜像源时出现的 "Unauthorized" 错误。
+        base = _resolve_registry_url()
+        is_official_hub = base.rstrip("/").endswith("registry-1.docker.io")
+
+        if is_official_hub:
+            # 标准 Docker Hub 认证流程（官方实现）。
+            url = (
+                f"{AUTH_URL}?service=registry.docker.io"
+                f"&scope=repository:{repo}:{actions}"
+            )
+            req = new_request(url, headers=_ua())
+            if basic_auth:
+                req.add_header("Authorization", basic_auth)
+            what = f"Authenticating {repo}"
+            # Through the auth-stripping opener, never urlopen(): the default
+            # redirect handler carries the Basic header to whatever host a
+            # redirect names, and this is the one request that has the user's
+            # password in it. Docker Hub is always verified HTTPS, so it is
+            # the verifying opener whatever `insecure` says.
+            data = decode_json_object(
+                _request_body(auth_opener().open, req, what), what,
+            )
+            return _grant_token(data, what), REGISTRY_URL
+
+        # 镜像源：探测 /v2/ 发现认证要求。
+        op = opener(insecure)
+        scheme = "https"
+        while True:
+            probe_base = f"{scheme}://{urllib.parse.urlparse(base).netloc}"
+            probe_req = new_request(f"{probe_base}/v2/", headers=_ua())
+            try:
+                _request_body(op.open, probe_req, f"Probing {probe_base}/v2/")
+                # 镜像源接受匿名请求 —— 无需 token。
+                return "", probe_base
+            except urllib.error.HTTPError as exc:
+                if exc.code != 401:
+                    raise
+                www_auth = exc.headers.get("WWW-Authenticate", "")
+                if not www_auth.lower().startswith("bearer "):
+                    # 非 Bearer 质询（如 Basic）—— 返回空 token；
+                    # 调用方重试时会得到更明确的错误。
+                    return "", probe_base
+                # Bearer 质询：到镜像源自己的 realm（而非
+                # auth.docker.io）换取 token。
+                params = _parse_bearer_challenge(
+                    www_auth.split(" ", 1)[1]
+                )
+                realm = params.get("realm", "")
+                if not realm:
+                    return "", probe_base
+                _require_usable_realm(realm, probe_base, insecure)
+                service = params.get("service", "")
+                qs_parts = []
+                if service:
+                    qs_parts.append(
+                        f"service={urllib.parse.quote(service, safe='')}"
+                    )
+                qs_parts.append(f"scope=repository:{repo}:{actions}")
+                sep = "&" if "?" in realm else "?"
+                token_req = new_request(
+                    f"{realm}{sep}{'&'.join(qs_parts)}", headers=_ua()
+                )
+                if basic_auth:
+                    token_req.add_header("Authorization", basic_auth)
+                what = "Requesting auth token"
+                data = decode_json_object(
+                    _request_body(op.open, token_req, what), what,
+                )
+                return _grant_token(data, what), probe_base
+            except urllib.error.URLError as exc:
+                if not insecure and is_cert_verification_error(exc):
+                    raise RuntimeError(
+                        certificate_error_msg(probe_base)
+                    ) from exc
+                if scheme == "https" and (
+                    is_plaintext_http_tls_error(exc)
+                    or _http_registry_reachable(urllib.parse.urlparse(base).netloc)
+                ):
+                    if insecure:
+                        scheme = "http"
+                        continue
+                    raise RuntimeError(
+                        insecure_registry_msg(probe_base)
+                    ) from exc
+                raise
+
+    # Custom registry: probe /v2/ to resolve the scheme and discover the
+    # Bearer realm. Registries serving public images still require this dance —
+    # they answer 401 to unauthenticated requests and embed the token endpoint
+    # in the challenge.
+    op = opener(insecure)
+    scheme = "https"
+    while True:
+        base = f"{scheme}://{registry}"
+        probe_req = new_request(f"{base}/v2/", headers=_ua())
+        try:
+            _request_body(op.open, probe_req, f"Probing {base}/v2/")
+            return "", base  # registry is wide open; no token required
+        except urllib.error.HTTPError as exc:
+            if exc.code != 401:
+                raise
+            www_auth = exc.headers.get("WWW-Authenticate", "")
+            if not www_auth.lower().startswith("bearer "):
+                return "", base
+            params = _parse_bearer_challenge(www_auth.split(" ", 1)[1])
+            realm = params.get("realm", "")
+            if not realm:
+                return "", base
+            _require_usable_realm(realm, registry, insecure)
+            service = params.get("service", "")
+            qs_parts = []
+            if service:
+                qs_parts.append(
+                    f"service={urllib.parse.quote(service, safe='')}"
+                )
+            qs_parts.append(f"scope=repository:{repo}:{actions}")
+            sep = "&" if "?" in realm else "?"
+            token_req = new_request(
+                f"{realm}{sep}{'&'.join(qs_parts)}", headers=_ua()
+            )
+            if basic_auth:
+                token_req.add_header("Authorization", basic_auth)
+            what = "Requesting auth token"
+            data = decode_json_object(
+                _request_body(op.open, token_req, what), what,
+            )
+            return _grant_token(data, what), base
+        except urllib.error.URLError as exc:
+            # The server speaks TLS but its certificate is untrusted. Only
+            # reachable when enforcing HTTPS (the insecure opener skips
+            # verification, so no cert error occurs there).
+            if not insecure and is_cert_verification_error(exc):
+                raise RuntimeError(certificate_error_msg(registry)) from exc
+            # The registry answered the HTTPS probe with plaintext (or only
+            # responds over plain HTTP): it is HTTP-only. Two signals,
+            # cheapest first — the handshake error itself (WRONG_VERSION_NUMBER
+            # and friends), else an active HTTP re-probe.
+            if scheme == "https" and (
+                is_plaintext_http_tls_error(exc)
+                or _http_registry_reachable(registry)
+            ):
+                if insecure:
+                    scheme = "http"  # retry the whole probe over plain HTTP
+                    continue
+                raise RuntimeError(insecure_registry_msg(registry)) from exc
+            raise
+
+
+def auth_note(prefix_space: bool = True) -> str:
+    """Return ' (user credentials)' or ' (anonymous)' for log lines."""
+    head = " " if prefix_space else ""
+    if os.environ.get("PD_DOCKER_AUTH"):
+        return f"{head}(user credentials)"
+    return f"{head}(anonymous)"

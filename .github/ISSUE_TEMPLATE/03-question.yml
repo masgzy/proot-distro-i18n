@@ -1,0 +1,10 @@
+name: "提问"
+description: "有关于 proot-distro 的问题？来问吧。"
+title: "[一般]: "
+labels: [question]
+body:
+  - type: textarea
+    attributes:
+      label: 问题
+    validations:
+      required: true
