@@ -61,7 +61,7 @@ _proot_distro() {
     _init_completion || return
 
     local -r _all_commands="install search remove rename reset login list ps kill backup
-        restore clear-cache copy sync run build push mirror help"
+        restore clear-cache copy sync run build push mirror lang help"
 
     # Complete the subcommand itself
     if [[ ${cword} -eq 1 ]]; then
@@ -363,8 +363,25 @@ _proot_distro() {
             ;;
 
         # -----------------------------------------------------------------------
+        lang)
+            if [[ "${cur}" == -* ]]; then
+                COMPREPLY=($(compgen -W "-h --help" -- "${cur}"))
+            else
+                # 第一个位置参数: 子动作; 第二个: LOCALE
+                local actions="get show status use set switch list ls reset unset clear"
+                local locales="en zh_CN"
+                local prev_word="${words[cword-1]}"
+                if [[ " use set switch " == *" ${prev_word} "* ]]; then
+                    COMPREPLY=($(compgen -W "${locales}" -- "${cur}"))
+                else
+                    COMPREPLY=($(compgen -W "${actions}" -- "${cur}"))
+                fi
+            fi
+            ;;
+
+        # -----------------------------------------------------------------------
         help)
-            local topics="install search remove rename reset login list ps kill backup restore clear-cache copy sync run build push mirror"
+            local topics="install search remove rename reset login list ps kill backup restore clear-cache copy sync run build push mirror lang"
             COMPREPLY=($(compgen -W "${topics}" -- "${cur}"))
             ;;
 

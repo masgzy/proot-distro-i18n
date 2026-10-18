@@ -71,7 +71,7 @@ end
 function __proot_distro_no_subcommand
     not __fish_seen_subcommand_from \
         install search remove rename reset login list ps kill backup restore \
-        clear-cache copy sync run build push mirror help
+        clear-cache copy sync run build push mirror lang help
 end
 
 # ---------------------------------------------------------------------------
@@ -93,6 +93,8 @@ complete -c proot-distro -f -n __proot_distro_no_subcommand -a sync        -d '�
 complete -c proot-distro -f -n __proot_distro_no_subcommand -a run         -d '在容器中运行镜像的 entrypoint/cmd'
 complete -c proot-distro -f -n __proot_distro_no_subcommand -a build       -d '从 Dockerfile 构建 OCI 镜像'
 complete -c proot-distro -f -n __proot_distro_no_subcommand -a push        -d '把本地构建的镜像推送到仓库'
+complete -c proot-distro -f -n __proot_distro_no_subcommand -a mirror      -d '管理 Docker registry 镜像源'
+complete -c proot-distro -f -n __proot_distro_no_subcommand -a lang        -d '查看与设置界面语言'
 complete -c proot-distro -f -n __proot_distro_no_subcommand -a help        -d '显示帮助'
 complete -c proot-distro -f -n __proot_distro_no_subcommand -a install     -d 'Install a container from a Docker image or local archive'
 complete -c proot-distro -f -n __proot_distro_no_subcommand -a search      -d 'Search Docker Hub for images'
@@ -111,6 +113,7 @@ complete -c proot-distro -f -n __proot_distro_no_subcommand -a sync        -d 'S
 complete -c proot-distro -f -n __proot_distro_no_subcommand -a run         -d 'Run the image entrypoint/cmd in a container'
 complete -c proot-distro -f -n __proot_distro_no_subcommand -a build       -d 'Build an OCI image from a Dockerfile'
 complete -c proot-distro -f -n __proot_distro_no_subcommand -a push        -d 'Push a locally built image to a registry'
+complete -c proot-distro -f -n __proot_distro_no_subcommand -a lang        -d 'Show and set the UI language'
 complete -c proot-distro -f -n __proot_distro_no_subcommand -a help        -d 'Show help'
 
 # 全局帮助标志（子命令之前）
@@ -440,10 +443,22 @@ complete -c proot-distro -f -n '__fish_seen_subcommand_from mirror'     -s q -l 
 complete -c proot-distro -f -n '__fish_seen_subcommand_from mirror'     -s h -l help -d '显示帮助'
 
 # ---------------------------------------------------------------------------
+# lang
+# ---------------------------------------------------------------------------
+complete -c proot-distro -f -n '__fish_seen_subcommand_from lang'     -a 'get'  -d '显示当前生效语言及来源'
+complete -c proot-distro -f -n '__fish_seen_subcommand_from lang'     -a 'show' -d '显示当前生效语言及来源（同 get）'
+complete -c proot-distro -f -n '__fish_seen_subcommand_from lang'     -a 'use'  -d '持久化设置语言'
+complete -c proot-distro -f -n '__fish_seen_subcommand_from lang'     -a 'set'  -d '持久化设置语言（同 use）'
+complete -c proot-distro -f -n '__fish_seen_subcommand_from lang'     -a 'list' -d '列出已内置翻译的语言'
+complete -c proot-distro -f -n '__fish_seen_subcommand_from lang'     -a 'reset' -d '清除语言偏好，回退默认'
+complete -c proot-distro -f -n '__fish_seen_subcommand_from lang'     -a 'en zh_CN' -d '语言代码'
+complete -c proot-distro -f -n '__fish_seen_subcommand_from lang'     -s h -l help -d '显示帮助'
+
+# ---------------------------------------------------------------------------
 # help
 # ---------------------------------------------------------------------------
 complete -c proot-distro -f -n '__fish_seen_subcommand_from help' \
-    -a 'install search remove rename reset login list ps kill backup restore clear-cache copy sync run build push' \
+    -a 'install search remove rename reset login list ps kill backup restore clear-cache copy sync run build push mirror lang' \
     -d 'Topic'
 
 # ---------------------------------------------------------------------------
@@ -641,4 +656,4 @@ complete -c pd -f -n '__fish_seen_subcommand_from push' -s q -l quiet           
 complete -c pd -f -n '__fish_seen_subcommand_from push' -s h -l help            -d '显示帮助'
 
 complete -c pd -f -n '__fish_seen_subcommand_from help' \
-    -a 'install search remove rename reset login list ps kill backup restore clear-cache copy sync run build push' -d 'Topic'
+    -a 'install search remove rename reset login list ps kill backup restore clear-cache copy sync run build push mirror lang' -d 'Topic'

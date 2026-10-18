@@ -30,8 +30,7 @@ include = ["proot_distro*"]
 [tool.setuptools.package-data]
 "proot_distro" = [
     "completions/*",
-    "locales/*/LC_MESSAGES/*.mo",
-    "locales/*/LC_MESSAGES/*.po",
+    "locales/*.json",
 ]
 
 # 安装方式：通过 GitHub 仓库分发

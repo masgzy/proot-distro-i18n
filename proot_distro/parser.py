@@ -83,6 +83,9 @@ REQUIRED_ARGS = {
                  " (e.g. 'ubuntu').")],
 }
 
+# `lang use` 的 locale 缺失由 command_lang 自己报错（带 usage 提示），
+# 不进 REQUIRED_ARGS —— 与 mirror use 的处理一致。
+
 
 def required_args_for(canonical: str, args) -> list:
     """Return the required (arg_name, error_message) pairs for a command.
@@ -112,6 +115,17 @@ ALIAS_TO_CANONICAL = {
     "s": "search", "se": "search",
     "h": "help", "he": "help", "hel": "help",
 }
+
+
+# --lang 标志的公共定义：顶层与每个子命令都注入（ parents 机制），
+# 因此 `pd --lang en list` 与 `pd list --lang en` 都可用。
+# default=SUPPRESS 是关键：未出现 --lang 时不写 namespace，这样
+# 子命令的解析不会把顶层已解析到的值覆盖成默认值。
+_LANG_PARENT = argparse.ArgumentParser(add_help=False)
+_LANG_PARENT.add_argument(
+    "--lang", dest="cli_lang", metavar="LOCALE",
+    default=argparse.SUPPRESS,
+)
 
 
 def _add_login_or_run_common(p):
@@ -159,15 +173,35 @@ def _add_login_or_run_common(p):
     p.add_argument("-d", "--detach", action="store_true")
 
 
+class _LangAwareSubParsers:
+    """包装 subparsers action：给每个子命令自动继承 --lang 标志。
+
+    所有 _builder 都通过它 add_parser，因此 `pd list --lang en` 与
+    `pd --lang en list` 两种写法都能解析，且新增子命令时无需记得
+    手动加 --lang。
+    """
+
+    def __init__(self, sub):
+        self._sub = sub
+
+    def add_parser(self, name, **kw):
+        kw["parents"] = [*(kw.get("parents") or []), _LANG_PARENT]
+        return self._sub.add_parser(name, **kw)
+
+    def __getattr__(self, item):
+        return getattr(self._sub, item)
+
+
 def build_parser() -> _PdArgumentParser:
     """Construct the top-level argparse parser with every subcommand."""
     parser = _PdArgumentParser(
         prog=PROGRAM_NAME,
         description="Manage Linux proot containers.",
         add_help=False,
+        parents=[_LANG_PARENT],  # 顶层 --lang（`pd --lang en list`）
     )
     parser.add_argument("-h", "--help", action="store_true")
-    sub = parser.add_subparsers(dest="command")
+    sub = _LangAwareSubParsers(parser.add_subparsers(dest="command"))
 
     sub.add_parser("help", aliases=["hel", "he", "h"], add_help=False)
 
@@ -189,8 +223,25 @@ def build_parser() -> _PdArgumentParser:
     _ps(sub)
     _kill(sub)
     _mirror(sub)
+    _lang(sub)
 
     return parser
+
+
+def _lang(sub):
+    # 界面语言管理（本 fork 特有）
+    p = sub.add_parser("lang", add_help=False)
+    p._pd_command = "lang"
+    p.add_argument(
+        "lang_action", nargs="?", default="get",
+        metavar="{get,use,list,reset}",
+        choices=["get", "show", "status", "use", "set", "switch",
+                 "list", "ls", "reset", "unset", "clear"],
+    )
+    p.add_argument(
+        "locale", nargs="?", default=None, metavar="LOCALE",
+    )
+    p.add_argument("-h", "--help", action="store_true")
 
 
 def _install(sub):
