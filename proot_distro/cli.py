@@ -36,7 +36,7 @@ import subprocess
 import sys
 
 from proot_distro.constants import IS_TERMUX, PROGRAM_NAME
-from proot_distro.i18n import _
+from proot_distro.i18n import _, set_language, normalize_locale, SOURCE_FLAG
 from proot_distro.message import C, msg, set_quiet, crit_error
 from proot_distro.arch import get_proot_bin
 from proot_distro.parser import (
@@ -61,6 +61,7 @@ from proot_distro.commands.ps import command_ps
 from proot_distro.commands.kill import command_kill
 from proot_distro.commands.mirror import command_mirror
 from proot_distro.commands.search import command_search
+from proot_distro.commands.lang import command_lang
 
 
 _COMMAND_HANDLERS = {
@@ -82,6 +83,7 @@ _COMMAND_HANDLERS = {
     "kill":        command_kill,
     "mirror":      command_mirror,
     "search":      command_search,
+    "lang":        command_lang,
     "help":        command_help,
 }
 
@@ -147,7 +149,7 @@ def _refuse_nested_proot() -> None:
 
 # Commands that never invoke proot — exempt from the proot-on-PATH
 # startup probe. Documented inline so future commands can opt in.
-_PROOT_EXEMPT_COMMANDS = frozenset({"build", "push", "kill", "ps", "mirror", "search", "help"})
+_PROOT_EXEMPT_COMMANDS = frozenset({"build", "push", "kill", "ps", "mirror", "search", "lang", "help"})
 
 
 def ensure_proot_installed() -> None:
@@ -228,6 +230,55 @@ def _ensure_proot_available(first_canonical: str) -> None:
     ensure_proot_installed()
 
 
+def _apply_lang_flag(args) -> None:
+    """把 --lang 标志应用到 i18n（优先级链的最高一级）。
+
+    模块导入时 i18n 已按 env > config > 默认探测过一次；只有当
+    命令行真的出现了 --lang（SUPPRESS 默认 → 只有出现时属性才存在）
+    才覆盖。无效值在这里报错退出——单次覆盖拼错了应该立刻告诉
+    用户，而不是默默回退默认。
+    """
+    raw = getattr(args, "cli_lang", None)
+    if raw is None:
+        return
+    if normalize_locale(raw) is None:
+        from proot_distro.i18n import AVAILABLE_LANGUAGES
+        msg()
+        crit_error(_("Unknown locale: '{token}'. Supported: {list}.",
+                     token=raw,
+                     list=", ".join(sorted(AVAILABLE_LANGUAGES))))
+        msg()
+        sys.exit(1)
+    set_language(raw, SOURCE_FLAG)
+
+
+def _apply_early_lang(argv: list) -> None:
+    """argparse 之前先扫出 --lang 并应用。
+
+    proot 探测、未知命令检查都发生在 parse 之前——它们产生的错误
+    消息同样应该尊重 --lang。这里只应用**合法**值；非法值留给
+    _apply_lang_flag（parse 后）统一报错，两处都是幂等的。
+    """
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            return  # 分隔符后是容器内命令，不再扫
+        if tok == "--lang" and i + 1 < len(argv):
+            _apply_lang_token(argv[i + 1])
+            return  # 只认第一次出现
+        if tok.startswith("--lang="):
+            _apply_lang_token(tok[len("--lang="):])
+            return
+        i += 1
+
+
+def _apply_lang_token(value: str) -> None:
+    """--lang 的值合法则立即切换语言；否则留给 argparse 阶段报错。"""
+    if value and normalize_locale(value) is not None:
+        set_language(value, SOURCE_FLAG)
+
+
 def _dispatch_help(raw_args) -> bool:
     """Render per-command help when ``-h``/``--help``/``--usage`` is given.
 
@@ -277,6 +328,30 @@ def _split_separator(canonical, raw_args, args):
             args.run_args = []
 
 
+def _first_command_token(argv: list) -> str:
+    """从 argv 里找出第一个子命令 token（可能是别名）。
+
+    不能直接取 sys.argv[1]：`pd --lang en install ubuntu` 的第一个
+    参数是全局标志 --lang，其值 ``en`` 也不是命令。因此跳过选项与
+    选项参数，只认第一个裸 token；遇到 `--`（login/run 的分隔符）
+    即停止。找不到返回空串（空参数列表时 main 的 help 分支处理）。
+    """
+    skip_next = False
+    for tok in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok == "--":
+            break
+        if tok == "--lang":
+            skip_next = True
+            continue
+        if tok.startswith("-"):
+            continue
+        return tok
+    return ""
+
+
 def main() -> None:
     """CLI entry point — installed as both `proot-distro` and `pd`.
 
@@ -295,9 +370,13 @@ def main() -> None:
 
     _refuse_nested_proot()
 
+    # --lang 尽早生效：help 短路与 proot 探测的错误消息也要尊重它
+    _apply_early_lang(sys.argv[1:])
+
     first_canonical = ""
     if len(sys.argv) >= 2:
-        first_canonical = ALIAS_TO_CANONICAL.get(sys.argv[1], sys.argv[1])
+        _raw_cmd = _first_command_token(sys.argv[1:])
+        first_canonical = ALIAS_TO_CANONICAL.get(_raw_cmd, _raw_cmd)
 
     # Help short-circuit: any -h/--help/--usage (top-level or per-command)
     # is dispatched BEFORE the proot-on-PATH probe. Rationale: help text
@@ -324,6 +403,9 @@ def main() -> None:
 
     parser = build_parser()
     args, unknown = parser.parse_known_args(raw_args)
+
+    # --lang 优先于一切其他语言来源；必须在任何用户可见输出之前应用
+    _apply_lang_flag(args)
 
     command = args.command
     if command is None:
@@ -386,3 +468,10 @@ def main() -> None:
         sys.exit(1)
 
     handler(args)
+
+    # 首次运行守护（见 autohold）：只在命令**正常完成**后执行——
+    # handler 内部的 sys.exit / 异常路径都不会走到这里，失败运行
+    # 不触发检测。条件不满足时静默返回。
+    if IS_TERMUX:
+        from proot_distro.autohold import maybe_auto_hold
+        maybe_auto_hold()

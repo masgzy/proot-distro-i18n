@@ -693,6 +693,79 @@ HELP_PAGES = {
         ],
     },
 
+    "lang": {
+        "usage": "lang {get|use|list|reset} [LOCALE]",
+        "summary": (
+            "查看与设置界面语言（本 fork 特有；原版无此命令，界面硬编码"
+            "英文）。\n\n"
+            "Termux 的 locale 支持是残缺的：LANG 通常为 C 或未设置，"
+            "Android 也不会把用户真实语言上报给终端应用，因此任何基于"
+            "系统 locale 的自动语言检测都行不通。lang use 提供一个"
+            "显式、持久化的开关，一次性解决这个痛点。"
+            "\n\n"
+            "翻译以纯 JSON 文件（locales/<locale>.json）内置分发，无需"
+            "编译步骤。"
+            "\n\n"
+            "语言来源优先级: --lang 标志 > PROOT_DISTRO_LANG 环境变量 > "
+            "PD_LANG 环境变量 > 配置文件 > 内置默认（zh_CN）。"
+        ),
+        "options": [
+            ("-h, --help", "显示本帮助。"),
+        ],
+        "examples": [
+            f"{PROGRAM_NAME} lang get",
+            f"{PROGRAM_NAME} lang use zh_CN",
+            f"{PROGRAM_NAME} lang use en",
+            f"{PROGRAM_NAME} lang list",
+            f"{PROGRAM_NAME} lang reset",
+            f"{PROGRAM_NAME} --lang en {PROGRAM_NAME}",
+        ],
+        "footer": [
+            {
+                "title": "子动作",
+                "intro": (
+                    "get / show / status: 显示当前生效语言及来源"
+                    "（--lang / 环境变量 / 配置文件 / 默认）。\n"
+                    "use / set / switch <LOCALE>: 持久化语言偏好到"
+                    "配置文件并立即生效。zh、zh-CN、zh_CN.UTF-8 等"
+                    "写法自动规范化为 zh_CN；C、POSIX、en、en_US 等"
+                    "自动规范化为 en。\n"
+                    "list / ls: 列出所有已内置翻译的语言。\n"
+                    "reset / unset / clear: 清除持久化偏好，回退默认"
+                    "逻辑（环境变量仍会优先生效，会给出提醒）。"
+                ),
+            },
+            {
+                "title": "全局 --lang 标志",
+                "intro": (
+                    "单次命令的临时覆盖，优先级最高，顶层与子命令位置"
+                    "均可写: pd --lang en install debian 或 "
+                    "pd install --lang en debian。不写入配置文件，"
+                    "仅影响本次运行。"
+                ),
+            },
+            {
+                "title": "环境变量",
+                "intro": (
+                    "PROOT_DISTRO_LANG / PD_LANG: 会话级或脚本级覆盖，"
+                    "优先于配置文件。设了它们时 lang use / lang reset "
+                    "会提醒配置不会立即生效。要恢复配置生效，请 unset。"
+                ),
+            },
+            {
+                "title": "配置文件",
+                "intro": (
+                    "桌面 Linux: ~/.config/proot-distro/config.json "
+                    "（或 $XDG_CONFIG_HOME/proot-distro/config.json）"
+                    "的 language 键。\n"
+                    "Termux/Android: $PREFIX/etc/proot-distro/config.json。\n"
+                    "写入采用 tmp + os.replace 原子替换，不会留下半写"
+                    "配置。"
+                ),
+            },
+        ],
+    },
+
     "ps": {
         "usage": "ps [OPTIONS]",
         "summary": (
@@ -978,4 +1051,5 @@ TOP_COMMANDS = [
     ("push", "把本地构建的镜像推送到仓库。"),
     ("search", "在 Docker Hub 上搜索镜像。"),
     ("mirror", "管理 Docker registry 镜像源（ls/test/use/unset/show）。"),
+    ("lang", "查看与设置界面语言（get/use/list/reset）。"),
 ]

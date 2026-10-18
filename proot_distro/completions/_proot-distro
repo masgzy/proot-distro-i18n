@@ -97,6 +97,7 @@ _proot_distro() {
                 'build:从 Dockerfile 构建 OCI 镜像'
                 'push:把本地构建的镜像推送到仓库'
                 'mirror:管理 Docker registry 镜像源'
+                'lang:查看与设置界面语言'
                 'help:显示帮助'
 =======
                 'install:install a container from a Docker image or local archive'
@@ -116,6 +117,7 @@ _proot_distro() {
                 'run:run the image entrypoint/cmd in a container'
                 'build:build an OCI image from a Dockerfile'
                 'push:push a locally built image to a registry'
+                'lang:show and set the UI language'
                 'help:show help'
             )
             _describe '命令' subcommands
@@ -367,12 +369,20 @@ _proot_distro() {
                     ;;
 
                 # -----------------------------------------------------------
+                lang)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[显示帮助]' \
+                        '1:子动作:(get show status use set switch list ls reset unset clear)' \
+                        '2:语言代码:(en zh_CN)'
+                    ;;
+
+                # -----------------------------------------------------------
                 help)
                     local -a topics
                     topics=(
                         install remove rename reset login list ps kill
                         backup restore clear-cache copy sync run
-                        build push mirror
+                        build push mirror lang
                     )
                     _describe '主题' topics
                     ;;

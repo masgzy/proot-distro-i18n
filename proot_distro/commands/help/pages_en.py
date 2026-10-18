@@ -985,6 +985,85 @@ HELP_PAGES = {
             },
         ],
     },
+
+    "lang": {
+        "usage": "lang {get|use|list|reset} [LOCALE]",
+        "summary": (
+            "Show and set the UI language (fork-specific; upstream "
+            "hardcodes English).\n\n"
+            "Termux's locale support is crippled: LANG is usually C or "
+            "unset, and Android never reports the user's real language "
+            "to terminal apps, so automatic locale detection cannot "
+            "work. `lang use` provides an explicit, persistent switch "
+            "that solves this pain point once and for all."
+            "\n\n"
+            "Translations ship as plain JSON files (locales/<locale>.json) "
+            "with no compile step."
+            "\n\n"
+            "Language source priority: --lang flag > PROOT_DISTRO_LANG "
+            "env var > PD_LANG env var > config file > built-in default "
+            "(zh_CN)."
+        ),
+        "options": [
+            ("-h, --help", "Show this help."),
+        ],
+        "examples": [
+            f"{PROGRAM_NAME} lang get",
+            f"{PROGRAM_NAME} lang use zh_CN",
+            f"{PROGRAM_NAME} lang use en",
+            f"{PROGRAM_NAME} lang list",
+            f"{PROGRAM_NAME} lang reset",
+            f"{PROGRAM_NAME} --lang en {PROGRAM_NAME}",
+        ],
+        "footer": [
+            {
+                "title": "SUB-ACTIONS",
+                "intro": (
+                    "get / show / status: show the effective language "
+                    "and where it comes from (--lang / env var / config "
+                    "file / default).\n"
+                    "use / set / switch <LOCALE>: persist the preference "
+                    "into the config file and apply immediately. "
+                    "zh, zh-CN, zh_CN.UTF-8 all normalize to zh_CN; "
+                    "C, POSIX, en, en_US normalize to en.\n"
+                    "list / ls: list every language with a built-in "
+                    "translation.\n"
+                    "reset / unset / clear: clear the persisted "
+                    "preference and fall back (env vars still win and "
+                    "are warned about)."
+                ),
+            },
+            {
+                "title": "GLOBAL --lang FLAG",
+                "intro": (
+                    "One-shot override with the highest priority, valid "
+                    "both before and after the subcommand: pd --lang en "
+                    "install debian or pd install --lang en debian. "
+                    "Never touches the config file; affects only this "
+                    "run."
+                ),
+            },
+            {
+                "title": "ENVIRONMENT VARIABLES",
+                "intro": (
+                    "PROOT_DISTRO_LANG / PD_LANG: session- or script-level "
+                    "override, wins over the config file. When set, "
+                    "lang use / lang reset warn that the persisted value "
+                    "has no effect until you unset them."
+                ),
+            },
+            {
+                "title": "CONFIG FILE",
+                "intro": (
+                    "Desktop Linux: the language key in "
+                    "~/.config/proot-distro/config.json (or "
+                    "$XDG_CONFIG_HOME/proot-distro/config.json).\n"
+                    "Termux/Android: $PREFIX/etc/proot-distro/config.json.\n"
+                    "Writes use atomic-replace (tmp + os.replace)."
+                ),
+            },
+        ],
+    },
 }
 
 
@@ -1009,4 +1088,5 @@ TOP_COMMANDS = [
     ("push", "Push a locally built image to a registry."),
     ("search", "Search Docker Hub for images."),
     ("mirror", "Manage Docker registry mirrors (ls/test/use/unset/show)."),
+    ("lang", "Show and set the UI language (get/use/list/reset)."),
 ]

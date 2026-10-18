@@ -60,23 +60,14 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
-from proot_distro.constants import IS_TERMUX, PROGRAM_NAME
+from proot_distro.constants import PROGRAM_NAME
+from proot_distro.config import CONFIG_DIR as _CONFIG_DIR
 from proot_distro.helpers.download import insecure_ssl_context
 from proot_distro.i18n import _
 
 # ---------------------------------------------------------------------------
-# 配置文件路径
+# 配置文件路径（目录规则单一事实来源在 config.py，本模块只拼文件名）
 # ---------------------------------------------------------------------------
-
-if IS_TERMUX:
-    # Termux: 走 $PREFIX/etc/<prog>/
-    _CONFIG_DIR = os.path.join(os.environ.get("TERMUX__PREFIX", "/data/data/com.termux/files/usr"),
-                               "etc", PROGRAM_NAME)
-else:
-    # 桌面 Linux: 走 XDG_CONFIG_HOME 或 ~/.config/<prog>/
-    _CONFIG_DIR = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
-        os.path.expanduser("~"), ".config", PROGRAM_NAME
-    )
 
 # 当前选中的镜像源（单条记录）
 MIRRORS_CONFIG_FILE = os.path.join(_CONFIG_DIR, "mirror.json")

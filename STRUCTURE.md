@@ -29,6 +29,9 @@ proot_distro/
   dirfd.py  statedir.py  atomic.py  locking.py  paths.py        Safe filesystem layer
   guestfile.py  l2s.py  shm.py  sysdata.py  session.py         Container runtime state
   arch.py  compress.py                                          CPU/emulator and zstd knowledge
+  i18n.py  config.py  autohold.py                               Fork: JSON translations, user prefs (config.json), first-run apt-mark hold guard
+  mirrors.py                                                    Fork: registry mirror table + probing
+  locales/<locale>.json                                         Fork: flat {source: translated} dicts, no compile step
 ```
 
 ### Entry and dispatch

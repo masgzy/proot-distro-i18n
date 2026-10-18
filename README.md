@@ -205,34 +205,60 @@ proot-distro mirror unset
 
 ## 国际化（i18n）
 
-### 语言切换
-
-**默认中文**。通过 `PD_LANG` 环境变量切英文：
+### lang 子命令（推荐）
 
 ```bash
-# 临时切英文
-PD_LANG=en proot-distro mirror ls
-
-# 永久切英文（写入 ~/.bashrc）
-export PD_LANG=en
-
-# 切回中文
-export PD_LANG=zh
-# 或直接 unset
-unset PD_LANG
+proot-distro lang get          # 显示当前生效语言及来源（配置文件/环境变量/默认）
+proot-distro lang use zh_CN    # 持久化设置语言（写入配置文件，立即生效）
+proot-distro lang use en       # 切英文，写法等价：en / en_US / C / POSIX
+proot-distro lang list         # 列出所有已内置翻译的 locale
+proot-distro lang reset        # 清除偏好，回退默认逻辑
 ```
 
-**语言探测策略**（v7 调整，适配 Termux 无 GNU locale 支持）：
+locale 写法随意：`zh`、`zh-CN`、`zh_CN.UTF-8` 自动规范化为 `zh_CN`；`C`、`POSIX`、`en_US` 自动规范化为 `en`。
 
-- **只看 `PD_LANG`**：`PD_LANG=en` / `C` / `POSIX` → 英文；`PD_LANG=zh` / `zh_CN` / 任何含 `zh` 的值 → 中文
-- **默认中文**：不设 `PD_LANG` 就是中文
+配置文件位置：桌面 Linux 在 `~/.config/proot-distro/config.json`（或 `$XDG_CONFIG_HOME/proot-distro/config.json`）的 `language` 键；Termux 在 `$PREFIX/etc/proot-distro/config.json`。
+
+### 语言来源优先级
+
+```
+--lang 标志  >  PROOT_DISTRO_LANG 环境变量  >  PD_LANG 环境变量  >  配置文件  >  默认 zh_CN
+```
+
+| 方式 | 作用 | 场景 |
+|---|---|---|
+| `proot-distro --lang en install debian` | 单次覆盖，最高优先级 | 临时换语言跑一条命令 |
+| `export PROOT_DISTRO_LANG=en` | 会话级 / 脚本级 | 脚本里固定语言 |
+| `export PD_LANG=en` | 同上（历史兼容） | 老脚本不用改 |
+| `proot-distro lang use en` | 持久化到配置文件 | 长期偏好（推荐） |
+| （什么都不做） | 默认中文 | 本 fork 面向中文用户 |
+
+`--lang` 写在顶层或子命令后都行（`pd --lang en list` / `pd list --lang en`）。环境变量压过配置文件时，`lang use` / `lang reset` / `lang get` 会提醒你先 `unset`。
+
+### 为什么默认中文 / 为什么需要 lang 子命令
+
+Termux 的 locale 支持是残缺的：`LANG` 通常为 `C` 或未设置，Android 也不会把用户真实语言上报给终端应用——**任何**基于系统 locale 的自动语言检测都行不通。一个显式的、持久化的 `proot-distro lang use zh_CN` 直接解决这个痛点；`lang get` 能告诉你当前语言到底来自哪一级。
+
+**语言探测策略**（v7 起适配 Termux 无 GNU locale 支持）：
+
 - **不看 `LC_ALL` / `LC_MESSAGES` / `LANG`**：Termux/Android 上这些变量要么未设、要么是 `C`，不可靠
+- **默认中文**：不设置任何来源时就是中文
+- 任何一级的值无法识别时跳过该级、继续向下探测
 
-历史：v1-v6 会按 `PD_LANG > LC_ALL > LC_MESSAGES > LANG` 探测，导致 Termux 默认环境（`LANG=C`）下显示英文。v7 改为只看 `PD_LANG`，默认中文。
+### 翻译格式：纯 JSON，免编译
+
+翻译以**扁平 JSON** 分发：`proot_distro/locales/zh_CN.json`，即 `{原文: 译文}` 字典——唯一的翻译源文件，没有 gettext、没有 `.po`、没有编译步骤。编辑即生效，pip 安装时随包分发。
+
+```json
+{
+  "Container list is empty.": "容器列表为空。",
+  "Adding: '{arc}'": "添加: '{arc}'"
+}
+```
 
 ### 翻译覆盖
 
-- **CLI 输出/错误**：201 条 msgid 全部译为中文
+- **CLI 输出/错误**：256 条翻译（JSON）
 - **help pages**：`pages.py`（中文）+ `pages_en.py`（英文），按语言切换
 - **shell 补全**：bash/fish/zsh 三脚本注释与描述全中文
 - **section 标签**：用法/描述/选项/示例 + USAGE/DESCRIPTION/OPTIONS/EXAMPLES 双语
@@ -254,13 +280,19 @@ unset PD_LANG
 | layer / manifest | 层 / 清单 |
 | Warning / Error | 警告 / 错误 |
 
-### 重新编译翻译
+## 防 apt 升级覆盖（首次运行守护）
 
-修改 `.po` 后重新编译 `.mo`：
+本 fork 通过 pip 安装，入口脚本与官方 apt 包 `proot-distro` 的路径相同（`$PREFIX/bin/proot-distro`）。`apt upgrade` 会把入口换回官方 Bash 版，i18n 版静默消失。
 
-```bash
-python3 compile_mo.py
-```
+首次**成功**运行后，程序会自动检测：
+
+- 官方 apt 包已安装、且尚未被 hold、且当前入口确实是被 pip 版覆盖的 Python 脚本 —— 三者同时成立时执行 `apt-mark hold proot-distro`，防止 `apt upgrade` 覆盖，并打印提醒。
+
+任何条件不满足就静默跳过，绝不碰你的包状态（比如你只在用官方版时）。
+
+- **想回官方版**：`apt-mark unhold proot-distro && apt install --reinstall proot-distro`
+- **不想要这个检测**：`export PD_NO_AUTO_HOLD=1`
+- 检测只做一次（标记文件 `$PREFIX/var/lib/proot-distro/.autohold-checked`）
 
 ## 性能优化
 
@@ -400,11 +432,12 @@ proot-distro 不应在 proot 内运行。如果你已经在 proot 容器里，�
 proot-distro-i18n/
 ├── proot-distro.py            # 入口脚本
 ├── pyproject.toml             # 项目配置
-├── compile_mo.py              # .po → .mo 编译器
 ├── proot_distro/
 │   ├── __init__.py
 │   ├── cli.py                 # CLI 入口
-│   ├── i18n.py                # 国际化基础设施
+│   ├── i18n.py                # 国际化基础设施（JSON 翻译加载）
+│   ├── config.py              # 用户偏好配置（config.json）
+│   ├── autohold.py            # 首次运行守护（apt-mark hold）
 │   ├── mirrors.py             # 镜像源表 + 配置读写 + 探测
 │   ├── message.py             # 消息输出 + 颜色
 │   ├── parser.py              # argparse 构建
@@ -423,18 +456,10 @@ proot-distro-i18n/
 │   │   └── docker/            # Docker registry 实现
 │   ├── completions/           # shell 补全（bash/fish/zsh）
 │   └── locales/
-│       └── zh_CN/LC_MESSAGES/
-│           ├── proot_distro.po   # 翻译源
-│           └── proot_distro.mo   # 编译产物
+│       └── zh_CN.json         # 中文翻译（纯 JSON，免编译）
 ├── tests/                     # 测试套件
 └── .github/                   # CI/CD 配置
 ```
-
-### 工具脚本
-
-| 文件 | 用途 |
-|---|---|
-| `compile_mo.py` | 纯 Python `.po → .mo` 编译器（项目根目录） |
 
 ### 添加新镜像源
 
@@ -473,8 +498,9 @@ proot-distro-i18n/
 ### 添加新翻译
 
 1. 在源码里用 `_("...")` 包裹字符串
-2. 在 `proot_distro/locales/zh_CN/LC_MESSAGES/proot_distro.po` 里添加 `msgid` + `msgstr`
-3. 运行 `python3 compile_mo.py` 重新编译 `.mo`
+2. 在 `proot_distro/locales/zh_CN.json` 里添加 `"原文": "译文"`（无编译，保存即生效）
+3. 新增语言：复制一份 `zh_CN.json` 改名为 `<locale>.json`（如 `ja.json`），翻译后在
+   `proot_distro/i18n.py` 的 `AVAILABLE_LANGUAGES` 里登记一行，`lang list` / `lang use` 即可识别
 
 ## 许可证
 
