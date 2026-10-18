@@ -43,6 +43,7 @@ from __future__ import annotations
 import json
 import os
 
+from proot_distro.atomic import atomic_write
 from proot_distro.constants import IS_TERMUX, PROGRAM_NAME, TERMUX_PREFIX
 
 __all__ = (
@@ -93,6 +94,10 @@ def save_user_config(update: dict, *, remove_keys: tuple = ()) -> dict:
     *update* 中的键覆盖旧值（值为 None 的键会被删除——与
     ``remove_keys`` 效果相同，方便调用方直接传 None 表达"清除"）；
     其他已有键原样保留。目录不存在时自动创建。
+
+    写入走项目统一的 ``atomic_write``：临时名按进程唯一（mkstemp），
+    并发的两个写入者不会像旧的固定 ``config.json.tmp`` 方案那样
+    互相截断对方的临时文件；重命名发布，读侧永远看不到半截 JSON。
     """
     data = load_user_config()
     for key, value in update.items():
@@ -103,12 +108,9 @@ def save_user_config(update: dict, *, remove_keys: tuple = ()) -> dict:
     for key in remove_keys:
         data.pop(key, None)
 
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    tmp_path = CONFIG_FILE + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as fh:
+    with atomic_write(CONFIG_FILE, "w", encoding="utf-8") as fh:
         json.dump(data, fh, ensure_ascii=False, indent=2, sort_keys=True)
         fh.write("\n")
-    os.replace(tmp_path, CONFIG_FILE)
     return data
 
 

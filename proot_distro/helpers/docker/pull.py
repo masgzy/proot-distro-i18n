@@ -696,7 +696,7 @@ def _pull_layers(image_ref, rootfs_fd, arch, insecure,
                      f"{i + 1}/{n_layers}{size_str}...")
             try:
                 layer_fd = download_blob(
-                    repo, digest, token or "", base, insecure
+                    repo, digest, token or "", base, insecure, size=size
                 )
             except NETWORK_ERRORS as dl_err:
                 # Read the same way as the two nets above: an HTTPError

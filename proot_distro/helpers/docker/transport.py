@@ -531,6 +531,82 @@ def _require_usable_realm(realm: str, registry: str, insecure: bool) -> None:
     )
 
 
+def _probe_and_redeem(op, *, insecure: bool, host: str, repo: str,
+                      actions: str, basic_auth: str,
+                      label: "str | None" = None) -> tuple:
+    """/v2/ probe → Bearer dance shared by get_auth_token's two branches.
+
+    Probes ``{scheme}://{host}/v2/`` (HTTPS first, stepping down to HTTP
+    only for an HTTP-only registry under --allow-insecure) and answers
+    what the registry's challenge asks for:
+
+      * an open registry: ``("", base)`` — no token required;
+      * a non-Bearer 401 (e.g. Basic): ``("", base)`` — the caller's next
+        request surfaces a clearer error;
+      * a Bearer challenge: the token redeemed at the realm it names.
+
+    *host* is the bare netloc the probe is addressed to. *label* names
+    the registry in user-facing messages; None (the mirror path) derives
+    it from the current scheme, so a scheme switch re-labels the error.
+    """
+    scheme = "https"
+    while True:
+        base = f"{scheme}://{host}"
+        shown = label if label is not None else base
+        probe_req = new_request(f"{base}/v2/", headers=_ua())
+        try:
+            _request_body(op.open, probe_req, f"Probing {base}/v2/")
+            return "", base  # registry is wide open; no token required
+        except urllib.error.HTTPError as exc:
+            if exc.code != 401:
+                raise
+            www_auth = exc.headers.get("WWW-Authenticate", "")
+            if not www_auth.lower().startswith("bearer "):
+                return "", base
+            params = _parse_bearer_challenge(www_auth.split(" ", 1)[1])
+            realm = params.get("realm", "")
+            if not realm:
+                return "", base
+            _require_usable_realm(realm, shown, insecure)
+            service = params.get("service", "")
+            qs_parts = []
+            if service:
+                qs_parts.append(
+                    f"service={urllib.parse.quote(service, safe='')}"
+                )
+            qs_parts.append(f"scope=repository:{repo}:{actions}")
+            sep = "&" if "?" in realm else "?"
+            token_req = new_request(
+                f"{realm}{sep}{'&'.join(qs_parts)}", headers=_ua()
+            )
+            if basic_auth:
+                token_req.add_header("Authorization", basic_auth)
+            what = "Requesting auth token"
+            data = decode_json_object(
+                _request_body(op.open, token_req, what), what,
+            )
+            return _grant_token(data, what), base
+        except urllib.error.URLError as exc:
+            # The server speaks TLS but its certificate is untrusted. Only
+            # reachable when enforcing HTTPS (the insecure opener skips
+            # verification, so no cert error occurs there).
+            if not insecure and is_cert_verification_error(exc):
+                raise RuntimeError(certificate_error_msg(shown)) from exc
+            # The registry answered the HTTPS probe with plaintext (or only
+            # responds over plain HTTP): it is HTTP-only. Two signals,
+            # cheapest first — the handshake error itself (WRONG_VERSION_NUMBER
+            # and friends), else an active HTTP re-probe.
+            if scheme == "https" and (
+                is_plaintext_http_tls_error(exc)
+                or _http_registry_reachable(host)
+            ):
+                if insecure:
+                    scheme = "http"  # retry the whole probe over plain HTTP
+                    continue
+                raise RuntimeError(insecure_registry_msg(shown)) from exc
+            raise
+
+
 def get_auth_token(
     repo: str, registry: str = "", actions: str = "pull",
     insecure: bool = False,
@@ -580,9 +656,7 @@ def get_auth_token(
         #    避免把 registry.docker.io 的 token 交给校验 service 字段
         #    的镜像源时出现的 "Unauthorized" 错误。
         base = _resolve_registry_url()
-        is_official_hub = base.rstrip("/").endswith("registry-1.docker.io")
-
-        if is_official_hub:
+        if base.rstrip("/").endswith("registry-1.docker.io"):
             # 标准 Docker Hub 认证流程（官方实现）。
             url = (
                 f"{AUTH_URL}?service=registry.docker.io"
@@ -602,128 +676,24 @@ def get_auth_token(
             )
             return _grant_token(data, what), REGISTRY_URL
 
-        # 镜像源：探测 /v2/ 发现认证要求。
+        # 镜像源：探测 /v2/ 发现认证要求（与自定义 registry 共用一套
+        # 探测/换取逻辑，见 _probe_and_redeem）。
         op = opener(insecure)
-        scheme = "https"
-        while True:
-            probe_base = f"{scheme}://{urllib.parse.urlparse(base).netloc}"
-            probe_req = new_request(f"{probe_base}/v2/", headers=_ua())
-            try:
-                _request_body(op.open, probe_req, f"Probing {probe_base}/v2/")
-                # 镜像源接受匿名请求 —— 无需 token。
-                return "", probe_base
-            except urllib.error.HTTPError as exc:
-                if exc.code != 401:
-                    raise
-                www_auth = exc.headers.get("WWW-Authenticate", "")
-                if not www_auth.lower().startswith("bearer "):
-                    # 非 Bearer 质询（如 Basic）—— 返回空 token；
-                    # 调用方重试时会得到更明确的错误。
-                    return "", probe_base
-                # Bearer 质询：到镜像源自己的 realm（而非
-                # auth.docker.io）换取 token。
-                params = _parse_bearer_challenge(
-                    www_auth.split(" ", 1)[1]
-                )
-                realm = params.get("realm", "")
-                if not realm:
-                    return "", probe_base
-                _require_usable_realm(realm, probe_base, insecure)
-                service = params.get("service", "")
-                qs_parts = []
-                if service:
-                    qs_parts.append(
-                        f"service={urllib.parse.quote(service, safe='')}"
-                    )
-                qs_parts.append(f"scope=repository:{repo}:{actions}")
-                sep = "&" if "?" in realm else "?"
-                token_req = new_request(
-                    f"{realm}{sep}{'&'.join(qs_parts)}", headers=_ua()
-                )
-                if basic_auth:
-                    token_req.add_header("Authorization", basic_auth)
-                what = "Requesting auth token"
-                data = decode_json_object(
-                    _request_body(op.open, token_req, what), what,
-                )
-                return _grant_token(data, what), probe_base
-            except urllib.error.URLError as exc:
-                if not insecure and is_cert_verification_error(exc):
-                    raise RuntimeError(
-                        certificate_error_msg(probe_base)
-                    ) from exc
-                if scheme == "https" and (
-                    is_plaintext_http_tls_error(exc)
-                    or _http_registry_reachable(urllib.parse.urlparse(base).netloc)
-                ):
-                    if insecure:
-                        scheme = "http"
-                        continue
-                    raise RuntimeError(
-                        insecure_registry_msg(probe_base)
-                    ) from exc
-                raise
+        return _probe_and_redeem(
+            op, insecure=insecure,
+            host=urllib.parse.urlparse(base).netloc,
+            repo=repo, actions=actions, basic_auth=basic_auth,
+        )
 
     # Custom registry: probe /v2/ to resolve the scheme and discover the
     # Bearer realm. Registries serving public images still require this dance —
     # they answer 401 to unauthenticated requests and embed the token endpoint
     # in the challenge.
     op = opener(insecure)
-    scheme = "https"
-    while True:
-        base = f"{scheme}://{registry}"
-        probe_req = new_request(f"{base}/v2/", headers=_ua())
-        try:
-            _request_body(op.open, probe_req, f"Probing {base}/v2/")
-            return "", base  # registry is wide open; no token required
-        except urllib.error.HTTPError as exc:
-            if exc.code != 401:
-                raise
-            www_auth = exc.headers.get("WWW-Authenticate", "")
-            if not www_auth.lower().startswith("bearer "):
-                return "", base
-            params = _parse_bearer_challenge(www_auth.split(" ", 1)[1])
-            realm = params.get("realm", "")
-            if not realm:
-                return "", base
-            _require_usable_realm(realm, registry, insecure)
-            service = params.get("service", "")
-            qs_parts = []
-            if service:
-                qs_parts.append(
-                    f"service={urllib.parse.quote(service, safe='')}"
-                )
-            qs_parts.append(f"scope=repository:{repo}:{actions}")
-            sep = "&" if "?" in realm else "?"
-            token_req = new_request(
-                f"{realm}{sep}{'&'.join(qs_parts)}", headers=_ua()
-            )
-            if basic_auth:
-                token_req.add_header("Authorization", basic_auth)
-            what = "Requesting auth token"
-            data = decode_json_object(
-                _request_body(op.open, token_req, what), what,
-            )
-            return _grant_token(data, what), base
-        except urllib.error.URLError as exc:
-            # The server speaks TLS but its certificate is untrusted. Only
-            # reachable when enforcing HTTPS (the insecure opener skips
-            # verification, so no cert error occurs there).
-            if not insecure and is_cert_verification_error(exc):
-                raise RuntimeError(certificate_error_msg(registry)) from exc
-            # The registry answered the HTTPS probe with plaintext (or only
-            # responds over plain HTTP): it is HTTP-only. Two signals,
-            # cheapest first — the handshake error itself (WRONG_VERSION_NUMBER
-            # and friends), else an active HTTP re-probe.
-            if scheme == "https" and (
-                is_plaintext_http_tls_error(exc)
-                or _http_registry_reachable(registry)
-            ):
-                if insecure:
-                    scheme = "http"  # retry the whole probe over plain HTTP
-                    continue
-                raise RuntimeError(insecure_registry_msg(registry)) from exc
-            raise
+    return _probe_and_redeem(
+        op, insecure=insecure, host=registry, label=registry,
+        repo=repo, actions=actions, basic_auth=basic_auth,
+    )
 
 
 def auth_note(prefix_space: bool = True) -> str:
