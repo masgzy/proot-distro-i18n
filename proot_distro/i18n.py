@@ -258,14 +258,19 @@ def _(s: str, *args, **kwargs) -> str:
     支持 ``str.format`` 风格的占位符。如果 *s* 不在翻译表中，
     直接返回 *s* 本身（与 gettext NullTranslations 行为一致）。
 
-    为了避免热路径上每次都做属性查找，这里用一次 ``lru_cache`` 间接
-    拿到翻译表再查。
+    格式化带安全网：译文里若混入了无法匹配的占位符（手工编辑时
+    多写了一个 ``{`` 之类），``str.format`` 抛出的 KeyError 会让整
+    条命令崩掉——这里拦住并退回未格式化的译文，坏占位符顶多显示
+    出来，不致命。
     """
     if not s:
         return s
     translated = _table().get(s, s)
     if args or kwargs:
-        return translated.format(*args, **kwargs)
+        try:
+            return translated.format(*args, **kwargs)
+        except (KeyError, IndexError, ValueError):
+            return translated
     return translated
 
 

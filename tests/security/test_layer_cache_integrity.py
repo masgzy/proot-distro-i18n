@@ -77,7 +77,7 @@ def test_pull_refetches_a_poisoned_cached_layer(tmp_path, builders,
 
     called = []
 
-    def fake_download(repo, dg, token, base, insecure=False):
+    def fake_download(repo, dg, token, base, insecure=False, size=0):
         called.append(dg)
         with open(layer_cache_path(dg), "wb") as fh:
             fh.write(good)
@@ -247,7 +247,7 @@ def test_download_blob_does_not_trust_a_cached_name(builders, monkeypatch):
 
     served = []
 
-    def _open(req):
+    def _open(req, *a, **k):
         served.append(req.full_url)
         return _Resp(good, ct="application/octet-stream")
 

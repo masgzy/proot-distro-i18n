@@ -127,8 +127,7 @@ def _action_get() -> int:
          else lang))
     msg()
     log_info(_("Change it with `{cmd} lang use <locale>`, list choices "
-               "with `{cmd} lang list`.",
-               cmd=PROGRAM_NAME, cmd2=PROGRAM_NAME))
+               "with `{cmd} lang list`.", cmd=PROGRAM_NAME))
     msg()
     return 0
 
@@ -176,7 +175,7 @@ def _action_list() -> int:
     msg()
     log_info(_("Default: {code}. Use `{cmd} lang use <locale>` to switch, "
                "`{cmd} lang reset` to clear.",
-              code=DEFAULT_LANGUAGE, cmd=PROGRAM_NAME, cmd2=PROGRAM_NAME))
+              code=DEFAULT_LANGUAGE, cmd=PROGRAM_NAME))
     msg()
     return 0
 
