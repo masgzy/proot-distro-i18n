@@ -33,6 +33,10 @@ EXPECTED_HASH=${1:-${EXPECTED_HASH:-}}
 # conftest). `lang get` in T4c proves the language machinery itself.
 export PD_LANG=en
 export PD_BUILD_HASH="$EXPECTED_HASH"
+# Pin the official registry: the fork defaults to a mirror when no
+# config exists, and mirrors 401 on images they have not cached --
+# exactly what T5a must not depend on.
+export PD_REGISTRY_URL="https://registry-1.docker.io"
 
 echo "== T0: this really is the Termux environment =="
 if [ -x "$PREFIX/bin/sh" ] && [ -x /system/bin/linker64 ]; then
