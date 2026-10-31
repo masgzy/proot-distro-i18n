@@ -38,7 +38,7 @@ import sys
 from proot_distro.constants import IS_TERMUX, PROGRAM_NAME
 from proot_distro.i18n import _, set_language, normalize_locale, SOURCE_FLAG
 from proot_distro.message import C, msg, set_quiet, crit_error
-from proot_distro.arch import get_proot_bin
+from proot_distro.arch import find_proot_bin, get_proot_bin
 from proot_distro.parser import (
     ALIAS_TO_CANONICAL, build_parser, required_args_for,
 )
@@ -106,7 +106,9 @@ def _refuse_nested_proot() -> None:
 
     Single read of /proc/self/status; the TracerPid line is enough to
     decide. We avoid the second /proc/<pid>/status open when TracerPid
-    is 0 (the common case), short-circuiting the hot path.
+    is 0 (the common case), short-circuiting the hot path. The tracer
+    name test is a substring match, so an nproot parent (its Name is
+    "nproot") is caught by the same check as a stock proot one.
 
     Defensive parsing: if /proc/self/status is malformed (TracerPid line
     missing or non-numeric), we skip the check rather than crashing.
@@ -156,7 +158,8 @@ def ensure_proot_installed() -> None:
     """Verify proot is usable; offer to install it on Termux (TTY only).
 
     A PD_PROOT_BIN override is validated by get_proot_bin() and nothing
-    else is probed; without one, proot must be on PATH.
+    else is probed; without one, an nproot or proot must be on PATH
+    (see arch.find_proot_bin for the preference order).
 
     Exits the process when proot is unavailable and cannot be installed
     (or the user declines the offer). Shared by the startup probe and by
@@ -167,11 +170,11 @@ def ensure_proot_installed() -> None:
         get_proot_bin()  # validates, crit_error()+exit(1) if bad
         return
 
-    if shutil.which("proot") is not None:
+    if find_proot_bin() is not None:
         return
 
     msg()
-    crit_error(_("proot utility does not exist on your system."))
+    crit_error(_("nproot or proot utility does not exist on your system."))
     msg()
 
     if not IS_TERMUX:

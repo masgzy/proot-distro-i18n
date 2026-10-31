@@ -209,6 +209,7 @@
   "no user '{user_spec}' defined in /etc/passwd.": "/etc/passwd 中未定义用户 '{user_spec}'。",
   "none (falls back to default)": "无（回退默认逻辑）",
   "not set (using default: {default})": "未设置 (使用默认: {default})",
+  "nproot or proot utility does not exist on your system.": "系统中未安装 nproot 或 proot 工具。",
   "option '--delete' needs a directory as the source.": "选项 '--delete' 需要一个目录作为源。",
   "original and new names must differ.": "原名称与新名称必须不同。",
   "output file path cannot be empty.": "输出文件路径不能为空。",

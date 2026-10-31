@@ -38,7 +38,7 @@ proot_distro/
 
 | Module | Role |
 | --- | --- |
-| `cli.py` | `main()`: routes SIGQUIT to `KeyboardInterrupt`, refuses nested proot, probes for `proot`, parses, validates required positionals, enables quiet mode, calls the handler from `_COMMAND_HANDLERS`. |
+| `cli.py` | `main()`: routes SIGQUIT to `KeyboardInterrupt`, refuses nested proot, probes for `nproot`/`proot` (nproot preferred, see arch.find_proot_bin), parses, validates required positionals, enables quiet mode, calls the handler from `_COMMAND_HANDLERS`. |
 | `parser.py` | `build_parser()` plus `ALIAS_TO_CANONICAL` and `required_args_for()`. Help is handled manually (`add_help=False`) so a missing positional renders the command's help page instead of an argparse error. Termux-only options exist only when `IS_TERMUX`. |
 | `commands/help/` | `pages.py` holds every help page as plain data, `render.py` lays them out (stacked on narrow terminals, two columns on wide ones), `__init__.py` exposes `HELP_COMMANDS`. |
 
@@ -114,7 +114,7 @@ Roughly bottom-up. Higher entries import lower ones.
 | `l2s.py` | Rewrite proot link2symlink targets after a rootfs moves. |
 | `shm.py`, `sysdata.py` | Host-side directories bound into the guest as `/dev/shm` and fake `/proc` / `/sys` files. `sysdata` rebuilds the fake `stat` and `uptime` from the host's `/proc/cpuinfo` at every login, so their CPU list matches it. |
 | `session.py` | Session registry: one JSON file per PID, liveness by inherited `flock`. |
-| `arch.py` | CPU detection, ELF probing, QEMU emulator selection, proot binary lookup. |
+| `arch.py` | CPU detection, ELF probing, QEMU emulator selection, proot binary lookup (`nproot` preferred over `proot`; `PD_PROOT_BIN` overrides). |
 | `compress.py` | Everything zstd (usable on Python >= 3.14 only) and the diagnostics when it is missing. |
 
 ## Runtime data layout

@@ -222,3 +222,74 @@ def test_proot_bin_override_is_made_absolute(tmp_path, monkeypatch):
     monkeypatch.setenv("PD_PROOT_BIN", "proot-static")
 
     assert arch.get_proot_bin() == str(proot)
+
+
+# ---------------------------------------------------------------------------
+# nproot preference — find_proot_bin() and its users
+# ---------------------------------------------------------------------------
+
+def _make_exec(tmp_path, name):
+    exe = tmp_path / name
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+    return exe
+
+
+def test_find_proot_bin_prefers_nproot(tmp_path, monkeypatch):
+    # nproot, the no-ptrace proot this tool targets, wins when both it
+    # and the stock proot are installed.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _make_exec(bin_dir, "proot")
+    nproot = _make_exec(bin_dir, "nproot")
+    monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.delenv("PD_PROOT_BIN", raising=False)
+
+    assert arch.find_proot_bin() == str(nproot)
+    assert arch.get_proot_bin() == str(nproot)
+
+
+def test_find_proot_bin_falls_back_to_proot(tmp_path, monkeypatch):
+    # Only the stock proot: the answer is unchanged from upstream.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    proot = _make_exec(bin_dir, "proot")
+    monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.delenv("PD_PROOT_BIN", raising=False)
+
+    assert arch.find_proot_bin() == str(proot)
+    assert arch.get_proot_bin() == str(proot)
+
+
+def test_find_proot_bin_answers_none_on_empty_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    monkeypatch.delenv("PD_PROOT_BIN", raising=False)
+
+    assert arch.find_proot_bin() is None
+
+
+def test_proot_bin_override_beats_nproot(tmp_path, monkeypatch):
+    # PD_PROOT_BIN stays the explicit, highest-priority choice even when
+    # an nproot sits on PATH.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _make_exec(bin_dir, "nproot")
+    custom = _make_exec(tmp_path, "my-proot")
+    monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.setenv("PD_PROOT_BIN", str(custom))
+
+    assert arch.get_proot_bin() == str(custom)
+
+
+def test_proot_bin_missing_names_both_candidates(tmp_path, monkeypatch,
+                                                 capsys):
+    # The refusal names what it looked for, so a user with only the
+    # no-ptrace fork in mind is not told to install an unrelated tool.
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    monkeypatch.delenv("PD_PROOT_BIN", raising=False)
+
+    with pytest.raises(SystemExit) as exc:
+        arch.get_proot_bin()
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "nproot or proot" in err

@@ -223,12 +223,39 @@ _QEMU_PKGS = {
 }
 
 
+# The proot-compatible cores this tool can drive, most preferred first.
+# nproot (https://github.com/masgzy/nproot) is a drop-in proot fork that
+# runs guests without ptrace; when it is installed it wins over the stock
+# "proot". Either binary speaks the same command line (the option table
+# is inherited from the termux/proot base), so no other code path needs
+# to know which one was picked. PD_PROOT_BIN overrides both.
+PROOT_BIN_NAMES = ("nproot", "proot")
+
+
+def find_proot_bin():
+    """Return the absolute path of a proot-compatible binary, or None.
+
+    Each name in PROOT_BIN_NAMES is looked up on PATH in order, so an
+    installed nproot is preferred over the stock proot and a system with
+    only one of the two works unchanged. The answer is absolute for the
+    same reason get_proot_bin() gives; None means nothing usable is on
+    PATH, and the caller decides how to report that (the startup probe
+    offers the Termux package, the exec backstop exits).
+    """
+    for name in PROOT_BIN_NAMES:
+        found = shutil.which(name)
+        if found:
+            return os.path.abspath(found)
+    return None
+
+
 def get_proot_bin() -> str:
     """Return the absolute path of the proot executable, or exit.
 
     A set PD_PROOT_BIN is validated like --emulator: it must point at an
     existing, executable file, or the process exits with an error.
-    Unset falls back to the PATH lookup for "proot".
+    Unset falls back to find_proot_bin(): nproot when installed, else
+    the stock "proot".
 
     The answer is always absolute, and a lookup that finds nothing is a
     refusal rather than the bare name "proot". Both callers hand this
@@ -252,9 +279,10 @@ def get_proot_bin() -> str:
                          "executable.", override=override))
             sys.exit(1)
         return os.path.abspath(override)
-    found = shutil.which("proot")
+    found = find_proot_bin()
     if not found:
-        crit_error("proot utility does not exist on your system.")
+        crit_error(_("nproot or proot utility does not exist on your "
+                     "system."))
         sys.exit(1)
     return os.path.abspath(found)
 
