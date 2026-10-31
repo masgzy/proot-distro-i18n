@@ -98,7 +98,9 @@ jobs:
           # the user-tests step inherits the built runtime.
           echo "/tmp/proot-src/src" >> "$GITHUB_PATH"
           export PATH="/tmp/proot-src/src:$PATH"
-          proot --help >/dev/null 2>&1 || true
+          # find_proot_bin() probes the system bin dirs *before* PATH, so
+          # /usr/bin/proot would win without an explicit override.
+          export PD_PROOT_BIN="/tmp/proot-src/src/proot"
           RUN_LIVE_TESTS=1 python -m pytest -q tests/live
 
       - name: User tests
@@ -108,6 +110,9 @@ jobs:
           set -Eeuo pipefail
 
           PD=(./proot-distro.py)
+          # Same override as the live step: use the freshly built proot,
+          # not Ubuntu's 5.1.0 that cannot run a modern kernel session.
+          export PD_PROOT_BIN="/tmp/proot-src/src/proot"
           WORKDIR="$(mktemp -d)"
           export XDG_DATA_HOME="${WORKDIR}/data"
           export XDG_CACHE_HOME="${WORKDIR}/cache"
