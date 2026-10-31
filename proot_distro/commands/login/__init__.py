@@ -310,6 +310,11 @@ def _build_termux_env(container_name, extra_env, minimal, isolated):
     if IS_TERMUX:
         env["PROOT_TMP_DIR"] = _resolve_proot_tmp_dir()
 
+    # Which runtime the session actually rides on (nproot or proot):
+    # scripts inside the container branch on this instead of poking at
+    # /proc/$PPID. extra_env still wins, being the user's explicit word.
+    env["PD_CONTAINER_RUNTIME"] = os.path.basename(get_proot_bin())
+
     for entry in extra_env:
         key, _, val = entry.partition("=")
         if key:
@@ -360,6 +365,9 @@ def _build_normal_env(container_name, login_user, login_home,
     # where proot itself may write.
     if IS_TERMUX:
         env["PROOT_TMP_DIR"] = _resolve_proot_tmp_dir()
+
+    # Same in-container runtime marker as the termux builder.
+    env["PD_CONTAINER_RUNTIME"] = os.path.basename(get_proot_bin())
 
     for entry in extra_env:
         key, _, val = entry.partition("=")

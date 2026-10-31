@@ -236,3 +236,51 @@ def test_inject_profile_writes_a_byte_that_is_not_utf8_as_that_byte(
     login_env.inject_termux_profile(str(root), {"X": "a\udcffb"})
     content = (root / "etc" / "profile.d" / "termux-profile.sh").read_bytes()
     assert b"export X='a\xffb'" in content
+
+
+# --- PD_CONTAINER_RUNTIME ----------------------------------------------------
+#
+# Which runtime the session rides on (nproot vs proot), exported so
+# scripts inside the container can branch without poking /proc/$PPID.
+
+import proot_distro.commands.login as _login_command
+
+
+def _fake_runtime(tmp_path, name="my-nproot"):
+    fake = tmp_path / name
+    fake.write_text("#!/bin/sh\n")
+    fake.chmod(0o755)
+    return str(fake)
+
+
+def test_env_carries_container_runtime(builders, tmp_path, monkeypatch):
+    builders.make_container("box")
+    monkeypatch.setenv("PD_PROOT_BIN", _fake_runtime(tmp_path))
+
+    env = _login_command._build_termux_env("box", [], minimal=False,
+                                           isolated=False)
+    assert env["PD_CONTAINER_RUNTIME"] == "my-nproot"
+
+    env = _login_command._build_normal_env("box", "root", "/root", [],
+                                           minimal=False, isolated=False)
+    assert env["PD_CONTAINER_RUNTIME"] == "my-nproot"
+
+
+def test_container_runtime_override_wins(builders, tmp_path, monkeypatch):
+    builders.make_container("box")
+    monkeypatch.setenv("PD_PROOT_BIN", _fake_runtime(tmp_path))
+    env = _login_command._build_termux_env(
+        "box", ["PD_CONTAINER_RUNTIME=custom"],
+        minimal=False, isolated=False)
+    assert env["PD_CONTAINER_RUNTIME"] == "custom"
+
+
+def test_container_runtime_is_a_bare_name(builders, tmp_path, monkeypatch):
+    # Whatever PD_PROOT_BIN names, the guest only learns the basename:
+    # host paths must not leak into the container.
+    builders.make_container("box")
+    monkeypatch.setenv("PD_PROOT_BIN", _fake_runtime(tmp_path, "weird-bin"))
+    env = _login_command._build_termux_env("box", [], minimal=False,
+                                           isolated=False)
+    assert env["PD_CONTAINER_RUNTIME"] == "weird-bin"
+    assert "/" not in env["PD_CONTAINER_RUNTIME"]
