@@ -87,7 +87,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends libtalloc-dev python3-dev
           git clone --depth 1 https://github.com/proot-me/proot.git \
               /tmp/proot-src
-          make -C /tmp/proot-src/src -j"$(nproc)" \
+          # WITHOUT_PYTHON: the runner has swig preinstalled, so the
+          # python extension would build too -- needless weight (and a
+          # libpython link) for what the suites need.
+          make -C /tmp/proot-src/src -j"$(nproc)" WITHOUT_PYTHON=1 \
             CPPFLAGS="-D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -I/tmp/proot-src/src" \
             LDFLAGS="-ltalloc"
           echo "/tmp/proot-src/src" >> "$GITHUB_PATH"
