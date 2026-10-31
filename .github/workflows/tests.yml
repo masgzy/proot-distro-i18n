@@ -88,7 +88,7 @@ jobs:
           git clone --depth 1 https://github.com/proot-me/proot.git \
               /tmp/proot-src
           make -C /tmp/proot-src/src -j"$(nproc)" \
-            CPPFLAGS="-D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE" \
+            CPPFLAGS="-D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -I/tmp/proot-src/src" \
             LDFLAGS="-ltalloc"
           echo "/tmp/proot-src/src" >> "$GITHUB_PATH"
           RUN_LIVE_TESTS=1 python -m pytest -q tests/live
