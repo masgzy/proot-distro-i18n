@@ -547,17 +547,16 @@ def _wait_for_step(proc, baseline) -> None:
         # between two children of its own -- the previous one reaped, the
         # next not forked yet -- shows an empty list for an instant, and
         # an orphan left behind by a finished subshell makes this branch
-        # fire on a step that is still going.  Give it one more poll to
-        # either exit or produce its next child before concluding it is
-        # over: a genuinely finished step returns here, one that was
-        # merely between children is caught by the children check at the
-        # top of the next round, and one blocked childless beyond that
-        # still ends up in _run_step's stop-and-grace tail below.
-        try:
-            proc.wait(timeout=_STEP_POLL_INTERVAL)
-            return
-        except subprocess.TimeoutExpired:
+        # fire on a step that is still going.  Look once more after a
+        # poll interval: a step that was merely between children has its
+        # next child by then and goes around, while one whose command is
+        # genuinely over stays childless for good -- that is the stand-in
+        # proot case this wait exists for, and it must return while the
+        # stand-in lives.
+        time.sleep(_STEP_POLL_INTERVAL)
+        if _children_of(proc.pid):
             continue
+        return
 
 
 def _signal_leftovers(targets, sig) -> None:
