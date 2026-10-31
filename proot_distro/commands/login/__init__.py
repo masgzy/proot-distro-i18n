@@ -50,6 +50,7 @@ from proot_distro.message import (
 )
 from proot_distro.arch import (
     detect_installed_arch,
+    find_proot_bin,
     get_device_cpu_arch,
     get_emulator_args,
     get_proot_bin,
@@ -312,8 +313,14 @@ def _build_termux_env(container_name, extra_env, minimal, isolated):
 
     # Which runtime the session actually rides on (nproot or proot):
     # scripts inside the container branch on this instead of poking at
-    # /proc/$PPID. extra_env still wins, being the user's explicit word.
-    env["PD_CONTAINER_RUNTIME"] = os.path.basename(get_proot_bin())
+    # /proc/$PPID.  Best effort and never fatal -- get_proot_bin()'s own
+    # validation runs later, before any exec -- so an environment with
+    # no runtime at all simply carries no marker.  extra_env still
+    # wins, being the user's explicit word.
+    override = os.path.expanduser(os.environ.get("PD_PROOT_BIN") or "")
+    found = override or find_proot_bin()
+    if found:
+        env["PD_CONTAINER_RUNTIME"] = os.path.basename(found)
 
     for entry in extra_env:
         key, _, val = entry.partition("=")
@@ -366,8 +373,12 @@ def _build_normal_env(container_name, login_user, login_home,
     if IS_TERMUX:
         env["PROOT_TMP_DIR"] = _resolve_proot_tmp_dir()
 
-    # Same in-container runtime marker as the termux builder.
-    env["PD_CONTAINER_RUNTIME"] = os.path.basename(get_proot_bin())
+    # Same in-container runtime marker as the termux builder, same
+    # best-effort, never-fatal lookup.
+    override = os.path.expanduser(os.environ.get("PD_PROOT_BIN") or "")
+    found = override or find_proot_bin()
+    if found:
+        env["PD_CONTAINER_RUNTIME"] = os.path.basename(found)
 
     for entry in extra_env:
         key, _, val = entry.partition("=")

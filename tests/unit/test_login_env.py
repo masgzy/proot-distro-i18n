@@ -284,3 +284,15 @@ def test_container_runtime_is_a_bare_name(builders, tmp_path, monkeypatch):
                                            isolated=False)
     assert env["PD_CONTAINER_RUNTIME"] == "weird-bin"
     assert "/" not in env["PD_CONTAINER_RUNTIME"]
+
+
+def test_container_runtime_is_best_effort(builders, monkeypatch):
+    # No runtime anywhere: the marker is simply absent and building the
+    # env must not exit -- get_proot_bin()'s fatal validation happens
+    # later, before any exec, and is not the env builder's business.
+    builders.make_container("box")
+    monkeypatch.delenv("PD_PROOT_BIN", raising=False)
+    monkeypatch.setattr(_login_command, "find_proot_bin", lambda: None)
+    env = _login_command._build_termux_env("box", [], minimal=False,
+                                           isolated=False)
+    assert "PD_CONTAINER_RUNTIME" not in env

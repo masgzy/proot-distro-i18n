@@ -36,8 +36,14 @@ else
 fi
 
 echo "== T1: bootstrap runtime (python + proot from the Termux repo) =="
+# pkg refuses to run as root and the docker container has no choice, so
+# fall back to plain apt, which has no such guard.  On a real Termux
+# user the first branch takes it as usual.
 if pkg update -y >"$LOG/pkg.log" 2>&1 \
    && pkg install -y python proot >>"$LOG/pkg.log" 2>&1; then
+    ok T1
+elif apt update >>"$LOG/pkg.log" 2>&1 \
+   && apt install -y python proot >>"$LOG/pkg.log" 2>&1; then
     ok T1
 else
     bad T1

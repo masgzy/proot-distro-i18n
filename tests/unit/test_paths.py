@@ -312,15 +312,30 @@ def test_overlap_resolves_the_prefix_above_the_rootfs(
     # O_NOFOLLOW. Point the walk at the alias so it plays that part.
     monkeypatch.setattr(statedir, "STATE_ROOTS", (str(aliased),))
 
-    src = paths.resolve_container_path("box:/data")
-    assert str(aliased) in src              # the alias really is in play
-    os.makedirs(src, exist_ok=True)
-    inner = os.path.join(real_containers, "box", "rootfs", "data", "in")
+    # container_dir()/container_rootfs()/container_manifest() memoise on
+    # the container name alone -- CONTAINERS_DIR is a process constant in
+    # a real run -- so make_container() above pinned the *real* spelling
+    # of every path helper.  Drop the memo before resolving through the
+    # alias, and again on the way out so the alias spelling cannot leak
+    # into later tests.
+    def _clear_container_path_caches():
+        for cached in (paths.container_dir, paths.container_rootfs,
+                       paths.container_manifest):
+            cached.cache_clear()
 
-    with pytest.raises(SystemExit) as exc:
-        paths.refuse_src_dest_overlap("box:/data", src, "inner", inner)
-    assert exc.value.code == 1
-    assert "into itself" in capsys.readouterr().err
+    _clear_container_path_caches()
+    try:
+        src = paths.resolve_container_path("box:/data")
+        assert str(aliased) in src              # the alias really is in play
+        os.makedirs(src, exist_ok=True)
+        inner = os.path.join(real_containers, "box", "rootfs", "data", "in")
+
+        with pytest.raises(SystemExit) as exc:
+            paths.refuse_src_dest_overlap("box:/data", src, "inner", inner)
+        assert exc.value.code == 1
+        assert "into itself" in capsys.readouterr().err
+    finally:
+        _clear_container_path_caches()
 
 
 def test_overlap_leaves_the_final_component_unresolved(tmp_path):
