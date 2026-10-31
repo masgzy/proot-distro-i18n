@@ -93,7 +93,12 @@ jobs:
           make -C /tmp/proot-src/src -j"$(nproc)" WITHOUT_PYTHON=1 \
             CPPFLAGS="-D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -I/tmp/proot-src/src" \
             LDFLAGS="-ltalloc"
+          # GITHUB_PATH only reaches *later* steps; the same-step pytest
+          # needs the export right here.  The GITHUB_PATH line stays so
+          # the user-tests step inherits the built runtime.
           echo "/tmp/proot-src/src" >> "$GITHUB_PATH"
+          export PATH="/tmp/proot-src/src:$PATH"
+          proot --help >/dev/null 2>&1 || true
           RUN_LIVE_TESTS=1 python -m pytest -q tests/live
 
       - name: User tests
