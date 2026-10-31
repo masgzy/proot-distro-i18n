@@ -62,6 +62,7 @@ from proot_distro.commands.kill import command_kill
 from proot_distro.commands.mirror import command_mirror
 from proot_distro.commands.search import command_search
 from proot_distro.commands.lang import command_lang
+from proot_distro.commands.version import command_version
 
 
 _COMMAND_HANDLERS = {
@@ -84,6 +85,7 @@ _COMMAND_HANDLERS = {
     "mirror":      command_mirror,
     "search":      command_search,
     "lang":        command_lang,
+    "version":     command_version,
     "help":        command_help,
 }
 
@@ -151,7 +153,7 @@ def _refuse_nested_proot() -> None:
 
 # Commands that never invoke proot — exempt from the proot-on-PATH
 # startup probe. Documented inline so future commands can opt in.
-_PROOT_EXEMPT_COMMANDS = frozenset({"build", "push", "kill", "ps", "mirror", "search", "lang", "help"})
+_PROOT_EXEMPT_COMMANDS = frozenset({"build", "push", "kill", "ps", "mirror", "search", "lang", "help", "version"})
 
 
 def ensure_proot_installed() -> None:
@@ -390,6 +392,15 @@ def main() -> None:
         "-h", "--help", "help", "hel", "he", "h"
     ):
         command_help()
+        sys.exit(0)
+
+    # Version short-circuit, parallel to the help one above: `pd -V`
+    # and `pd --version` render the version block before the proot
+    # probe, so a pristine system reports its identity instead of
+    # asking for a runtime it has not installed yet. The `version`
+    # subcommand reaches the same output through normal dispatch.
+    if len(sys.argv) >= 2 and sys.argv[1] in ("-V", "--version"):
+        command_version()
         sys.exit(0)
 
     raw_args = sys.argv[1:]

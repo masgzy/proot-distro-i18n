@@ -66,6 +66,7 @@ what the command takes (see `locking.py`).
 | `ps` | `ps.py` | List live sessions from the session registry. | none |
 | `kill` | `kill.py` | Tear down a session's whole process tree. | none |
 | `clear-cache` (`clear`, `cl`) | `clear_cache.py` | Delete the download cache, or only orphan blobs / the build index. The orphan and build-index sweeps refuse while another command holds an exclusive lock. | none taken; sweeps probe for held locks |
+| `version` (`v`, `ver`) | `version.py` | Print the fork version, 8-hex build hash (PD_BUILD_HASH > git probe > unknown), the resolved container runtime and the UI language. Exempt from the proot probe like `help`; pipe-safe stdout. | none |
 
 `login/` is split by concern:
 
@@ -233,7 +234,11 @@ for tars, OCI archives, ELF stubs and rootfs trees.
 
 CI (`tests.yml`) runs unit, integration, security and live tests on Python
 3.9, 3.11 and 3.13, plus an end-to-end shell script on pushes that installs
-Alpine, Debian and Ubuntu and exercises each command.
+Alpine, Debian and Ubuntu and exercises each command. A `termux-arm64` job
+boots the official `termux/termux-docker:aarch64` image on a native arm64
+runner with a read-only `/tmp` (the Android layout) and runs
+`.github/termux-smoke.sh`: version/hash assertions, help/list/lang, then a
+full Alpine install + login cycle against the real Termux userland.
 
 ## Adding things
 

@@ -113,6 +113,7 @@ ALIAS_TO_CANONICAL = {
     "cp": "copy",
     "mir": "mirror", "mr": "mirror",
     "s": "search", "se": "search",
+    "v": "version", "ver": "version",
     "h": "help", "he": "help", "hel": "help",
 }
 
@@ -224,6 +225,7 @@ def build_parser() -> _PdArgumentParser:
     _kill(sub)
     _mirror(sub)
     _lang(sub)
+    _version(sub)
 
     return parser
 
@@ -241,6 +243,13 @@ def _lang(sub):
     p.add_argument(
         "locale", nargs="?", default=None, metavar="LOCALE",
     )
+    p.add_argument("-h", "--help", action="store_true")
+
+
+def _version(sub):
+    # 版本与构建信息（本 fork 特有；顶层 -V/--version 也路由到它）
+    p = sub.add_parser("version", aliases=["v", "ver"], add_help=False)
+    p._pd_command = "version"
     p.add_argument("-h", "--help", action="store_true")
 
 

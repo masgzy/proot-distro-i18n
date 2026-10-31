@@ -1026,6 +1026,47 @@ HELP_PAGES = {
             },
         ],
     },
+    "version": {
+        "usage": "version",
+        "summary": (
+            "显示版本与构建信息（本 fork 特有；别名 v / ver，顶层 "
+            "-V / --version 亦路由至此）。\n\n"
+            "第一行是标识行: fork 名称、发行版版本与构建 hash（8 位 "
+            "git 短哈希，与 nproot --version 的取法一致），提 issue "
+            "时请附上它。\n\n"
+            "其余各行列出决定本机行为的关键事实: Python 版本、容器"
+            "运行时（PD_PROOT_BIN 覆盖 > nproot > proot）、界面语言。"
+            "排查「到底用的哪个 proot」时先看这里。"
+        ),
+        "options": [
+            ("-h, --help", "显示本帮助。"),
+        ],
+        "examples": [
+            f"{PROGRAM_NAME} version",
+            f"{PROGRAM_NAME} v",
+            f"{PROGRAM_NAME} --version",
+            f"{PROGRAM_NAME} -V",
+        ],
+        "footer": [
+            {
+                "title": "构建 hash 的来源",
+                "intro": (
+                    "优先级: PD_BUILD_HASH 环境变量（CI 产物可打点）> "
+                    "git 仓库短哈希（从安装位置向上探测 .git）> "
+                    "unknown（pip 轮子安装没有仓库信息）。任何一步"
+                    "失败都会静默降级，version 永远可用。"
+                ),
+            },
+            {
+                "title": "无需 proot",
+                "intro": (
+                    "version 与 help 一样豁免 proot 探测: 没装 proot/"
+                    "nproot 的干净系统上也能正常显示，运行时一栏会"
+                    "明确标注 not found。"
+                ),
+            },
+        ],
+    },
 }
 
 
@@ -1052,4 +1093,5 @@ TOP_COMMANDS = [
     ("search", "在 Docker Hub 上搜索镜像。"),
     ("mirror", "管理 Docker registry 镜像源（ls/test/use/unset/show）。"),
     ("lang", "查看与设置界面语言（get/use/list/reset）。"),
+    ("version", "显示版本与构建信息（v / ver / -V）。"),
 ]

@@ -1064,6 +1064,52 @@ HELP_PAGES = {
             },
         ],
     },
+    "version": {
+        "usage": "version",
+        "summary": (
+            "Show version and build information (fork-specific; "
+            "aliases v / ver, top-level -V / --version route here "
+            "too).\n\n"
+            "The first line is the identity line: fork name, release "
+            "version and the build hash (8-hex git short hash, same "
+            "convention as nproot --version). Attach it to bug "
+            "reports.\n\n"
+            "The remaining lines list the facts that decide local "
+            "behavior: Python version, container runtime (PD_PROOT_BIN "
+            "override > nproot > proot), UI language. When in doubt "
+            "about which proot is actually used, look here first."
+        ),
+        "options": [
+            ("-h, --help", "Show this help."),
+        ],
+        "examples": [
+            f"{PROGRAM_NAME} version",
+            f"{PROGRAM_NAME} v",
+            f"{PROGRAM_NAME} --version",
+            f"{PROGRAM_NAME} -V",
+        ],
+        "footer": [
+            {
+                "title": "WHERE THE BUILD HASH COMES FROM",
+                "intro": (
+                    "Priority: PD_BUILD_HASH env var (CI artifacts can "
+                    "stamp it) > short git hash (probed upward from the "
+                    "install location) > unknown (wheel installs carry "
+                    "no repository). Every failed step degrades "
+                    "silently; version always renders."
+                ),
+            },
+            {
+                "title": "WORKS WITHOUT PROOT",
+                "intro": (
+                    "version is exempt from the proot probe just like "
+                    "help: on a pristine system without proot/nproot it "
+                    "still renders, with the runtime line explicitly "
+                    "marked not found."
+                ),
+            },
+        ],
+    },
 }
 
 
@@ -1089,4 +1135,5 @@ TOP_COMMANDS = [
     ("search", "Search Docker Hub for images."),
     ("mirror", "Manage Docker registry mirrors (ls/test/use/unset/show)."),
     ("lang", "Show and set the UI language (get/use/list/reset)."),
+    ("version", "Show version and build information (v / ver / -V)."),
 ]

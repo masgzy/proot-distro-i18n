@@ -61,7 +61,7 @@ _proot_distro() {
     _init_completion || return
 
     local -r _all_commands="install search remove rename reset login list ps kill backup
-        restore clear-cache copy sync run build push mirror lang help"
+        restore clear-cache copy sync run build push mirror lang version help"
 
     # Complete the subcommand itself
     if [[ ${cword} -eq 1 ]]; then
@@ -380,8 +380,13 @@ _proot_distro() {
             ;;
 
         # -----------------------------------------------------------------------
+        version)
+            COMPREPLY=($(compgen -W "-h --help" -- "${cur}"))
+            ;;
+
+        # -----------------------------------------------------------------------
         help)
-            local topics="install search remove rename reset login list ps kill backup restore clear-cache copy sync run build push mirror lang"
+            local topics="install search remove rename reset login list ps kill backup restore clear-cache copy sync run build push mirror lang version"
             COMPREPLY=($(compgen -W "${topics}" -- "${cur}"))
             ;;
 

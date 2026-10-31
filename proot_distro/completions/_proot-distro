@@ -98,6 +98,7 @@ _proot_distro() {
                 'push:把本地构建的镜像推送到仓库'
                 'mirror:管理 Docker registry 镜像源'
                 'lang:查看与设置界面语言'
+                'version:显示版本与构建信息'
                 'help:显示帮助'
 =======
                 'install:install a container from a Docker image or local archive'
@@ -118,6 +119,7 @@ _proot_distro() {
                 'build:build an OCI image from a Dockerfile'
                 'push:push a locally built image to a registry'
                 'lang:show and set the UI language'
+                'version:show version and build information'
                 'help:show help'
             )
             _describe '命令' subcommands

@@ -12,6 +12,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  termux-arm64:
+    name: Termux (docker arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Run the smoke suite in a real Termux container
+        run: |
+          set -eux
+          chmod +x .github/termux-smoke.sh
+          # /tmp is mounted read-only: the CI-side equivalent of the
+          # Android layout (no writable /tmp), exercising pd's
+          # PROOT_TMP_DIR auto-export and nproot/proot's $PREFIX/tmp
+          # fallback end to end. Everything else is the untouched
+          # Termux userland from the official image.
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD:/work:ro" \
+            -e EXPECTED_HASH="$(git rev-parse --short=8 HEAD)" \
+            --tmpfs /tmp:ro \
+            --entrypoint /data/data/com.termux/files/usr/bin/bash \
+            termux/termux-docker:aarch64 /work/.github/termux-smoke.sh
+
   test:
     name: Test suite (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
