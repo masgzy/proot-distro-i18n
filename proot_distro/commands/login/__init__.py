@@ -548,6 +548,11 @@ def _login_with_rootfs(container_name: str, args, lock,
     # child_env's, which an image's Env sets, PATH being deliberately not
     # blocked because it is the guest's to choose.
     proot_bin = get_proot_bin()
+    # Say which core was picked: an installed nproot wins over the stock
+    # proot silently, and without this line the choice is invisible --
+    # it is also the first thing a "why is it not using nproot" report
+    # needs to see.
+    log_info(_("using '{path}' as the container runtime.", path=proot_bin))
     # proot resolves --rootfs by name, so the argv carries "." and the
     # process chdirs into the pinned descriptor just before the exec (see
     # _exec_proot). `--get-proot-cmd` prints a command the user runs

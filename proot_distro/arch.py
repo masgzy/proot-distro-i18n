@@ -291,7 +291,9 @@ def get_proot_bin() -> str:
     """Return the absolute path of the proot executable, or exit.
 
     A set PD_PROOT_BIN is validated like --emulator: it must point at an
-    existing, executable file, or the process exits with an error.
+    existing, executable file, or the process exits with an error. A
+    leading ~ is expanded first, so a value copied from a shell line
+    whose tilde was never expanded still resolves.
     Unset falls back to find_proot_bin(): nproot when installed, else
     the stock "proot".
 
@@ -310,7 +312,7 @@ def get_proot_bin() -> str:
     here has already passed cli.ensure_proot_installed(), so the exit is
     a backstop, not the ordinary "proot is missing" report.
     """
-    override = os.environ.get("PD_PROOT_BIN")
+    override = os.path.expanduser(os.environ.get("PD_PROOT_BIN") or "")
     if override:
         if not os.path.isfile(override) or not os.access(override, os.X_OK):
             crit_error(_("PD_PROOT_BIN '{override}' is not found or not "

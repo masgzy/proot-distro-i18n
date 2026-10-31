@@ -235,6 +235,7 @@
   "unknown command '{command}'.": "未知命令 '{command}'。",
   "unknown command '{first}'.": "未知命令 '{first}'。",
   "unrecognized option": "无法识别的选项",
+  "using '{path}' as the container runtime.": "容器运行时使用 '{path}'。",
   "{_arg0}* detached session{_arg1}": "{_arg0}* 后台会话{_arg1}",
   "{_arg0}Command: {_arg1}{_arg2}{_arg3}": "{_arg0}命令: {_arg1}{_arg2}{_arg3}",
   "{_arg0}Installed containers:{_arg1}": "{_arg0}已安装的容器:{_arg1}",
