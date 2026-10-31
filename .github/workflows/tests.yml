@@ -28,14 +28,16 @@ jobs:
           # /tmp is mounted read-only: the CI-side equivalent of the
           # Android layout (no writable /tmp), exercising pd's
           # PROOT_TMP_DIR auto-export and nproot/proot's $PREFIX/tmp
-          # fallback end to end. Everything else is the untouched
-          # Termux userland from the official image.
+          # fallback end to end.  The default entrypoint matters: it
+          # drops privileges to the image's system user, which is the
+          # only way pkg/apt install anything (they refuse root), and
+          # it forwards argv but only a whitelist of env vars -- so the
+          # expected hash travels as $1, not the environment.
           docker run --rm --platform linux/arm64 \
             -v "$PWD:/work:ro" \
-            -e EXPECTED_HASH="$(git rev-parse --short=8 HEAD)" \
             --tmpfs /tmp:ro \
-            --entrypoint /data/data/com.termux/files/usr/bin/bash \
-            termux/termux-docker:aarch64 /work/.github/termux-smoke.sh
+            termux/termux-docker:aarch64 \
+            /work/.github/termux-smoke.sh "$(git rev-parse --short=8 HEAD)"
 
   test:
     name: Test suite (Python ${{ matrix.python-version }})

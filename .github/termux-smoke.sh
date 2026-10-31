@@ -22,6 +22,12 @@ ok()  { PASS=$((PASS+1)); echo "[PASS] $1"; }
 bad() { FAIL=$((FAIL+1)); echo "[FAIL] $1"; }
 PD() { python3 /work/proot-distro.py "$@"; }
 
+# The image entrypoint drops privileges to the system user through a
+# whitelist of env vars -- EXPECTED_HASH does not survive it -- so the
+# workflow passes the hash as the first argument; the environment stays
+# as the fallback for local runs.
+EXPECTED_HASH=${1:-${EXPECTED_HASH:-}}
+
 # Pin the UI language to English so the grep assertions below are
 # stable (the repo's own pytest suite pins it the same way via
 # conftest). `lang get` in T4c proves the language machinery itself.

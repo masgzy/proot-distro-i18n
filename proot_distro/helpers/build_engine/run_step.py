@@ -541,8 +541,23 @@ def _wait_for_step(proc, baseline) -> None:
             pass
         if _children_of(proc.pid):
             continue
-        if _adopted(baseline, skip_pid=proc.pid):
+        if not _adopted(baseline, skip_pid=proc.pid):
+            continue
+        # The children list is a snapshot between waits: a step running
+        # between two children of its own -- the previous one reaped, the
+        # next not forked yet -- shows an empty list for an instant, and
+        # an orphan left behind by a finished subshell makes this branch
+        # fire on a step that is still going.  Give it one more poll to
+        # either exit or produce its next child before concluding it is
+        # over: a genuinely finished step returns here, one that was
+        # merely between children is caught by the children check at the
+        # top of the next round, and one blocked childless beyond that
+        # still ends up in _run_step's stop-and-grace tail below.
+        try:
+            proc.wait(timeout=_STEP_POLL_INTERVAL)
             return
+        except subprocess.TimeoutExpired:
+            continue
 
 
 def _signal_leftovers(targets, sig) -> None:

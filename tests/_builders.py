@@ -7,6 +7,7 @@
 # both well-formed and hostile input.
 
 import contextlib
+import shlex
 import gzip
 import hashlib
 import io
@@ -452,12 +453,19 @@ def parse_proot_cmd_env(out):
     assignments are everything between `env -i` and the binary.
     """
     env = {}
-    for token in out.replace("\\\n", " ").split():
-        if token.endswith("proot") or token.startswith("--"):
+    # shlex over the raw print: it eats the backslash-newline joins, the
+    # dq() quoting and values with spaces in one go.  The assignments are
+    # the tokens that carry an "=" -- the first token without one is the
+    # runtime binary, everything after it is argv.  (The old cut-off,
+    # "endswith('proot')", died the day PD_CONTAINER_RUNTIME=proot became
+    # one of the assignments.)
+    for token in shlex.split(out.replace("\\\n", " ")):
+        if token in ("env", "-i"):
+            continue
+        if "=" not in token:
             break
-        if "=" in token and not token.startswith("env"):
-            key, _, val = token.partition("=")
-            env[key] = val.strip('"')
+        key, _, val = token.partition("=")
+        env[key] = val
     return env
 
 
