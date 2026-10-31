@@ -40,6 +40,9 @@ def test_build_hash_env_stamp_is_stripped(monkeypatch):
 
 def test_build_hash_git_probe(monkeypatch):
     monkeypatch.delenv("PD_BUILD_HASH", raising=False)
+    # An editable/wheel build bakes a stamp file into the tree; the git
+    # probe is only reachable without one, so hide it explicitly.
+    monkeypatch.setattr(version_mod, "_read_stamped_hash", lambda: "")
     fake = mock.Mock(returncode=0, stdout="12345678\n")
     with mock.patch.object(subprocess, "run", return_value=fake) as run:
         assert version_mod.build_hash() == "12345678"
@@ -49,6 +52,7 @@ def test_build_hash_git_probe(monkeypatch):
 
 def test_build_hash_git_failure_falls_back_to_unknown(monkeypatch):
     monkeypatch.delenv("PD_BUILD_HASH", raising=False)
+    monkeypatch.setattr(version_mod, "_read_stamped_hash", lambda: "")
     fake = mock.Mock(returncode=128, stdout="")
     with mock.patch.object(subprocess, "run", return_value=fake):
         assert version_mod.build_hash() == "unknown"
@@ -56,9 +60,42 @@ def test_build_hash_git_failure_falls_back_to_unknown(monkeypatch):
 
 def test_build_hash_git_crash_falls_back_to_unknown(monkeypatch):
     monkeypatch.delenv("PD_BUILD_HASH", raising=False)
+    monkeypatch.setattr(version_mod, "_read_stamped_hash", lambda: "")
     with mock.patch.object(subprocess, "run",
                            side_effect=OSError("no git here")):
         assert version_mod.build_hash() == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# build_hash: the _build_hash.py stamp the PEP 517 backend bakes into
+# wheels and sdists (pip installs used to report "unknown")
+# ---------------------------------------------------------------------------
+
+def test_build_hash_stamp_file_beats_git(monkeypatch):
+    monkeypatch.delenv("PD_BUILD_HASH", raising=False)
+    monkeypatch.setattr(version_mod, "_read_stamped_hash",
+                        lambda: "cafebabe")
+    # git would answer here, but the stamp is the truth for an
+    # installed copy: it was baked while the sources still had .git.
+    assert version_mod.build_hash() == "cafebabe"
+
+
+def test_build_hash_env_still_beats_stamp_file(monkeypatch):
+    monkeypatch.setenv("PD_BUILD_HASH", "deadbeef")
+    monkeypatch.setattr(version_mod, "_read_stamped_hash",
+                        lambda: "cafebabe")
+    assert version_mod.build_hash() == "deadbeef"
+
+
+def test_build_hash_stamp_literal_unknown_is_ignored(monkeypatch):
+    # A backend that could not resolve anything stamps "unknown"; that
+    # value must not shadow a working git probe in a checkout.
+    monkeypatch.delenv("PD_BUILD_HASH", raising=False)
+    monkeypatch.setattr(version_mod, "_read_stamped_hash", lambda: "unknown")
+    fake = mock.Mock(returncode=0, stdout="12345678\n")
+    with mock.patch.object(subprocess, "run", return_value=fake):
+        assert version_mod.build_hash() == "12345678"
+
 
 
 # ---------------------------------------------------------------------------

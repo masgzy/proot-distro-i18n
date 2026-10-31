@@ -1,0 +1,5 @@
+# The PEP 517 backend must ride along: `python -m build` builds the
+# wheel *from the sdist*, and the sdist tree has no setuptools build
+# backend unless this file is in it.
+include _pd_build_backend.py
+include compile_mo.py

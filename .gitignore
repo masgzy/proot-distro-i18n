@@ -9,3 +9,6 @@ __pycache__
 *.tar.bz2
 *.tar.gz
 *.tar.xz
+
+# Baked at wheel-build time by _pd_build_backend.py, never committed.
+proot_distro/_build_hash.py

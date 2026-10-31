@@ -1,6 +1,11 @@
 [build-system]
 requires = ["setuptools>=77"]
-build-backend = "setuptools.build_meta"
+# Custom backend: stamps proot_distro/_build_hash.py with the short
+# commit before setuptools collects the package, so pip installs from
+# git+URL report their build in `pd version` instead of "unknown".
+# See _pd_build_backend.py; MANIFEST.in ships it inside sdists.
+build-backend = "_pd_build_backend"
+backend-path = ["."]
 
 [project]
 name = "proot-distro-i18n"

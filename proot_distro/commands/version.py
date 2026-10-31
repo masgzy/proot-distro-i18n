@@ -52,18 +52,53 @@ FORK_NAME = "proot-distro-i18n"
 FORK_URL = "https://github.com/masgzy/proot-distro-i18n"
 
 
+def _read_stamped_hash() -> str:
+    """Read the hash baked into this copy at build time, if any.
+
+    Wheel and sdist installs carry ``proot_distro/_build_hash.py`` --
+    written by the PEP 517 backend while the sources were still next to
+    their ``.git``.  A checkout that ran ``pip install .`` once may have
+    the file lying around too; it still tells the truth about the tree
+    it was generated from, so it stays the answer over a live git probe
+    only when the file exists at all (a dev checkout that never built
+    simply has no file and falls through to git).
+    """
+    try:
+        import proot_distro
+
+        stamp = os.path.join(
+            os.path.dirname(os.path.abspath(proot_distro.__file__)),
+            "_build_hash.py")
+        with open(stamp, encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("__build_hash__"):
+                    value = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if value and value != "unknown":
+                        return value
+    except Exception:
+        # No file, unreadable, odd encoding -- probe git instead.
+        pass
+    return ""
+
+
 def build_hash() -> str:
     """Return the short git commit of the running copy, best effort.
 
-    Priority: PD_BUILD_HASH (CI stamp) > ``git rev-parse --short=8 HEAD``
-    walked from this package's parent directory (works for checkouts,
-    the common install on Termux) > "unknown". Same convention as
+    Priority: PD_BUILD_HASH (CI stamp) > the ``_build_hash.py`` stamp
+    the PEP 517 backend baked into wheels and sdists (the common
+    ``pip install git+URL`` case, which used to report "unknown") >
+    ``git rev-parse --short=8 HEAD`` walked from this package's parent
+    directory (checkout installs) > "unknown". Same convention as
     nproot's ``--version`` (8-hex short hash), so support tickets line
     up across both repos.
     """
     stamped = os.environ.get("PD_BUILD_HASH", "").strip()
     if stamped:
         return stamped
+
+    from_file = _read_stamped_hash()
+    if from_file and from_file != "unknown":
+        return from_file
 
     try:
         import proot_distro
