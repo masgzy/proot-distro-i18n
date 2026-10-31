@@ -4,6 +4,7 @@
 
 import pytest
 
+from proot_distro import arch
 from proot_distro import cli
 
 
@@ -12,6 +13,18 @@ def _make_exec(tmp_path, name):
     exe.write_text("#!/bin/sh\n")
     exe.chmod(exe.stat().st_mode | 0o111)
     return exe
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_probe_dirs(tmp_path, monkeypatch):
+    """Point the explicit probe dirs at scratch space, so the host's
+    real /usr/bin or Termux prefix cannot leak into expectations."""
+    sysbin = tmp_path / "sysbin"
+    userbin = tmp_path / "userbin"
+    sysbin.mkdir()
+    userbin.mkdir()
+    monkeypatch.setattr(arch, "SYSTEM_BIN_DIRS", (str(sysbin),))
+    monkeypatch.setattr(arch, "USER_BIN_DIR", str(userbin))
 
 
 def test_probe_passes_with_nproot_alone(tmp_path, monkeypatch):

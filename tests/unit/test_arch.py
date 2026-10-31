@@ -235,6 +235,22 @@ def _make_exec(tmp_path, name):
     return exe
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_probe_dirs(tmp_path, monkeypatch):
+    """Point the explicit probe dirs at scratch space.
+
+    find_proot_bin() no longer walks PATH alone, so the host's real
+    /usr/bin or Termux prefix must not leak into expectations.
+    """
+    sysbin = tmp_path / "sysbin"
+    userbin = tmp_path / "userbin"
+    sysbin.mkdir()
+    userbin.mkdir()
+    monkeypatch.setattr(arch, "SYSTEM_BIN_DIRS", (str(sysbin),))
+    monkeypatch.setattr(arch, "USER_BIN_DIR", str(userbin))
+    return sysbin, userbin
+
+
 def test_find_proot_bin_prefers_nproot(tmp_path, monkeypatch):
     # nproot, the no-ptrace proot this tool targets, wins when both it
     # and the stock proot are installed.
@@ -266,6 +282,55 @@ def test_find_proot_bin_answers_none_on_empty_path(tmp_path, monkeypatch):
     monkeypatch.delenv("PD_PROOT_BIN", raising=False)
 
     assert arch.find_proot_bin() is None
+
+
+def test_find_proot_bin_prefers_system_dir_over_path(
+    tmp_path, monkeypatch
+):
+    # A stale copy in a personal PATH entry (last session's download)
+    # must not shadow the properly installed one.
+    sysbin, _userbin = tmp_path / "sysbin", tmp_path / "userbin"
+    installed = _make_exec(sysbin, "nproot")
+    (tmp_path / "path").mkdir()
+    _make_exec(tmp_path / "path", "nproot")
+    monkeypatch.setenv("PATH", str(tmp_path / "path"))
+
+    assert arch.find_proot_bin() == str(installed)
+
+
+def test_find_proot_bin_path_beats_user_local_dir(tmp_path, monkeypatch):
+    userbin = tmp_path / "userbin"
+    (tmp_path / "path").mkdir()
+    path_nproot = _make_exec(tmp_path / "path", "nproot")
+    _make_exec(userbin, "nproot")
+    monkeypatch.setenv("PATH", str(tmp_path / "path"))
+
+    assert arch.find_proot_bin() == str(path_nproot)
+
+
+def test_find_proot_bin_user_local_dir_used_when_path_misses(
+    tmp_path, monkeypatch
+):
+    # ~/.local/bin regularly exists while a non-login PATH omits it.
+    userbin = tmp_path / "userbin"
+    local_nproot = _make_exec(userbin, "nproot")
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+
+    assert arch.find_proot_bin() == str(local_nproot)
+
+
+def test_find_proot_bin_skips_non_executable_system_hit(
+    tmp_path, monkeypatch
+):
+    # A leftover non-executable file in an early directory must not
+    # stop the search.
+    sysbin, _userbin = tmp_path / "sysbin", tmp_path / "userbin"
+    (sysbin / "nproot").write_text("not executable")
+    (tmp_path / "path").mkdir()
+    path_nproot = _make_exec(tmp_path / "path", "nproot")
+    monkeypatch.setenv("PATH", str(tmp_path / "path"))
+
+    assert arch.find_proot_bin() == str(path_nproot)
 
 
 def test_proot_bin_override_beats_nproot(tmp_path, monkeypatch):

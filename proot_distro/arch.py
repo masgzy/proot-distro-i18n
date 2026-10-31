@@ -231,19 +231,57 @@ _QEMU_PKGS = {
 # to know which one was picked. PD_PROOT_BIN overrides both.
 PROOT_BIN_NAMES = ("nproot", "proot")
 
+# Where a properly installed binary is expected, probed *before* PATH:
+# on Termux the package tree is $PREFIX/bin (its real path ends in
+# usr/bin), on a classic distro /usr/bin and /usr/local/bin fill the
+# same role.  A stale copy left in a personal PATH entry -- last
+# session's download, a project directory -- then no longer shadows
+# the installed one.
+SYSTEM_BIN_DIRS = (
+    f"{TERMUX_PREFIX}/bin",
+    "/usr/bin",
+    "/usr/local/bin",
+)
+
+# The user-local install, probed last: the directory often exists
+# while a non-login PATH does not mention it.
+USER_BIN_DIR = "~/.local/bin"
+
+
+def _find_bin(name):
+    """Locate @name: system dirs, then PATH, then ~/.local/bin.
+
+    Every hit is checked for executability, so a leftover non-
+    executable file in an early directory does not stop the search.
+    Returns what it found (possibly relative, when PATH holds a
+    relative entry), or None.
+    """
+    for base in SYSTEM_BIN_DIRS:
+        candidate = f"{base}/{name}"
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    found = shutil.which(name)
+    if found:
+        return found
+    candidate = os.path.join(os.path.expanduser(USER_BIN_DIR), name)
+    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        return candidate
+    return None
+
 
 def find_proot_bin():
     """Return the absolute path of a proot-compatible binary, or None.
 
-    Each name in PROOT_BIN_NAMES is looked up on PATH in order, so an
-    installed nproot is preferred over the stock proot and a system with
-    only one of the two works unchanged. The answer is absolute for the
-    same reason get_proot_bin() gives; None means nothing usable is on
-    PATH, and the caller decides how to report that (the startup probe
-    offers the Termux package, the exec backstop exits).
+    Each name in PROOT_BIN_NAMES is resolved in the same order --
+    system bin dirs, PATH, ~/.local/bin -- so an installed nproot is
+    preferred over the stock proot and a system with only one of the
+    two works unchanged. The answer is absolute for the same reason
+    get_proot_bin() gives; None means nothing usable was found
+    anywhere, and the caller decides how to report that (the startup
+    probe offers the Termux package, the exec backstop exits).
     """
     for name in PROOT_BIN_NAMES:
-        found = shutil.which(name)
+        found = _find_bin(name)
         if found:
             return os.path.abspath(found)
     return None

@@ -53,7 +53,7 @@ PRoot-Distro 是 proot 用户空间模拟器（chroot、mount --bind、binfmt_mi
 | 性能 | paths.container_* 每次重算 | `lru_cache(maxsize=256)`，8.8x 加速 |
 | 下载 | 单连接串行 | TCP 窗口调优（SO_RCVBUF 2 MiB + TCP_NODELAY）+ 大文件分块并行下载 |
 | 帮助可用性 | 未装 proot 时所有 `-h` 报错 | 任何 `-h`/`--help` 提前到 proot 检查之前 |
-| 运行时 | 仅支持 `proot` | 优先 `nproot`（无 ptrace 分支），PATH 上没有时回退 `proot`；`PD_PROOT_BIN` 可显式指定任意二进制 |
+| 运行时 | 仅支持 `proot` | 优先 `nproot`（无 ptrace 分支），按系统目录 → PATH → `~/.local/bin` 探测，没有时回退 `proot`；`PD_PROOT_BIN` 可显式指定任意二进制 |
 | 配置文件 | 无 | `~/.config/proot-distro/mirror.json`（XDG）或 `$PREFIX/etc/proot-distro/mirror.json`（Termux） |
 
 ## 安装
@@ -105,9 +105,10 @@ cp proot_distro/completions/_proot-distro ~/.local/share/zsh/site-functions/_pro
 
 本版对它的支持是自动的：
 
-- **无需配置**：只要 `nproot` 在 PATH 上（Termux 下即 `$PREFIX/bin/nproot`），login / run / build 就会用它启动容器。
-- **平滑回退**：PATH 上没有 `nproot` 时回退到传统 `proot`，与原版行为一致；两者都未安装时，报错会提示 `nproot or proot`。
-- **显式指定**：设置环境变量 `PD_PROOT_BIN=/path/to/nproot` 可指向任意 proot 兼容二进制，优先级高于 PATH 探测。
+- **无需配置**：按 `$PREFIX/bin`（Termux，即真实路径中的 usr/bin）→ `/usr/bin`、`/usr/local/bin` → `PATH` → `~/.local/bin` 的顺序查找，任何一处装了 `nproot`，login / run / build 就会用它启动容器；安装版优先于 PATH 上遗留的旧副本。
+- **平滑回退**：所有位置都没有 `nproot` 时回退到传统 `proot`，与原版行为一致；两者都未安装时，报错会提示 `nproot or proot`。
+- **显式指定**：设置环境变量 `PD_PROOT_BIN=/path/to/nproot` 可指向任意 proot 兼容二进制，优先级高于上述探测。
+- **临时目录自动设好**：启动容器时自动导出 `PROOT_TMP_DIR=$PREFIX/tmp`（Android 没有 `/tmp`，proot 只认这个变量不认 `TMPDIR`）。
 
 在 Termux 上安装 nproot（二进制或源码编译）请参考其仓库说明；不想折腾的用户也可以随时 `pkg install proot` 使用传统后端。
 

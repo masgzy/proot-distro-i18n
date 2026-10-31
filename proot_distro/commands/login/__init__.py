@@ -208,6 +208,12 @@ def _build_termux_env(container_name, extra_env, minimal, isolated):
         env["PATH"] = f"{TERMUX_PREFIX}/bin"
         env["PREFIX"] = TERMUX_PREFIX
         env["TMPDIR"] = f"{TERMUX_PREFIX}/tmp"
+        # proot/nproot read PROOT_TMP_DIR (never TMPDIR) for where to
+        # extract the loader and build the glue rootfs; Android has no
+        # /tmp, so anchor it to the Termux prefix explicitly -- older
+        # nproot builds without the unset-candidate fallback then keep
+        # working too.
+        env["PROOT_TMP_DIR"] = f"{TERMUX_PREFIX}/tmp"
 
     # Image manifest Env applies in every mode (including isolated and
     # minimal); image_env_pairs() is where what it may set is decided.
