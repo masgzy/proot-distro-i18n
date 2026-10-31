@@ -15,6 +15,7 @@ set -u
 
 PREFIX=/data/data/com.termux/files/usr
 LOG=$PREFIX/tmp
+mkdir -p "$LOG"
 PASS=0
 FAIL=0
 ok()  { PASS=$((PASS+1)); echo "[PASS] $1"; }
