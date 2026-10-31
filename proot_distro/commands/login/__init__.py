@@ -618,6 +618,17 @@ def _login_with_rootfs(container_name: str, args, lock,
             val = os.environ.get(var)
             if val:
                 child_env[var] = val
+    # nproot backend selection (docs/BACKENDS.md): nproot itself defaults
+    # to "auto" -- the no-ptrace LD_PRELOAD "proto" backend when the
+    # request fits, ptrace otherwise.  --backend / $PDI18N_BACKEND only
+    # pin that choice.  Older nproot binaries ignore the variable, so
+    # passing it is always safe.  `--get-proot-cmd` users must export
+    # NPROOT_BACKEND themselves; a printed command cannot carry env.
+    backend = getattr(args, "backend", None) or os.environ.get(
+        "PDI18N_BACKEND"
+    )
+    if backend:
+        child_env["NPROOT_BACKEND"] = backend
     if IS_TERMUX and dist_type != "termux":
         # Always pin PROOT_L2S_DIR to a fixed path and create the
         # directory upfront. Without this the first session lets proot

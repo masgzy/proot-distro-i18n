@@ -211,6 +211,7 @@ complete -c proot-distro -n '__fish_seen_subcommand_from login' \
     -s b -l bind       -r -d '把 PATH[:DEST] bind 挂载进容器（可重复）'
 complete -c proot-distro -f -n '__fish_seen_subcommand_from login; and __proot_distro_is_termux' \
     -l no-link2symlink    -d '禁用 proot link2symlink 扩展'
+    -l backend            -d 'nproot 后端选择 auto|proto|ptrace（默认 auto，proto 无 ptrace）'
 complete -c proot-distro -f -n '__fish_seen_subcommand_from login; and __proot_distro_is_termux' \
     -l no-sysvipc         -d '禁用 SysV IPC 模拟'
 complete -c proot-distro -f -n '__fish_seen_subcommand_from login; and __proot_distro_is_termux' \
@@ -360,6 +361,7 @@ complete -c proot-distro -n '__fish_seen_subcommand_from run' \
     -s b -l bind       -r -d '把 PATH[:DEST] bind 挂载进容器（可重复）'
 complete -c proot-distro -f -n '__fish_seen_subcommand_from run; and __proot_distro_is_termux' \
     -l no-link2symlink    -d '禁用 proot link2symlink 扩展'
+    -l backend            -d 'nproot 后端选择 auto|proto|ptrace（默认 auto，proto 无 ptrace）'
 complete -c proot-distro -f -n '__fish_seen_subcommand_from run; and __proot_distro_is_termux' \
     -l no-sysvipc         -d '禁用 SysV IPC 模拟'
 complete -c proot-distro -f -n '__fish_seen_subcommand_from run; and __proot_distro_is_termux' \

@@ -158,7 +158,7 @@ _proot_distro() {
                     -b --bind --emulator --kernel --hostname -w --work-dir
                     -e --env -d --detach --get-proot-cmd -h --help"
                 _proot_distro_is_termux && \
-                    opts+=" --isolated --minimal --no-link2symlink --no-sysvipc --no-kill-on-exit"
+                    opts+=" --isolated --minimal --no-link2symlink --no-sysvipc --no-kill-on-exit --backend"
                 COMPREPLY=($(compgen -W "${opts}" -- "${cur}"))
             else
                 COMPREPLY=($(compgen -W "$(_proot_distro_get_containers)" -- "${cur}"))
@@ -283,7 +283,7 @@ _proot_distro() {
                     -b --bind --emulator --kernel --hostname -w --work-dir
                     -e --env -d --detach --get-proot-cmd -h --help"
                 _proot_distro_is_termux && \
-                    opts+=" --isolated --minimal --no-link2symlink --no-sysvipc --no-kill-on-exit"
+                    opts+=" --isolated --minimal --no-link2symlink --no-sysvipc --no-kill-on-exit --backend"
                 COMPREPLY=($(compgen -W "${opts}" -- "${cur}"))
             else
                 COMPREPLY=($(compgen -W "$(_proot_distro_get_containers)" -- "${cur}"))
