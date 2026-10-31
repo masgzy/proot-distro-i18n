@@ -63,8 +63,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e '.[test]'
 
-      - name: Compile .mo translation files
-        run: python compile_mo.py
 
       - name: Unit tests
         run: python -m pytest tests/unit

@@ -21,8 +21,6 @@ jobs:
       - name: Install build tools
         run: pip install build
 
-      - name: Compile .mo translation files
-        run: python compile_mo.py
 
       - name: Build sdist and wheel
         run: python -m build
