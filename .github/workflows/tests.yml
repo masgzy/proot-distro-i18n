@@ -78,8 +78,20 @@ jobs:
       - name: Security tests
         run: python -m pytest tests/security
 
-      - name: Live tests
-        run: RUN_LIVE_TESTS=1 python -m pytest -q tests/live
+      - name: Build a current proot and run the live suite
+        run: |
+          set -eux
+          # Ubuntu's proot is 5.1.0 (2019) and fails silently against
+          # current kernels; the live suite is only meaningful with a
+          # runtime that works, so build the current upstream one.
+          sudo apt-get install -y --no-install-recommends libtalloc-dev
+          git clone --depth 1 https://github.com/proot-me/proot.git \
+              /tmp/proot-src
+          make -C /tmp/proot-src/src -j"$(nproc)" \
+            CPPFLAGS="-D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE" \
+            LDFLAGS="-ltalloc"
+          echo "/tmp/proot-src/src" >> "$GITHUB_PATH"
+          RUN_LIVE_TESTS=1 python -m pytest -q tests/live
 
       - name: User tests
         if: github.event_name != 'pull_request'

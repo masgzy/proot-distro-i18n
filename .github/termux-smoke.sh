@@ -46,14 +46,23 @@ else
 fi
 
 echo "== T1: bootstrap runtime (python + proot from the Termux repo) =="
-# pkg refuses to run as root and the docker container has no choice, so
-# fall back to plain apt, which has no such guard.  On a real Termux
-# user the first branch takes it as usual.
-if pkg update -y >"$LOG/pkg.log" 2>&1 \
-   && pkg install -y python proot >>"$LOG/pkg.log" 2>&1; then
-    ok T1
-elif apt update >>"$LOG/pkg.log" 2>&1 \
-   && apt install -y python proot >>"$LOG/pkg.log" 2>&1; then
+# pkg's mirror auto-picker has landed on dead community mirrors before
+# (the 401/InRelease flake); pin the official Termux mirror and retry,
+# so the bootstrap does not depend on mirror roulette.  The success
+# test is the binaries themselves, not the exit status.
+if [ -w "$PREFIX/etc/apt" ]; then
+    echo "deb https://packages.termux.dev/apt/termux-main stable main" \
+        > "$PREFIX/etc/apt/sources.list"
+fi
+attempts=0
+until pkg update -y >>"$LOG/pkg.log" 2>&1 \
+      && pkg install -y python proot >>"$LOG/pkg.log" 2>&1; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -ge 3 ] && break
+    sleep 5
+done
+if command -v python3 >/dev/null 2>&1 \
+   && command -v proot >/dev/null 2>&1; then
     ok T1
 else
     bad T1
