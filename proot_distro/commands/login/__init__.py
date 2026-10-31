@@ -45,7 +45,9 @@ from proot_distro.constants import (
 )
 from proot_distro import dirfd
 from proot_distro.guestfile import guest_file_exists
-from proot_distro.message import C, msg, crit_error, quote_error, warn
+from proot_distro.message import (
+    C, log_info, msg, crit_error, quote_error, warn,
+)
 from proot_distro.arch import (
     detect_installed_arch,
     get_device_cpu_arch,
@@ -200,6 +202,77 @@ def _resolve_login_user(rootfs: str, container_name: str, user_arg: str,
     }
 
 
+# Verified location for proot/nproot temporary files, resolved once per
+# process by _resolve_proot_tmp_dir(); None until first asked.
+_PROOT_TMP_DIR = None
+
+
+def _usable_dir(path: str) -> bool:
+    """True when @path is (or could be created as) a writable directory."""
+    try:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+    except OSError:
+        pass
+    return os.path.isdir(path) and os.access(path, os.W_OK | os.X_OK)
+
+
+def _resolve_proot_tmp_dir() -> str:
+    """Return a verified base directory for proot/nproot temporary files.
+
+    proot reads PROOT_TMP_DIR (never TMPDIR) to decide where it extracts
+    the embedded loader and builds the glue rootfs, and Android has no
+    /tmp to fall back to.  nproot further treats a set PROOT_TMP_DIR as
+    authoritative: a missing location is created, but an unusable one
+    fails the run instead of silently redirecting temporary files
+    elsewhere.  Handing it an unverified location therefore turns an
+    environment quirk -- $PREFIX/tmp deleted, left root-owned by a tsu
+    session, or living on noexec storage -- into "can't create temporary
+    directory: Permission denied" for every command, with the glue
+    rootfs and the loader extraction failing in its wake.
+
+    So the location is validated here, before it is exported, with the
+    very operation proot will perform (create + write):
+
+      1. a PROOT_TMP_DIR exported by the invoking shell, when usable;
+      2. $PREFIX/tmp, created when missing;
+      3. ~/.proot-distro/tmp, created when missing.
+
+    Unusable candidates are reported and skipped.  Should every
+    candidate fail, $PREFIX/tmp is returned anyway so that nproot's own
+    error -- which names the location -- still applies.
+    """
+    global _PROOT_TMP_DIR
+    if _PROOT_TMP_DIR is not None:
+        return _PROOT_TMP_DIR
+
+    prefix_tmp = f"{TERMUX_PREFIX}/tmp"
+    candidates = []
+    host_value = os.environ.get("PROOT_TMP_DIR")
+    if host_value:
+        candidates.append(host_value)
+    candidates.append(prefix_tmp)
+    candidates.append(os.path.join(TERMUX_HOME, ".proot-distro", "tmp"))
+    candidates = list(dict.fromkeys(candidates))
+
+    for path in candidates:
+        if _usable_dir(path):
+            _PROOT_TMP_DIR = path
+            break
+        if os.path.isdir(path):
+            warn(_("temporary directory '{path}' is not writable, "
+                   "skipping it.", path=path))
+        else:
+            warn(_("temporary directory '{path}' does not exist and "
+                   "cannot be created, skipping it.", path=path))
+    else:
+        _PROOT_TMP_DIR = prefix_tmp
+
+    if _PROOT_TMP_DIR != prefix_tmp:
+        log_info(_("proot temporary files go to '{path}'.",
+                   path=_PROOT_TMP_DIR))
+    return _PROOT_TMP_DIR
+
+
 def _build_termux_env(container_name, extra_env, minimal, isolated):
     """Env dict for termux-type containers."""
     env: dict = {}
@@ -208,12 +281,6 @@ def _build_termux_env(container_name, extra_env, minimal, isolated):
         env["PATH"] = f"{TERMUX_PREFIX}/bin"
         env["PREFIX"] = TERMUX_PREFIX
         env["TMPDIR"] = f"{TERMUX_PREFIX}/tmp"
-        # proot/nproot read PROOT_TMP_DIR (never TMPDIR) for where to
-        # extract the loader and build the glue rootfs; Android has no
-        # /tmp, so anchor it to the Termux prefix explicitly -- older
-        # nproot builds without the unset-candidate fallback then keep
-        # working too.
-        env["PROOT_TMP_DIR"] = f"{TERMUX_PREFIX}/tmp"
 
     # Image manifest Env applies in every mode (including isolated and
     # minimal); image_env_pairs() is where what it may set is decided.
@@ -233,6 +300,15 @@ def _build_termux_env(container_name, extra_env, minimal, isolated):
             val = os.environ.get(var, "")
             if val:
                 env[var] = val
+
+    # proot/nproot read PROOT_TMP_DIR (never TMPDIR) for where to extract
+    # the loader and build the glue rootfs; on Android there is no /tmp,
+    # and nproot treats a set value as authoritative, so a *verified*
+    # location is exported in every mode -- including minimal and
+    # isolated, where without it the run would die before reaching the
+    # guest.  extra_env still wins, being the user's explicit word.
+    if IS_TERMUX:
+        env["PROOT_TMP_DIR"] = _resolve_proot_tmp_dir()
 
     for entry in extra_env:
         key, _, val = entry.partition("=")
@@ -278,6 +354,12 @@ def _build_normal_env(container_name, login_user, login_home,
             val = os.environ.get(var, "")
             if val:
                 env[var] = val
+
+    # Same verified handoff as the termux builder: normal containers on
+    # Termux need it just as much -- dist type changes nothing about
+    # where proot itself may write.
+    if IS_TERMUX:
+        env["PROOT_TMP_DIR"] = _resolve_proot_tmp_dir()
 
     for entry in extra_env:
         key, _, val = entry.partition("=")

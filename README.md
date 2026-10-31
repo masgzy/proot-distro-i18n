@@ -108,7 +108,7 @@ cp proot_distro/completions/_proot-distro ~/.local/share/zsh/site-functions/_pro
 - **无需配置**：按 `$PREFIX/bin`（Termux，即真实路径中的 usr/bin）→ `/usr/bin`、`/usr/local/bin` → `PATH` → `~/.local/bin` 的顺序查找，任何一处装了 `nproot`，login / run / build 就会用它启动容器；安装版优先于 PATH 上遗留的旧副本。
 - **平滑回退**：所有位置都没有 `nproot` 时回退到传统 `proot`，与原版行为一致；两者都未安装时，报错会提示 `nproot or proot`。
 - **显式指定**：设置环境变量 `PD_PROOT_BIN=/path/to/nproot` 可指向任意 proot 兼容二进制，优先级高于上述探测。
-- **临时目录自动设好**：启动容器时自动导出 `PROOT_TMP_DIR=$PREFIX/tmp`（Android 没有 `/tmp`，proot 只认这个变量不认 `TMPDIR`）。
+- **临时目录自动设好**：启动容器时自动导出**验证过可写**的 `PROOT_TMP_DIR`（Android 没有 `/tmp`，proot 只认这个变量不认 `TMPDIR`）。优先级：shell 里已设置的 `PROOT_TMP_DIR` → `$PREFIX/tmp`（缺失时自动创建）→ `~/.proot-distro/tmp`。不可用的候选会给出原因并跳过——nproot 对显式设置的值是"照单全收、坏了就报错"，所以由启动器先把关。
 
 在 Termux 上安装 nproot（二进制或源码编译）请参考其仓库说明；不想折腾的用户也可以随时 `pkg install proot` 使用传统后端。
 

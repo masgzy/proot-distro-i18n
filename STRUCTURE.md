@@ -71,7 +71,7 @@ what the command takes (see `locking.py`).
 
 | Module | Role |
 | --- | --- |
-| `__init__.py` | `command_login`: resolve rootfs, user, env, binds, then exec proot. |
+| `__init__.py` | `command_login`: resolve rootfs, user, env, binds, then exec proot. Also `_resolve_proot_tmp_dir()`: validate a writable `PROOT_TMP_DIR` (host value → `$PREFIX/tmp` → `~/.proot-distro/tmp`) and export it in every session mode on Termux. |
 | `proot_cmd.py` | `build_proot_args()`: assembles the proot argv in a fixed order. |
 | `passwd.py` | uid/gid/home/shell lookup, read through `guestfile`. |
 | `env.py` | Image `Env`, identity variables, `/etc/profile.d` injection. |
