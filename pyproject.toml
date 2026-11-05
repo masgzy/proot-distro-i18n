@@ -28,6 +28,7 @@ test = ["pytest>=7"]
 [project.scripts]
 proot-distro = "proot_distro.cli:main"
 pd = "proot_distro.cli:main"
+pdi18n = "proot_distro.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["proot_distro*"]

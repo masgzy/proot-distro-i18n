@@ -100,6 +100,12 @@ cp proot_distro/completions/_proot-distro ~/.local/share/zsh/site-functions/_pro
 # 加到 ~/.zshrc: fpath=(~/.local/share/zsh/site-functions $fpath)
 ```
 
+### 命令别名
+
+pip 安装后会同时得到三个等价的入口脚本：`proot-distro`、`pd` 和 `pdi18n`。
+三者指向同一实现，`pdi18n` 与配套的 `nproot` 名字对得上，脚本里区分两套
+工具时用这个别名最不容易混淆。
+
 ## nproot 支持（无 ptrace 运行时）
 
 [nproot](https://github.com/masgzy/nproot) 是本工具配套的 proot 分支，不依赖 `ptrace` 即可运行容器（命令行与 proot 完全兼容）。
