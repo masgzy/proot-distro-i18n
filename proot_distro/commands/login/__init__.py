@@ -274,6 +274,30 @@ def _resolve_proot_tmp_dir() -> str:
     return _PROOT_TMP_DIR
 
 
+def _nproot_env_passthrough(env: dict) -> None:
+    """Ride the user's NPROOT_* runtime knobs into the launcher env.
+
+    nproot's launcher sanitizes its own environment down to a known
+    set, so an NPROOT_ variable absent from this dict dies before the
+    shim ever sees it -- 'NPROOT_DEBUG=1 pd sh debian' produced a
+    debug-less shim exactly that way on the GKI 6.1 arm64 device logs (one
+    bare shield line, then a silent signal-31 death).  Names must be
+    strict NPROOT_[A-Z0-9_]+ so a stray variable cannot smuggle odd
+    bytes into the guest env; explicit --env still wins, and the
+    launcher's own NPROOT_BACKEND decision below keeps precedence.
+    """
+    prefix = "NPROOT_"
+    for var, val in os.environ.items():
+        if not var.startswith(prefix) or len(var) == len(prefix):
+            continue
+        rest = var[len(prefix):]
+        if not all(("A" <= c <= "Z") or c.isdigit() or c == "_"
+                   for c in rest):
+            continue
+        if var not in env:
+            env[var] = val
+
+
 def _build_termux_env(container_name, extra_env, minimal, isolated):
     """Env dict for termux-type containers."""
     env: dict = {}
@@ -321,6 +345,8 @@ def _build_termux_env(container_name, extra_env, minimal, isolated):
     found = override or find_proot_bin()
     if found:
         env["PD_CONTAINER_RUNTIME"] = os.path.basename(found)
+
+    _nproot_env_passthrough(env)
 
     for entry in extra_env:
         key, _, val = entry.partition("=")
@@ -379,6 +405,8 @@ def _build_normal_env(container_name, login_user, login_home,
     found = override or find_proot_bin()
     if found:
         env["PD_CONTAINER_RUNTIME"] = os.path.basename(found)
+
+    _nproot_env_passthrough(env)
 
     for entry in extra_env:
         key, _, val = entry.partition("=")
