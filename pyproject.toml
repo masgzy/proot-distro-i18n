@@ -9,7 +9,7 @@ backend-path = ["."]
 
 [project]
 name = "proot-distro-i18n"
-version = "5.10.0"
+version = "5.10.1"
 description = "PRoot-Distro 的中文汉化版（基于官方 v5.10.0），附带镜像源管理与下载提速。"
 
 readme = "README.md"
