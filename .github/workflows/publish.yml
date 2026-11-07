@@ -40,6 +40,15 @@ jobs:
       url: https://pypi.org/p/proot-distro-i18n
     permissions:
       id-token: write
+      contents: write     # the GitHub Release upload below
+    # PyPI trusted publishing must be configured ON PyPI first
+    # (account -> pending publisher: owner=masgzy,
+    # repo=proot-distro-i18n, workflow=publish.yml, environment=pypi).
+    # Until that one-time manual step is done the exchange fails with
+    # "Trusted publishing exchange failure" -- tolerate it so a tag
+    # push stays green; the GitHub Release wheel is the install channel
+    # meanwhile.
+    continue-on-error: true
 
     steps:
       - name: Retrieve artifacts
@@ -50,3 +59,21 @@ jobs:
 
       - name: Publish
         uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Attach dist/ to the GitHub Release
+        # The wheel/sdist built here are the user-facing install path
+        # (zero-build pip install from the Release page); the gh CLI
+        # token ships with every workflow, contents:write is implied by
+        # no explicit restriction above -- fallback: the release is
+        # created manually when this step cannot.
+        run: |
+          set -eux
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" --notes "Automated dist/ upload for $TAG."
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}

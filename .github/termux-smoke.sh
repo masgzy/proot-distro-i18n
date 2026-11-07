@@ -13,6 +13,16 @@
 
 set -u
 
+# The upstream termux/termux-docker image no longer guarantees a
+# preinstalled python3 (observed 2026-11-07: a fresh aarch64 image
+# shipped without it and 13 of 14 checks died on "python3: command
+# not found" before anything under test was reached).  Install it on
+# demand; a no-op when it is already there.
+command -v python3 >/dev/null 2>&1 || {
+    echo "== python3 missing from the base image: pkg install python =="
+    pkg install -y python || apt install -y python
+}
+
 PREFIX=/data/data/com.termux/files/usr
 LOG=$PREFIX/tmp
 mkdir -p "$LOG"
