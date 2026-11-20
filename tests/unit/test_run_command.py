@@ -43,8 +43,15 @@ def _container(builders, name="box", **config):
 
 def _run(capsys, **over):
     """Run `run` against container 'box'; return (exit code, stdout, stderr)."""
-    with pytest.raises(SystemExit) as exc:
-        command_run(_args(**over))
+    from proot_distro.commands import login as _login
+
+    with pytest.MonkeyPatch.context() as mp:
+        # Same stand-in as _builders.login_child_env: a well-formed
+        # image config has to reach the printed command without a real
+        # runtime installed on the host.
+        mp.setattr(_login, "get_proot_bin", lambda: "/usr/bin/proot")
+        with pytest.raises(SystemExit) as exc:
+            command_run(_args(**over))
     out = capsys.readouterr()
     return exc.value.code, out.out, out.err
 
@@ -103,10 +110,9 @@ def test_absent_fields_are_not_malformed(builders, capsys):
             "Entrypoint": None, "Cmd": ["/bin/sh"], "WorkingDir": None,
         }},
     })
-    with pytest.raises(SystemExit) as exc:
-        command_run(_args("box2"))
-    assert exc.value.code == 0
-    assert "--cwd=/" in capsys.readouterr().out
+    code, out, _err = _run(capsys, container_name="box2")
+    assert code == 0
+    assert "--cwd=/" in out
 
 
 def test_an_empty_string_argument_is_a_valid_argv_entry(builders, capsys):

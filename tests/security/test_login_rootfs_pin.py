@@ -51,6 +51,11 @@ def captured_exec(monkeypatch):
         raise SystemExit(0)
 
     monkeypatch.setattr(os, "execvpe", fake_execvpe)
+    # Same stand-in as _builders.login_child_env: these tests are about
+    # which rootfs/inode the session pins, not about the binary, and
+    # must not require one installed on the host.
+    monkeypatch.setattr(login_mod, "get_proot_bin",
+                        lambda: "/usr/bin/proot")
     here = os.open(os.curdir, os.O_RDONLY | os.O_DIRECTORY)
     try:
         yield seen

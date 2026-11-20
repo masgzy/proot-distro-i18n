@@ -473,7 +473,15 @@ def login_child_env(command, args, capsys):
     """Run *command* (command_login / command_run) with --get-proot-cmd set
     and return the environment it would have exec'd proot with."""
     import pytest
-    with pytest.raises(SystemExit) as exc:
-        command(args)
+    from proot_distro.commands import login as _login
+
+    with pytest.MonkeyPatch.context() as mp:
+        # Rendering --get-proot-cmd must not need a real nproot/proot on
+        # the host: only the absolute-path rule matters here, and a
+        # stand-in keeps these tests green on machines without a
+        # runtime installed (CI builds one; dev boxes need not).
+        mp.setattr(_login, "get_proot_bin", lambda: "/usr/bin/proot")
+        with pytest.raises(SystemExit) as exc:
+            command(args)
     assert exc.value.code == 0
     return parse_proot_cmd_env(capsys.readouterr().out)

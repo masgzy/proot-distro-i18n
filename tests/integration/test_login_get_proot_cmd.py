@@ -8,7 +8,21 @@ import pytest
 
 import _builders
 from proot_distro.arch import get_device_cpu_arch
+from proot_distro.commands import login as login_mod
 from proot_distro.commands.login import command_login, _detect_dist_type
+
+
+@pytest.fixture(autouse=True)
+def _stand_in_runtime(monkeypatch):
+    """A proot stand-in for every test here.
+
+    This module drives command_login in every case; without a runtime
+    installed on the host, arch.get_proot_bin() exits before the argv
+    these tests assert on is ever built. Same deal as the fixtures in
+    tests/security/conftest.py and _builders.login_child_env.
+    """
+    monkeypatch.setattr(login_mod, "get_proot_bin",
+                        lambda: "/usr/bin/proot")
 from proot_distro.commands.login import proot_cmd
 from proot_distro.commands.run import command_run
 from proot_distro.constants import TERMUX_PREFIX
@@ -31,8 +45,13 @@ def _login_args(name, **over):
 
 def _run_login(builders, name, **over):
     builders.make_container(name, arch=HOST_ARCH)
-    with pytest.raises(SystemExit) as exc:
-        command_login(_login_args(name, **over))
+    # The stand-in keeps these tests green without a real nproot/proot
+    # installed (same deal as _builders.login_child_env); the argv they
+    # assert on is what matters, not the binary that would run it.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(login_mod, "get_proot_bin", lambda: "/usr/bin/proot")
+        with pytest.raises(SystemExit) as exc:
+            command_login(_login_args(name, **over))
     assert exc.value.code == 0
 
 
@@ -235,6 +254,7 @@ def test_a_refused_exec_is_a_message(builders, capsys, monkeypatch):
         raise OSError(errno.E2BIG, "Argument list too long")
 
     monkeypatch.setattr(login_mod.os, "execvpe", _execvpe)
+    monkeypatch.setattr(login_mod, "get_proot_bin", lambda: "/usr/bin/proot")
     try:
         with pytest.raises(SystemExit) as exc:
             command_login(_builders.login_args("box", get_proot_cmd=False))
