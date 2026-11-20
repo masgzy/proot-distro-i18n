@@ -234,3 +234,31 @@ def test_lang_action_choices():
         args, _ = parser.parse_known_args(argv)
         assert args.lang_action == action
         assert getattr(args, "locale", None) == locale
+
+# ---------------------------------------------------------------------------
+# config.clear_user_key -- the removal path other settings ride on
+# ---------------------------------------------------------------------------
+
+def test_clear_user_key_with_another_key_present(clean_lang_env):
+    # Regression: clear_user_key() used to delete the key in memory and
+    # then hand the *rest* to save_user_config() as an update -- which
+    # re-reads the disk state first and merged the deleted key right
+    # back. Any removal while another key was present (language plus a
+    # `pd setting` value, say) silently resurrected the removed key.
+    os.makedirs(config_mod.CONFIG_DIR)
+    config_mod.save_user_config({"language": "zh_CN", "other": "1"})
+    assert config_mod.clear_user_key("other") is True
+    assert config_mod.load_user_config() == {"language": "zh_CN"}
+
+
+def test_clear_user_key_removes_the_file_once_empty(clean_lang_env):
+    os.makedirs(config_mod.CONFIG_DIR)
+    config_mod.save_user_config({"language": "zh_CN"})
+    assert config_mod.clear_user_key("language") is True
+    assert not os.path.exists(config_mod.CONFIG_FILE)
+
+
+def test_clear_user_key_missing_key_is_a_no(clean_lang_env):
+    os.makedirs(config_mod.CONFIG_DIR)
+    assert config_mod.clear_user_key("language") is False
+

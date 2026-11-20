@@ -117,16 +117,20 @@ def save_user_config(update: dict, *, remove_keys: tuple = ()) -> dict:
 def clear_user_key(key: str) -> bool:
     """删除配置里的单个键；返回是否真的存在（并删除了）。
 
-    写回后如果配置变空则顺手删掉整个文件，保持配置目录整洁——
-    与 ``lang reset`` 的"清除偏好"语义匹配。
+    删除走 ``save_user_config`` 的 ``remove_keys`` 通道——让同一次
+    读-改-写完成删除。曾经在这里先 ``del data[key]`` 再把剩余字典当
+    ``update`` 传回去：``save_user_config`` 会先从磁盘重读旧状态再
+    合并，结果被删的键又从磁盘上"复活"了——只要文件里还有别的键
+    （比如 ``language`` 与一个设置并存）就必现。写回后如果配置变空
+    则顺手删掉整个文件，保持配置目录整洁——与 ``lang reset`` 的
+    "清除偏好"语义匹配。
     """
-    data = load_user_config()
-    if key not in data:
+    if key not in load_user_config():
         return False
-    del data[key]
-    if data:
-        save_user_config(data)
-    else:
+    save_user_config({}, remove_keys=(key,))
+    if not load_user_config():
+        # The key was the last one: no config left to keep, drop the
+        # file the way `lang reset` has always tidied up.
         try:
             os.remove(CONFIG_FILE)
         except OSError:
