@@ -50,7 +50,8 @@ from proot_distro.i18n import _, get_language
 _HELP_PAGE_NAMES = (
     "build", "push", "backup", "clear-cache", "copy", "install",
     "list", "login", "mirror", "ps", "kill", "remove", "rename",
-    "reset", "restore", "run", "sync", "lang", "version",
+    "reset", "restore", "run", "sync", "lang", "setting", "update",
+    "version",
 )
 
 

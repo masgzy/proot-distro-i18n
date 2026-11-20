@@ -12,6 +12,8 @@
 - [快速开始](#快速开始)
 - [镜像源管理（mirror 子命令）](#镜像源管理mirror-子命令)
 - [国际化（i18n）](#国际化i18n)
+- [用户设置（setting 子命令）](#用户设置setting-子命令)
+- [自动更新（update 子命令）](#自动更新update-子命令)
 - [性能优化](#性能优化)
 - [配置文件](#配置文件)
 - [环境变量](#环境变量)
@@ -68,6 +70,10 @@ pip install git+https://github.cnxiaobai.com/https://github.com/masgzy/proot-dis
 pip install git+https://v6.gh-proxy.org/https://github.com/masgzy/proot-distro-i18n.git
 ```
 
+装好之后升级就用 `pd update`（见[自动更新](#自动更新update-子命令)）：
+它直接安装 Release 预编译 wheel，不在设备上现场构建，不会出现
+`pip install --upgrade git+...` 长时间卡在 `Preparing metadata` 阶段的问题。
+
 ### 方式 2：克隆仓库后本地安装
 
 ```bash
@@ -118,6 +124,10 @@ pip 安装后会同时得到三个等价的入口脚本：`proot-distro`、`pd` 
 - **临时目录自动设好**：启动容器时自动导出**验证过可写**的 `PROOT_TMP_DIR`（Android 没有 `/tmp`，proot 只认这个变量不认 `TMPDIR`）。优先级：shell 里已设置的 `PROOT_TMP_DIR` → `$PREFIX/tmp`（缺失时自动创建）→ `~/.proot-distro/tmp`。不可用的候选会给出原因并跳过——nproot 对显式设置的值是"照单全收、坏了就报错"，所以由启动器先把关。
 
 在 Termux 上安装 nproot（二进制或源码编译）请参考其仓库说明；不想折腾的用户也可以随时 `pkg install proot` 使用传统后端。
+
+装好后升级 nproot 也走 `pd update`：自动下载最新 Release 的
+`nproot-android-<arch>.zip` 并安装到现有 nproot 所在目录，正在运行的容器
+会话不受影响。详见[自动更新](#自动更新update-子命令)。
 
 ## 版本与构建信息（version 子命令）
 
@@ -319,6 +329,63 @@ Termux 的 locale 支持是残缺的：`LANG` 通常为 `C` 或未设置，Andro
 | layer / manifest | 层 / 清单 |
 | Warning / Error | 警告 / 错误 |
 
+## 用户设置（setting 子命令）
+
+`pd setting` 查看与修改用户偏好，保存在与 `lang` 相同的
+`config.json` 里。修改立即持久化，但对**新会话**生效——正在运行的
+容器不受影响。
+
+```bash
+pd setting ls                       # 列出全部设置项（不带子动作时也是这个）
+pd setting put passthrough false    # 关闭宿主 Termux 穿透
+pd setting put passthrough true     # 重新打开（默认）
+pd setting reset passthrough        # 单项恢复默认
+pd setting reset                    # 全部恢复默认（不影响 lang 写入的语言）
+pd setting help                     # 完整帮助
+```
+
+### passthrough：宿主 Termux 穿透
+
+| 取值 | 行为 |
+|---|---|
+| `true`（默认） | 容器内程序优先，Termux 二进制兜底：Termux 的 bin 目录追加在容器 PATH 末尾 |
+| `false` | 从容器 PATH 移除 Termux 的 bin 目录，容器内执行不到 Termux 程序 |
+
+取值写法随意：`true/false`、`1/0`、`t/f`（大小写均可）、`yes/no`、
+`on/off` 都行，存储时统一归一化。
+
+关闭穿透只改变 PATH 解析：Termux 前缀仍绑定进容器，按绝对路径仍能
+访问其中的文件，只是 shell 不再找到它们。termux 类型的容器（Termux
+自身镜像）不受影响——它的 PATH 本来就是 Termux 前缀。
+
+## 自动更新（update 子命令）
+
+`pd update` 一条命令更新两个东西：pd 本体和 nproot 运行时。数据来源
+是两个仓库的 GitHub Releases，全程验证 TLS；`--check` 只查不改。
+
+```bash
+pd update --check           # 只报告可用更新
+pd update                   # 更新 pd 本体 + nproot 运行时
+pd update --pd-only         # 只更新 pd 本体
+pd update --runtime-only    # 只更新 nproot
+pd update --force           # 已是最新也重装
+```
+
+- **pd 本体**：从 Release 下载预编译 wheel（`proot_distro_i18n-<版本>-py3-none-any.whl`）
+  后交给 pip 本地安装。不在设备上现场构建——`pip install
+  git+...` 在 Termux 上长时间停在 `Preparing metadata` 阶段的问题就此绕开。
+  Release 里没有 wheel 时回退 PyPI。更新完成后重启正在运行的 pd 进程生效。
+- **nproot 运行时**：下载本机架构的 `nproot-android-<arch>.zip`，按
+  白名单校验压缩包成员（`nproot`、`host-census`、`preload/*.so`），
+  拒绝路径穿越与符号链接，然后安装到现有 nproot 所在目录（未安装过则
+  装到 `$PREFIX/bin`）。替换用 rename 原子完成：正在运行的容器会话
+  继续用旧版本，新会话用新版本。没有适配本机架构的资产时（如桌面
+  x86_64）仅提示并跳过。
+
+GitHub API 未认证时每 IP 每小时 60 次。遇到限流可导出
+`PD_GITHUB_TOKEN`（或 `GITHUB_TOKEN` / `GH_TOKEN`）提高额度；token
+只从环境变量读取，永不写入配置或日志。
+
 ## 防 apt 升级覆盖（首次运行守护）
 
 本 fork 通过 pip 安装，入口脚本与官方 apt 包 `proot-distro` 的路径相同（`$PREFIX/bin/proot-distro`）。`apt upgrade` 会把入口换回官方 Bash 版，i18n 版静默消失。
@@ -407,6 +474,7 @@ $PREFIX/etc/proot-distro/mirror.json
 | 变量 | 用途 | 默认 |
 |---|---|---|
 | `PD_LANG` | 覆盖语言（`zh_CN` / `en`） | 探测 `LC_ALL`/`LANG` |
+| `PD_GITHUB_TOKEN` | `pd update` 查询 GitHub API 的可选令牌（`GITHUB_TOKEN` / `GH_TOKEN` 亦可） | 无（未认证额度 60 次/时/IP） |
 | `PD_REGISTRY_URL` | 覆盖 registry URL（优先级最高） | 无 |
 | `PD_DOCKER_AUTH` | Docker 仓库鉴权 `username:password` | 无 |
 | `PD_FORCE_NO_COLORS` | 设为 `true` 禁用颜色 | 无 |

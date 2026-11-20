@@ -79,6 +79,7 @@ from proot_distro.commands.login.passwd import (
 )
 from proot_distro.commands.login.proot_cmd import build_proot_args
 from proot_distro.commands.login.quoting import dq
+from proot_distro import settings
 from proot_distro.i18n import _
 
 
@@ -272,6 +273,35 @@ def _resolve_proot_tmp_dir() -> str:
         log_info(_("proot temporary files go to '{path}'.",
                    path=_PROOT_TMP_DIR))
     return _PROOT_TMP_DIR
+
+
+def _compose_guest_path(path: str, dist_type: str) -> str:
+    """The guest PATH for a default-mode Termux session.
+
+    The host Termux ``bin`` dir goes last, after every component the
+    container itself chose (an image's ``ENV PATH``), with duplicates
+    and empty entries squeezed out -- including the one
+    DEFAULT_PATH_ENV carries mid-list, so there is exactly one
+    occurrence and it is the last. The 'passthrough' setting
+    (`pd setting put passthrough false`) flips that for normal-type
+    containers: the entry is *stripped* instead of appended, leaving
+    Termux programs unreachable from the container. A termux-type
+    container is exempt -- its own PATH *is* the Termux prefix, and
+    stripping it would leave the guest no PATH at all.
+    """
+    termux_bin = f"{TERMUX_PREFIX}/bin"
+    components = [
+        c for c in path.split(":") if c and c != termux_bin
+    ]
+    if dist_type == "normal" and not settings.passthrough_enabled():
+        log_info(_("host Termux passthrough is disabled by the "
+                   "'passthrough' setting; Termux programs are not "
+                   "reachable from this session. Restore it with "
+                   "'{cmd} setting put passthrough true'.",
+                   cmd=PROGRAM_NAME))
+    else:
+        components.append(termux_bin)
+    return ":".join(components)
 
 
 def _nproot_env_passthrough(env: dict) -> None:
@@ -542,18 +572,19 @@ def _login_with_rootfs(container_name: str, args, lock,
         if IS_TERMUX and not minimal:
             setup_fake_sysdata(rootfs, container_fd=container_fd)
 
-    # Ensure Termux bin is always last in PATH so guest tools can
-    # invoke host Termux utilities. Skipped in --isolated and --minimal
-    # modes where TERMUX_PREFIX is not bound into the guest. Dedupes any
-    # existing occurrence first.
+    # Host Termux binaries ride the guest PATH in the default mode on
+    # Termux -- appended last, so guest tools shadow them. The
+    # 'passthrough' setting (pd setting put passthrough false) turns
+    # that off for normal-type containers: the entry is stripped from
+    # PATH instead and the profile.d snippet drops its append block (see
+    # the termux_path argument of inject_termux_profile), so Termux
+    # programs are no longer reachable from the container. Skipped in
+    # --isolated and --minimal modes where TERMUX_PREFIX is not bound
+    # into the guest.
     if IS_TERMUX and not isolated and not minimal:
-        termux_bin = f"{TERMUX_PREFIX}/bin"
-        components = [
-            c for c in child_env.get("PATH", "").split(":")
-            if c and c != termux_bin
-        ]
-        components.append(termux_bin)
-        child_env["PATH"] = ":".join(components)
+        child_env["PATH"] = _compose_guest_path(
+            child_env.get("PATH", ""), dist_type
+        )
 
     # Every session writes the snippet, so what `su -` re-exports is what
     # *this* session was handed: written only by a default-mode Termux
@@ -564,7 +595,8 @@ def _login_with_rootfs(container_name: str, args, lock,
     if dist_type == "normal":
         inject_termux_profile(
             rootfs, child_env, rootfs_fd=rootfs_fd,
-            termux_path=IS_TERMUX and not isolated and not minimal,
+            termux_path=IS_TERMUX and not isolated and not minimal
+                        and settings.passthrough_enabled(),
         )
 
     # Architecture detection.

@@ -1064,6 +1064,148 @@ HELP_PAGES = {
             },
         ],
     },
+    "setting": {
+        "usage": "setting {put|set|reset|ls|list|help} [ITEM] [VALUE]",
+        "summary": (
+            "View and change user-facing settings (fork-specific). "
+            "Each setting is listed with its description, current value "
+            "and default; a change is persisted to config.json at once "
+            "but applies to NEW sessions -- the PATH composition and "
+            "the profile.d snippet are both decided when a session "
+            "starts, so running containers are not touched.\n\n"
+            "Current settings:\n\n"
+            "passthrough (default true) -- host Termux passthrough. "
+            "true: container programs first, Termux binaries as the "
+            "fallback (the default behavior; the Termux bin directory "
+            "is appended last on the container PATH); false: the "
+            "Termux bin directory is removed from the container PATH "
+            "and Termux programs cannot be executed."
+        ),
+        "options": [
+            ("-h, --help", "show this help."),
+        ],
+        "examples": [
+            f"{PROGRAM_NAME} setting ls",
+            f"{PROGRAM_NAME} setting put passthrough false",
+            f"{PROGRAM_NAME} setting put passthrough true",
+            f"{PROGRAM_NAME} setting reset passthrough",
+            f"{PROGRAM_NAME} setting reset",
+            f"{PROGRAM_NAME} setting help",
+        ],
+        "footer": [
+            {
+                "title": "SUB-ACTIONS",
+                "intro": (
+                    "put / set <ITEM> <VALUE>: set and persist. Boolean "
+                    "items accept true/false, 1/0, t/f (any case), "
+                    "yes/no, on/off; the stored form is a JSON boolean.\n"
+                    "reset [ITEM]: back to defaults. With ITEM only that "
+                    "setting; without it, all of them -- only keys this "
+                    "command owns are touched, the UI language written "
+                    "by pd lang is never affected.\n"
+                    "ls / list: list every setting (also the default "
+                    "when no sub-action is given).\n"
+                    "help: show this page."
+                ),
+            },
+            {
+                "title": "WHAT passthrough DOES NOT DO",
+                "intro": (
+                    "Turning it off only changes PATH resolution: the "
+                    "Termux prefix stays bound into the container and "
+                    "its files remain readable at absolute paths; the "
+                    "shell just no longer finds the binaries. termux-"
+                    "type containers (a Termux image itself) are not "
+                    "affected -- their PATH is the Termux prefix, and "
+                    "stripping it would leave no PATH at all. The "
+                    "profile.d snippet is rewritten on every login, so "
+                    "no stale append block survives the switch."
+                ),
+            },
+            {
+                "title": "STORAGE",
+                "intro": (
+                    "Same file as lang: "
+                    "$PREFIX/etc/proot-distro/config.json on Termux, "
+                    "~/.config/proot-distro/config.json on the desktop. "
+                    "A damaged file reads as no settings; everything "
+                    "falls back to defaults without an error."
+                ),
+            },
+        ],
+    },
+    "update": {
+        "usage": "update [--check] [--pd-only | --runtime-only] [--force]",
+        "summary": (
+            "Update this program and the nproot runtime (fork-"
+            "specific). Replaces the manual 'pip install --upgrade "
+            "git+...' dance: GitHub Releases carry a prebuilt "
+            "universal wheel (pd) and a binary archive (nproot), "
+            "installed straight from the download -- nothing is built "
+            "on the device, which is exactly what the git+ route does "
+            "and why it can sit at 'Preparing metadata' forever on "
+            "Termux.\n\n"
+            "Both targets run in order by default: this program first, "
+            "then the nproot runtime."
+        ),
+        "options": [
+            ("-h, --help", "show this help."),
+            ("--check", "report available updates; change nothing."),
+            ("--pd-only", "update this program; leave nproot alone."),
+            ("--runtime-only", "update the nproot runtime; leave this "
+             "program alone."),
+            ("--force", "reinstall even when up to date."),
+            ("--allow-insecure", "accept self-signed/expired "
+             "certificates and downgraded HTTP redirects."),
+            ("-q, --quiet", "quiet mode."),
+        ],
+        "examples": [
+            f"{PROGRAM_NAME} update --check",
+            f"{PROGRAM_NAME} update",
+            f"{PROGRAM_NAME} update --runtime-only",
+            f"{PROGRAM_NAME} update --pd-only --force",
+        ],
+        "footer": [
+            {
+                "title": "THIS PROGRAM (pd)",
+                "intro": (
+                    "The latest release of masgzy/proot-distro-i18n is "
+                    "queried for proot_distro_i18n-<version>-py3-none-"
+                    "any.whl, downloaded and handed to pip as a local "
+                    "file (--no-deps; the package has no dependencies). "
+                    "A release without a wheel falls back to PyPI; with "
+                    "neither, manual commands are printed. Restart any "
+                    "running pd process afterwards."
+                ),
+            },
+            {
+                "title": "THE NPROOT RUNTIME",
+                "intro": (
+                    "The latest release of masgzy/nproot is queried for "
+                    "nproot-android-<arch>.zip for this device's CPU, "
+                    "extracted and installed next to wherever the "
+                    "current nproot was found (or into $PREFIX/bin when "
+                    "none is). Archive members are checked against a "
+                    "strict whitelist (nproot, host-census, "
+                    "preload/*.so); path traversal and symlinks are "
+                    "refused; a running binary is replaced atomically "
+                    "via rename, so live sessions keep the old inode "
+                    "while new ones get the new version. When no asset "
+                    "matches this device (e.g. a desktop x86_64 box), "
+                    "the target is skipped with a notice."
+                ),
+            },
+            {
+                "title": "GITHUB RATE LIMITS",
+                "intro": (
+                    "Unauthenticated GitHub API allows 60 requests per "
+                    "hour per IP. When rate-limited, export "
+                    "PD_GITHUB_TOKEN (or GITHUB_TOKEN / GH_TOKEN) and "
+                    "retry; a token is never written to config or logs."
+                ),
+            },
+        ],
+    },
     "version": {
         "usage": "version",
         "summary": (
@@ -1135,5 +1277,7 @@ TOP_COMMANDS = [
     ("search", "Search Docker Hub for images."),
     ("mirror", "Manage Docker registry mirrors (ls/test/use/unset/show)."),
     ("lang", "Show and set the UI language (get/use/list/reset)."),
+    ("setting", "View and change user settings (put/reset/ls)."),
+    ("update", "Update pd itself and the nproot runtime (--check first)."),
     ("version", "Show version and build information (v / ver / -V)."),
 ]

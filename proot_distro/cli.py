@@ -62,6 +62,8 @@ from proot_distro.commands.kill import command_kill
 from proot_distro.commands.mirror import command_mirror
 from proot_distro.commands.search import command_search
 from proot_distro.commands.lang import command_lang
+from proot_distro.commands.setting import command_setting
+from proot_distro.commands.update import command_update
 from proot_distro.commands.version import command_version
 
 
@@ -85,6 +87,8 @@ _COMMAND_HANDLERS = {
     "mirror":      command_mirror,
     "search":      command_search,
     "lang":        command_lang,
+    "setting":     command_setting,
+    "update":      command_update,
     "version":     command_version,
     "help":        command_help,
 }
@@ -153,7 +157,7 @@ def _refuse_nested_proot() -> None:
 
 # Commands that never invoke proot — exempt from the proot-on-PATH
 # startup probe. Documented inline so future commands can opt in.
-_PROOT_EXEMPT_COMMANDS = frozenset({"build", "push", "kill", "ps", "mirror", "search", "lang", "help", "version"})
+_PROOT_EXEMPT_COMMANDS = frozenset({"build", "push", "kill", "ps", "mirror", "search", "lang", "setting", "update", "help", "version"})
 
 
 def ensure_proot_installed() -> None:

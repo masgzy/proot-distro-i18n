@@ -229,6 +229,8 @@ def build_parser() -> _PdArgumentParser:
     _kill(sub)
     _mirror(sub)
     _lang(sub)
+    _setting(sub)
+    _update(sub)
     _version(sub)
 
     return parser
@@ -247,6 +249,48 @@ def _lang(sub):
     p.add_argument(
         "locale", nargs="?", default=None, metavar="LOCALE",
     )
+    p.add_argument("-h", "--help", action="store_true")
+
+
+def _setting(sub):
+    # 用户设置（本 fork 特有）。不带子动作时默认 ls。
+    p = sub.add_parser("setting", add_help=False)
+    p._pd_command = "setting"
+    p.add_argument(
+        "setting_action", nargs="?", default="ls",
+        metavar="{put,set,reset,ls,list,help}",
+        choices=["put", "set", "reset", "ls", "list", "help"],
+    )
+    p.add_argument("item", nargs="?", default=None, metavar="ITEM")
+    p.add_argument("value", nargs="?", default=None, metavar="VALUE")
+    p.add_argument("-h", "--help", action="store_true")
+
+
+def _update(sub):
+    # 自更新：pd 本体 + nproot 运行时（本 fork 特有）
+    p = sub.add_parser("update", add_help=False)
+    p._pd_command = "update"
+    p.add_argument(
+        "--check", dest="check", action="store_true",
+        help="only report what is available; change nothing",
+    )
+    scope = p.add_mutually_exclusive_group()
+    scope.add_argument(
+        "--pd-only", dest="pd_only", action="store_true",
+        help="update this program; leave the nproot runtime alone",
+    )
+    scope.add_argument(
+        "--runtime-only", dest="runtime_only", action="store_true",
+        help="update the nproot runtime; leave this program alone",
+    )
+    p.add_argument(
+        "--force", dest="force", action="store_true",
+        help="apply even when already up to date (reinstall)",
+    )
+    p.add_argument(
+        "--allow-insecure", dest="allow_insecure", action="store_true",
+    )
+    p.add_argument("-q", "--quiet", action="store_true")
     p.add_argument("-h", "--help", action="store_true")
 
 

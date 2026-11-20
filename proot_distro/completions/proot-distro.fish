@@ -71,7 +71,7 @@ end
 function __proot_distro_no_subcommand
     not __fish_seen_subcommand_from \
         install search remove rename reset login list ps kill backup restore \
-        clear-cache copy sync run build push mirror lang version help
+        clear-cache copy sync run build push mirror lang setting update version help
 end
 
 # ---------------------------------------------------------------------------
@@ -95,6 +95,8 @@ complete -c proot-distro -f -n __proot_distro_no_subcommand -a build       -d '�
 complete -c proot-distro -f -n __proot_distro_no_subcommand -a push        -d '把本地构建的镜像推送到仓库'
 complete -c proot-distro -f -n __proot_distro_no_subcommand -a mirror      -d '管理 Docker registry 镜像源'
 complete -c proot-distro -f -n __proot_distro_no_subcommand -a lang        -d '查看与设置界面语言'
+complete -c proot-distro -f -n __proot_distro_no_subcommand -a setting     -d '查看与修改用户设置'
+complete -c proot-distro -f -n __proot_distro_no_subcommand -a update      -d '更新 pd 本体与 nproot 运行时'
 complete -c proot-distro -f -n __proot_distro_no_subcommand -a version     -d '显示版本与构建信息'
 complete -c proot-distro -f -n __proot_distro_no_subcommand -a help        -d '显示帮助'
 complete -c proot-distro -f -n __proot_distro_no_subcommand -a install     -d 'Install a container from a Docker image or local archive'

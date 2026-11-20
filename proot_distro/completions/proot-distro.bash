@@ -61,7 +61,7 @@ _proot_distro() {
     _init_completion || return
 
     local -r _all_commands="install search remove rename reset login list ps kill backup
-        restore clear-cache copy sync run build push mirror lang version help"
+        restore clear-cache copy sync run build push mirror lang setting update version help"
 
     # Complete the subcommand itself
     if [[ ${cword} -eq 1 ]]; then
@@ -380,13 +380,35 @@ _proot_distro() {
             ;;
 
         # -----------------------------------------------------------------------
+        setting)
+            if [[ "${cur}" == -* ]]; then
+                COMPREPLY=($(compgen -W "-h --help" -- "${cur}"))
+            else
+                # 第一个位置参数: 子动作; 之后: ITEM VALUE
+                local actions="put set reset ls list help"
+                local items="passthrough"
+                local prev_word="${words[cword-1]}"
+                if [[ " put set reset " == *" ${prev_word} "* ]]; then
+                    COMPREPLY=($(compgen -W "${items}" -- "${cur}"))
+                else
+                    COMPREPLY=($(compgen -W "${actions}" -- "${cur}"))
+                fi
+            fi
+            ;;
+
+        # -----------------------------------------------------------------------
+        update)
+            COMPREPLY=($(compgen -W "-h --help --check --pd-only --runtime-only --force --allow-insecure -q --quiet" -- "${cur}"))
+            ;;
+
+        # -----------------------------------------------------------------------
         version)
             COMPREPLY=($(compgen -W "-h --help" -- "${cur}"))
             ;;
 
         # -----------------------------------------------------------------------
         help)
-            local topics="install search remove rename reset login list ps kill backup restore clear-cache copy sync run build push mirror lang version"
+            local topics="install search remove rename reset login list ps kill backup restore clear-cache copy sync run build push mirror lang setting update version"
             COMPREPLY=($(compgen -W "${topics}" -- "${cur}"))
             ;;
 

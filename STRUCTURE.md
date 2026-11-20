@@ -29,7 +29,7 @@ proot_distro/
   dirfd.py  statedir.py  atomic.py  locking.py  paths.py        Safe filesystem layer
   guestfile.py  l2s.py  shm.py  sysdata.py  session.py         Container runtime state
   arch.py  compress.py                                          CPU/emulator and zstd knowledge
-  i18n.py  config.py  autohold.py                               Fork: JSON translations, user prefs (config.json), first-run apt-mark hold guard
+  i18n.py  config.py  settings.py  autohold.py                 Fork: JSON translations, user prefs + pd setting registry (config.json), first-run apt-mark hold guard
   mirrors.py                                                    Fork: registry mirror table + probing
   locales/<locale>.json                                         Fork: flat {source: translated} dicts, no compile step
 ```
@@ -66,6 +66,10 @@ what the command takes (see `locking.py`).
 | `ps` | `ps.py` | List live sessions from the session registry. | none |
 | `kill` | `kill.py` | Tear down a session's whole process tree. | none |
 | `clear-cache` (`clear`, `cl`) | `clear_cache.py` | Delete the download cache, or only orphan blobs / the build index. The orphan and build-index sweeps refuse while another command holds an exclusive lock. | none taken; sweeps probe for held locks |
+| `mirror` (`mir`, `mr`) | `mirror.py` | List, probe, and switch Docker registry mirrors; `mirror.json`/`mirrors.json` under `CONFIG_DIR`. | none |
+| `lang` | `lang.py` | Show/set/reset the UI language; the `language` key of `config.json`. | none |
+| `setting` | `setting.py`, `settings.py` | Show/change user settings (registry in `settings.py`, storage in `config.json`); first item `passthrough` gates whether host Termux binaries ride a normal container's PATH. | none |
+| `update` | `update.py` | Update this package (release wheel → local pip install) and the nproot runtime (release zip, whitelist-checked, rename-over-running-binary install). Optional `PD_GITHUB_TOKEN` for API rate limits. Exempt from the proot probe. | none |
 | `version` (`v`, `ver`) | `version.py` | Print the fork version, 8-hex build hash (PD_BUILD_HASH > git probe > unknown), the resolved container runtime and the UI language. Exempt from the proot probe like `help`; pipe-safe stdout. | none |
 
 `login/` is split by concern:

@@ -287,6 +287,20 @@ def find_proot_bin():
     return None
 
 
+def find_nproot_bin():
+    """Return the absolute path of an installed nproot, or None.
+
+    The same search _find_bin() performs, narrowed to the "nproot"
+    name: `update` wants the runtime binary specifically (it installs
+    the refreshed one next to wherever this resolves to), not the
+    stock proot find_proot_bin() would settle for. Absolute for the
+    same reason; None means no nproot anywhere -- the caller decides
+    whether that is a fresh install or an error.
+    """
+    found = _find_bin("nproot")
+    return os.path.abspath(found) if found else None
+
+
 def get_proot_bin() -> str:
     """Return the absolute path of the proot executable, or exit.
 

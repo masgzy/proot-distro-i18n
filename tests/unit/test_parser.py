@@ -84,6 +84,12 @@ def test_each_subcommand_parses():
         (["login", "box"], "login"),
         (["kill", "box"], "kill"),
         (["search", "ubuntu"], "search"),
+        (["lang"], "lang"),
+        (["setting"], "setting"),
+        (["setting", "ls"], "setting"),
+        (["setting", "put", "passthrough", "false"], "setting"),
+        (["update", "--check"], "update"),
+        (["update", "--pd-only"], "update"),
     ]:
         args, _ = p.parse_known_args(argv)
         assert args.command == cmd

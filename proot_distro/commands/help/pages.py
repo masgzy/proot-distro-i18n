@@ -766,6 +766,128 @@ HELP_PAGES = {
         ],
     },
 
+    "setting": {
+        "usage": "setting {put|set|reset|ls|list|help} [ITEM] [VALUE]",
+        "summary": (
+            "查看与修改用户设置（本 fork 特有）。每项设置一行说明、"
+            "当前值与默认值；修改立即持久化到 config.json，但对**新"
+            "会话**生效——PATH 组成与 profile.d 片段都是在会话启动"
+            "时决定的，正在运行的容器不受影响。\n\n"
+            "当前设置项:\n\n"
+            "passthrough（默认 true）— 宿主 Termux 穿透。true: 容器"
+            "内程序优先，Termux 二进制兑底（默认行为，Termux 的 bin "
+            "目录追加在容器 PATH 末尾）；false: 从容器 PATH 中移除 "
+            "Termux 的 bin 目录，容器内无法执行 Termux 程序。"
+        ),
+        "options": [
+            ("-h, --help", "显示本帮助。"),
+        ],
+        "examples": [
+            f"{PROGRAM_NAME} setting ls",
+            f"{PROGRAM_NAME} setting put passthrough false",
+            f"{PROGRAM_NAME} setting put passthrough true",
+            f"{PROGRAM_NAME} setting reset passthrough",
+            f"{PROGRAM_NAME} setting reset",
+            f"{PROGRAM_NAME} setting help",
+        ],
+        "footer": [
+            {
+                "title": "子动作",
+                "intro": (
+                    "put / set <ITEM> <VALUE>: 设置并持久化。布尔项接受 "
+                    "true/false、1/0、t/f（大小写均可）、yes/no、on/off，"
+                    "存储时归一化为 JSON 布尔值。\n"
+                    "reset [ITEM]: 恢复默认。带 ITEM 只重置该项；不带则"
+                    "重置全部设置——只动本命令管理的键，不会影响 lang "
+                    "命令写入的界面语言。\n"
+                    "ls / list: 列出全部设置项（不带子动作时也是这个）。\n"
+                    "help: 显示本页。"
+                ),
+            },
+            {
+                "title": "passthrough 的边界",
+                "intro": (
+                    "关闭只改变 PATH 解析: Termux 前缀仍绑定进容器，"
+                    "按绝对路径仍可访问其中的文件；只是 shell 不再找到"
+                    "它们。termux 类型的容器（Termux 自身镜像）不受此"
+                    "设置影响——它的 PATH 本来就是 Termux 前缀，剥掉"
+                    "等于没有 PATH。另外 profile.d 片段随每次登录重写，"
+                    "关穿透不会留下旧的追加块。"
+                ),
+            },
+            {
+                "title": "存储位置",
+                "intro": (
+                    "与 lang 同一文件: Termux 为 "
+                    "$PREFIX/etc/proot-distro/config.json，桌面为 "
+                    "~/.config/proot-distro/config.json。文件损坏时按"
+                    "无设置处理，一切回默认，不会报错。"
+                ),
+            },
+        ],
+    },
+
+    "update": {
+        "usage": "update [--check] [--pd-only | --runtime-only] [--force]",
+        "summary": (
+            "更新 pd 本体与 nproot 运行时（本 fork 特有）。替代手工"
+            "「pip install --upgrade git+...」: GitHub Releases 提供"
+            "预编译的通用 wheel（pd）与二进制压缩包（nproot），下载"
+            "即装，不在设备上现场构建——正是 git+ 安装在 Termux 上"
+            "长时间停在 Preparing metadata 阶段的绕开方案。\n\n"
+            "两个目标默认依次执行: 先 pd 本体，后 nproot 运行时。"
+        ),
+        "options": [
+            ("-h, --help", "显示本帮助。"),
+            ("--check", "只报告可用更新，不做任何改动。"),
+            ("--pd-only", "只更新 pd 本体，不动 nproot。"),
+            ("--runtime-only", "只更新 nproot 运行时，不动 pd 本体。"),
+            ("--force", "已是最新也重装。"),
+            ("--allow-insecure", "接受自签/过期证书与降级 HTTP 重定向。"),
+            ("-q, --quiet", "静默模式。"),
+        ],
+        "examples": [
+            f"{PROGRAM_NAME} update --check",
+            f"{PROGRAM_NAME} update",
+            f"{PROGRAM_NAME} update --runtime-only",
+            f"{PROGRAM_NAME} update --pd-only --force",
+        ],
+        "footer": [
+            {
+                "title": "pd 本体",
+                "intro": (
+                    "从 masgzy/proot-distro-i18n 的最新 Release 取 "
+                    "proot_distro_i18n-<版本>-py3-none-any.whl 下载后"
+                    "交给 pip 本地安装（--no-deps，本包无依赖）。Release"
+                    "里没有 wheel 时回退 PyPI，两者都没有则给出手工"
+                    "命令。安装完成后重启正在运行的 pd 进程生效。"
+                ),
+            },
+            {
+                "title": "nproot 运行时",
+                "intro": (
+                    "从 masgzy/nproot 的最新 Release 取本机架构的 "
+                    "nproot-android-<arch>.zip，解压后安装到现有 nproot "
+                    "所在目录（未安装则装到 $PREFIX/bin）。压缩包成员"
+                    "按白名单校验（nproot、host-census、preload/*.so），"
+                    "拒绝路径穿越与符号链接；覆盖运行中的二进制用 "
+                    "rename 原子替换，旧会话继续用旧 inode，新会话用"
+                    "新版本。与本机同架构的资产不存在时（如桌面 "
+                    "x86_64）仅提示并跳过。"
+                ),
+            },
+            {
+                "title": "GitHub 限流",
+                "intro": (
+                    "未认证的 GitHub API 每 IP 每小时 60 次。遇到限流"
+                    "时导出 PD_GITHUB_TOKEN（或 GITHUB_TOKEN / "
+                    "GH_TOKEN）再试即可提高额度；token 永不写入配置"
+                    "或日志。"
+                ),
+            },
+        ],
+    },
+
     "ps": {
         "usage": "ps [OPTIONS]",
         "summary": (
@@ -1093,5 +1215,7 @@ TOP_COMMANDS = [
     ("search", "在 Docker Hub 上搜索镜像。"),
     ("mirror", "管理 Docker registry 镜像源（ls/test/use/unset/show）。"),
     ("lang", "查看与设置界面语言（get/use/list/reset）。"),
+    ("setting", "查看与修改用户设置（put/reset/ls）。"),
+    ("update", "更新 pd 本体与 nproot 运行时（--check 先查）。"),
     ("version", "显示版本与构建信息（v / ver / -V）。"),
 ]

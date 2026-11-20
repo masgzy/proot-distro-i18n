@@ -98,6 +98,8 @@ _proot_distro() {
                 'push:把本地构建的镜像推送到仓库'
                 'mirror:管理 Docker registry 镜像源'
                 'lang:查看与设置界面语言'
+                'setting:查看与修改用户设置'
+                'update:更新 pd 本体与 nproot 运行时'
                 'version:显示版本与构建信息'
                 'help:显示帮助'
 =======
@@ -119,6 +121,8 @@ _proot_distro() {
                 'build:build an OCI image from a Dockerfile'
                 'push:push a locally built image to a registry'
                 'lang:show and set the UI language'
+                'setting:view and change user settings'
+                'update:update pd itself and the nproot runtime'
                 'version:show version and build information'
                 'help:show help'
             )
@@ -379,12 +383,33 @@ _proot_distro() {
                     ;;
 
                 # -----------------------------------------------------------
+                setting)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[显示帮助]' \
+                        '1:子动作:(put set reset ls list help)' \
+                        '2:设置项:(passthrough)' \
+                        '3:取值:(true false)'
+                    ;;
+
+                # -----------------------------------------------------------
+                update)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[显示帮助]' \
+                        '--check[只检查不修改]' \
+                        '--pd-only[只更新 pd 本体]' \
+                        '--runtime-only[只更新 nproot 运行时]' \
+                        '--force[已是最新也重装]' \
+                        '--allow-insecure[接受不安全证书与降级重定向]' \
+                        '(-q --quiet)'{-q,--quiet}'[静默模式]'
+                    ;;
+
+                # -----------------------------------------------------------
                 help)
                     local -a topics
                     topics=(
                         install remove rename reset login list ps kill
                         backup restore clear-cache copy sync run
-                        build push mirror lang
+                        build push mirror lang setting update version
                     )
                     _describe '主题' topics
                     ;;
