@@ -51,6 +51,7 @@
 # rule out, so a file this module wrote is one with exactly one link, and
 # anything else is dropped and written again.
 
+import errno
 import os
 import stat
 
@@ -513,8 +514,25 @@ def _write_current(dir_fd: int, name: str, content: str) -> None:
             view = data
             while view:
                 view = view[os.write(fd, view):]
+            written_st = os.fstat(fd)
         finally:
             os.close(fd)
+        # 发布前比对目录项与写入 fd 的 inode：写入期间被换掉就拒绝
+        # 发布，不把别人种的链接 rename 到目标名上（消费者侧
+        # _is_own_file 会再拒一次，这里先不做“发布非我写的内容”
+        # 这件事本身）。
+        try:
+            entry = dirfd.lstat_at(dir_fd, tmp)
+        except OSError:
+            entry = None
+        if (entry is None
+                or (entry.st_dev, entry.st_ino)
+                != (written_st.st_dev, written_st.st_ino)):
+            raise OSError(
+                errno.ESTALE,
+                "the temporary file was replaced while it was being "
+                "written", tmp,
+            )
         os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
     except OSError:
         pass

@@ -41,37 +41,37 @@ belongs to ``pd lang`` and is never touched here. ``reset`` only
 removes keys this registry owns, so ``pd setting reset`` cannot
 silently change the UI language.
 
-The flagship setting is ``passthrough`` (default OFF):
+The settings:
 
-* off -- the default. A normal-type container's PATH has the host
-  Termux ``bin`` dir stripped, and the profile.d snippet drops the
-  append block, so Termux binaries are not reachable from inside the
-  container. The Termux prefix itself stays bound into the guest
-  (files are still readable at absolute paths); only PATH resolution
-  changes. This keeps a container self-contained: no accidental
-  escape into host tools, no surprise when a guest package name
-  shadows a host one.
-* on  -- the host Termux ``bin`` dir is appended last on the guest
-  PATH (container programs first, Termux binaries as the fallback),
-  and the profile.d snippet re-appends it for every login shell.
-
-Sessions must be restarted for a change to apply -- PATH and the
-snippet are both decided when a session starts.
-
-The other registry entry, ``distro_mirror``, is not about the
-session: when it is on, the moment an ``install`` finishes the
-rootfs' package-manager sources are switched to a Chinese mirror
-(distro_mirror.py does the work), so the first ``apt update`` inside
-a fresh container is already fast. It never touches installed
-containers by itself -- ``pd mirror distro`` does that on demand.
+* ``passthrough`` (default OFF): host Termux passthrough. off -- a
+  normal-type container's PATH has the host Termux ``bin`` dir
+  stripped and the profile.d snippet drops the append block, so
+  Termux binaries are not reachable from inside the container. on --
+  the host bin dir is appended last on the guest PATH. Sessions must
+  be restarted for a change to apply.
+* ``distro_mirror`` (default OFF): when it is on, the moment an
+  ``install`` finishes the rootfs' package-manager sources are
+  switched to a Chinese mirror, so the first ``apt update`` inside a
+  fresh container is already fast.
+* ``dns`` (default "auto"): what ``/etc/resolv.conf`` says inside a
+  container. auto -- follow the host's own resolv.conf (fallback:
+  the static 8.8.8.8/8.8.4.4 the upstream ships). A comma-separated
+  list of up to 3 IP addresses pins the servers instead
+  (``pd setting put dns 223.5.5.5,119.29.29.29``). Honored at
+  install and re-applied at each login -- but only while the file is
+  still one this program wrote; a resolv.conf the guest's own root
+  edited is left alone.
 """
 
 from __future__ import annotations
 
+import ipaddress
+
 from proot_distro.config import clear_user_key, load_user_config, save_user_config
+from proot_distro.i18n import _
 
 __all__ = (
-    "SETTING_KIND_BOOL", "SETTINGS",
+    "SETTING_KIND_BOOL", "SETTING_KIND_IP_LIST", "SETTINGS",
     "SettingError", "list_settings", "normalize_bool", "normalize_value",
     "passthrough_enabled", "reset_settings", "set_setting",
 )
@@ -79,6 +79,13 @@ __all__ = (
 # Value kinds. A kind names the normalizer applied to user input; see
 # normalize_value().
 SETTING_KIND_BOOL = "bool"
+SETTING_KIND_IP_LIST = "ip_list"
+
+# ``dns`` 能接受的自动档拼写（= 跟随宿主 resolv.conf）。
+_DNS_AUTO_TOKENS = ("auto", "default", "host")
+
+# musl 与 glibc 的 resolver 各自最多读 3 个 nameserver（MAXNS=3）。
+_MAX_DNS_SERVERS = 3
 
 
 class SettingError(ValueError):
@@ -112,6 +119,57 @@ def normalize_bool(raw: str) -> bool:
     )
 
 
+def normalize_ip_list(raw: str):
+    """Normalize a ``dns`` value: ``auto`` or up to 3 IP addresses.
+
+    Accepts comma- or whitespace-separated IPv4/IPv6 addresses, each
+    validated with ``ipaddress`` (leading/trailing blanks stripped),
+    deduplicated preserving order. More than 3 addresses is an error
+    -- musl and glibc each read at most 3 nameservers (MAXNS=3), so a
+    fourth is a promise the guest resolver never honors; the error
+    names the cap so the user can drop one instead of guessing.
+
+    The auto spellings (auto/default/host) return the string
+    ``"auto"`` -- follow the host's resolv.conf, falling back to the
+    static servers when the host has none. An empty value is an
+    error like any other unrecognized one: `pd setting reset dns`
+    is the way back to auto, and an empty string means nothing.
+    """
+    token = str(raw).strip()
+    if token.lower() in _DNS_AUTO_TOKENS:
+        return "auto"
+    if not token:
+        raise SettingError(_(
+            "empty 'dns' value. Give up to {n} IP addresses "
+            "('223.5.5.5,119.29.29.29'), 'auto' to follow the host, "
+            "or use `setting reset dns`.".format(n=_MAX_DNS_SERVERS)
+        ))
+    seen, servers = set(), []
+    pieces = token.replace(",", " ").split()
+    for piece in pieces:
+        try:
+            ip = ipaddress.ip_address(piece)
+        except ValueError:
+            raise SettingError(_(
+                "'{piece}' is not a valid IP address for 'dns'. "
+                "Example: 223.5.5.5,119.29.29.29; or 'auto' to "
+                "follow the host.".format(piece=piece)
+            )) from None
+        text = str(ip)
+        if text not in seen:
+            seen.add(text)
+            servers.append(text)
+    if not servers:
+        raise SettingError(_("empty 'dns' value."))
+    if len(servers) > _MAX_DNS_SERVERS:
+        raise SettingError(_(
+            "{n} addresses given for 'dns'; the guest resolvers "
+            "(musl, glibc) each read at most 3 nameservers.".format(
+                n=len(servers))
+        ))
+    return servers
+
+
 # The registry: setting name -> spec. Order is the display order of
 # `pd setting ls`. The config.json key is the setting name itself.
 # `doc` is shown by `ls` verbatim through _() (translated like every
@@ -139,12 +197,26 @@ SETTINGS: dict = {
             "with 'mirror distro <name> --revert'."
         ),
     },
+    "dns": {
+        "kind": SETTING_KIND_IP_LIST,
+        "default": "auto",
+        "doc": (
+            "what /etc/resolv.conf says inside a container. auto "
+            "(default): follow the host's resolver config, falling "
+            "back to the static 8.8.8.8/8.8.4.4. Or up to 3 IP "
+            "addresses ('223.5.5.5,119.29.29.29') to pin the "
+            "nameservers. Applied at install and re-applied by every "
+            "login while the file is still ours; a resolv.conf the "
+            "guest edited itself is never touched."
+        ),
+    },
 }
 
 # Normalizers by kind, so normalize_value() stays the single dispatch
 # point for future kinds.
 _NORMALIZERS = {
     SETTING_KIND_BOOL: normalize_bool,
+    SETTING_KIND_IP_LIST: normalize_ip_list,
 }
 
 
@@ -181,6 +253,24 @@ def _read_stored(name: str):
                 return normalize_bool(raw)
             except SettingError:
                 return None
+        return None
+    if spec["kind"] == SETTING_KIND_IP_LIST:
+        # "auto" or a list of valid, unique, ≤3 IP strings; anything
+        # else (hand-edited junk) reads as unset.
+        if raw == "auto":
+            return raw
+        if isinstance(raw, list):
+            try:
+                merged = normalize_ip_list(" ".join(str(x) for x in raw))
+            except SettingError:
+                return None
+            return merged if isinstance(merged, list) else None
+        if isinstance(raw, str):
+            try:
+                merged = normalize_ip_list(raw)
+            except SettingError:
+                return None
+            return merged
         return None
     return raw
 

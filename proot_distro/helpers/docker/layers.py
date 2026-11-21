@@ -37,6 +37,7 @@ from proot_distro.i18n import _
 from proot_distro.message import log_info
 from proot_distro.progress import clear_bar, draw_bytes_bar, fmt_size
 from proot_distro.helpers.download import (
+    MAX_DOWNLOAD_BYTES as MAX_BLOB_BYTES,
     declared_length, new_request, require_complete_body, retry_http,
 )
 from proot_distro.helpers.docker.cache import (
@@ -326,6 +327,14 @@ def download_blob(
                             fh.write(chunk)
                             hasher.update(chunk)
                             downloaded += len(chunk)
+                            # 解压炸弹封顶（见 helpers.download 的同一条规矩）：
+                            # 摘要校验在全量写完之后才发生，上限先把磁盘
+                            # 保住。
+                            if downloaded > MAX_BLOB_BYTES:
+                                raise RuntimeError(_(
+                                    "blob exceeds the {limit} byte "
+                                    "download cap; refusing to keep "
+                                    "writing.", limit=MAX_BLOB_BYTES))
                             draw_bytes_bar(downloaded, total,
                                            noun=_("downloaded"))
                         # Before the digest, so a connection that ended early

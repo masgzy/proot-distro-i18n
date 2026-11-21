@@ -76,6 +76,7 @@ from proot_distro.helpers.layer_diff import (
 from proot_distro.helpers.tar_extract import safe_resolve_parts
 from proot_distro import dirfd
 from proot_distro.atomic import publish_file
+from proot_distro.i18n import _
 
 
 # Chunk size for spooling, the same one tar_extract streams with.
@@ -228,7 +229,12 @@ class _Spool:
 
         The count comes back because one caller has something to compare
         it against: a URL response that declared a Content-Length.
+
+        写入量封顶（同 helpers.download 的体积上限纪律）：一个 ADD
+        的远程响应或压缩成员可以声称任何大小，先把它落到盘上再看
+        是什么就把 /data 填满了——超限即拒绝，不留半截。
         """
+        from proot_distro.helpers.download import MAX_DOWNLOAD_BYTES
         while True:
             self._seq += 1
             name = f"add-{self._seq}.{os.urandom(4).hex()}"
@@ -239,8 +245,17 @@ class _Spool:
             break
         try:
             with os.fdopen(fd, "wb") as out:
-                shutil.copyfileobj(fobj, out, _SPOOL_CHUNK)
-                written = out.tell()
+                written = 0
+                while True:
+                    chunk = fobj.read(_SPOOL_CHUNK)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > MAX_DOWNLOAD_BYTES:
+                        raise RuntimeError(_(
+                            "ADD source exceeds the {limit} byte cap; "
+                            "refusing to spool it.", limit=MAX_DOWNLOAD_BYTES))
+                    out.write(chunk)
         except BaseException:
             dirfd.unlink_quietly(self.fd, name)
             raise

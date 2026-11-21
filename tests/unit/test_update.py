@@ -23,17 +23,31 @@ from proot_distro.commands import update as update_mod
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("text,expected", [
-    ("5.10.2", (5, 10, 2)),
-    ("v5.10.2", (5, 10, 2)),
-    ("V1.2.3.4", (1, 2, 3, 4)),
-    ("1.2", (1, 2)),
-    ("1.2.rc1", (1, 2)),       # stops at the first non-numeric part
-    ("rolling", ()),
-    ("", ()),
-    ("v", ()),
+    ("5.10.2", ((5, 10, 2), 4, 0)),
+    ("v5.10.2", ((5, 10, 2), 4, 0)),
+    ("V1.2.3.4", ((1, 2, 3, 4), 4, 0)),
+    ("1.2", ((1, 2), 4, 0)),
+    ("1.2.rc1", ((1, 2), 3, 1)),   # rc（预发布）比同号正式版旧
+    ("rolling", None),
+    ("", None),
+    ("v", None),
 ])
 def test_parse_version(text, expected):
     assert update_mod._parse_version(text) == expected
+
+
+# PEP 440 后缀方向：post > 正式 > rc > b > a > dev。
+def test_parse_version_orders_suffixes_correctly():
+    base = update_mod._parse_version("5.10.3")
+    assert update_mod._parse_version("5.10.3.post1") > base
+    assert update_mod._parse_version("5.10.4") > base
+    assert update_mod._parse_version("5.10.3a1") < base
+    assert update_mod._parse_version("5.10.3.dev2") < base
+    assert update_mod._parse_version("5.10.3rc1") < base
+    assert update_mod._parse_version("5.11.0") > base
+    # 曾经的旧解析把 '5.10.3.post1' 截断成 (5,10,3)，把 post 发布
+    # 当成“已是最新”静默跳过。
+    assert not (base >= update_mod._parse_version("5.10.3.post1"))
 
 
 # ---------------------------------------------------------------------------
@@ -55,14 +69,31 @@ def test_pick_wheel_asset():
         _asset("proot_distro_i18n-5.10.2-py3-none-any.whl",
                "https://example.invalid/w.whl"),
     ])
-    assert update_mod._pick_wheel_asset(release) == (
+    version, url, name, sha = update_mod._pick_wheel_asset(release)
+    assert (version, url, name) == (
         "5.10.2", "https://example.invalid/w.whl",
         "proot_distro_i18n-5.10.2-py3-none-any.whl")
+    assert sha == ""  # 无 digest 元数据时不校验，但字段存在
+
+
+def test_pick_wheel_asset_uses_the_digest_when_present():
+    asset = _asset("proot_distro_i18n-5.10.2-py3-none-any.whl")
+    asset["digest"] = "sha256:" + "ab" * 32
+    release = _release(assets=[asset])
+    _version, _url, _name, sha = update_mod._pick_wheel_asset(release)
+    assert sha == "ab" * 32
+
+
+def test_pick_wheel_asset_ignores_a_malformed_digest():
+    asset = _asset("proot_distro_i18n-5.10.2-py3-none-any.whl")
+    asset["digest"] = "not-a-digest"
+    release = _release(assets=[asset])
+    assert update_mod._pick_wheel_asset(release)[3] == ""
 
 
 def test_pick_wheel_asset_missing():
     release = _release(assets=[_asset("Source.tar.gz")])
-    assert update_mod._pick_wheel_asset(release) == ("", "", "")
+    assert update_mod._pick_wheel_asset(release) == ("", "", "", "")
 
 
 def test_nproot_asset_for_device(monkeypatch):
@@ -70,20 +101,23 @@ def test_nproot_asset_for_device(monkeypatch):
     release = _release(tag="v5.1.107.105", assets=[
         _asset("nproot-android-arm64.zip", "https://example.invalid/z.zip"),
     ])
-    assert update_mod._nproot_asset_for_device(release) == (
+    tag, url, name, sha = update_mod._nproot_asset_for_device(release)
+    assert (tag, url, name) == (
         "v5.1.107.105", "https://example.invalid/z.zip",
         "nproot-android-arm64.zip")
+    assert sha == ""
 
 
 def test_nproot_asset_wrong_arch(monkeypatch):
     monkeypatch.setattr(update_mod, "get_device_cpu_arch", lambda: "riscv64")
-    assert update_mod._nproot_asset_for_device(_release()) == ("", "", "")
+    assert update_mod._nproot_asset_for_device(_release()) == (
+        "", "", "", "")
 
 
 def test_nproot_asset_missing_for_arch(monkeypatch):
     monkeypatch.setattr(update_mod, "get_device_cpu_arch", lambda: "x86_64")
     release = _release(assets=[_asset("nproot-android-arm64.zip")])
-    tag, url, name = update_mod._nproot_asset_for_device(release)
+    tag, url, name, _sha = update_mod._nproot_asset_for_device(release)
     assert tag and not url and not name
 
 
@@ -274,7 +308,7 @@ def test_update_pd_installs_newer_wheel(monkeypatch, tmp_path):
                             _asset(_WHEEL_5103)]))
     monkeypatch.setattr(update_mod, "PROGRAM_VERSION", "5.10.2")
     monkeypatch.setattr(update_mod, "download_file",
-                        lambda url, dest, insecure=False: None)
+                        lambda url, dest, insecure=False, sha256=None: None)
     ran = {}
     monkeypatch.setattr(update_mod, "_pip_install",
                         lambda wheel: ran.setdefault("wheel", wheel))
@@ -292,6 +326,15 @@ def test_update_pd_older_release_needs_force(monkeypatch):
                                  force=False) is False
 
 
+def test_self_update_never_runs_insecure(monkeypatch):
+    """--allow-insecure 会把 pip 马上要执行的代码交给中间人：拒发。"""
+    with pytest.raises(RuntimeError, match="allow-insecure"):
+        update_mod._update_pd(check_only=False, insecure=True, force=False)
+    with pytest.raises(RuntimeError, match="allow-insecure"):
+        update_mod._update_nproot(check_only=False, insecure=True,
+                                  force=False)
+
+
 def test_update_pd_rolling_checkout_refuses_without_force(monkeypatch):
     monkeypatch.setattr(update_mod, "_latest_release",
                         lambda repo: _release(tag="v5.10.3", assets=[
@@ -307,7 +350,8 @@ def test_update_pd_falls_back_to_pypi(monkeypatch):
                         lambda repo: _release(assets=[]))
     monkeypatch.setattr(update_mod, "_wheel_url_on_pypi",
                         lambda: ("5.10.4", "https://example.invalid/f.whl",
-                                 "proot_distro_i18n-5.10.4-py3-none-any.whl"))
+                                 "proot_distro_i18n-5.10.4-py3-none-any.whl",
+                                 ""))
     monkeypatch.setattr(update_mod, "PROGRAM_VERSION", "5.10.2")
     assert update_mod._update_pd(check_only=True, insecure=False,
                                  force=False) is True
@@ -316,7 +360,8 @@ def test_update_pd_falls_back_to_pypi(monkeypatch):
 def test_update_pd_no_wheel_anywhere_is_an_honest_no(monkeypatch):
     monkeypatch.setattr(update_mod, "_latest_release",
                         lambda repo: _release(assets=[]))
-    monkeypatch.setattr(update_mod, "_wheel_url_on_pypi", lambda: ("", "", ""))
+    monkeypatch.setattr(update_mod, "_wheel_url_on_pypi",
+                        lambda: ("", "", "", ""))
     assert update_mod._update_pd(check_only=False, insecure=False,
                                  force=False) is False
 
@@ -339,7 +384,8 @@ def _fake_arm64_device(monkeypatch):
 def _fake_download(monkeypatch, archive_path):
     monkeypatch.setattr(
         update_mod, "download_file",
-        lambda url, dest, insecure=False: shutil.copyfile(archive_path, dest))
+        lambda url, dest, insecure=False, sha256=None:
+            shutil.copyfile(archive_path, dest))
 
 
 def test_update_nproot_skips_when_no_asset(monkeypatch):

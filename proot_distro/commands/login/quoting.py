@@ -33,9 +33,19 @@ _SAFE_CHARS = frozenset(
 
 
 def dq(s: str) -> str:
-    """Return s in double quotes for a POSIX shell, quoting only when needed."""
+    """Return s in double quotes for a POSIX shell, quoting only when needed.
+
+    A string containing ``!`` falls back to single quotes: inside double
+    quotes bash's interactive history expansion still fires (``!!``
+    splices the previous command into the line the user pasted the
+    produced command into), and there is no double-quote escape for it
+    that does not change the value for every other shell. Single quotes
+    carry it through everywhere.
+    """
     if s and all(c in _SAFE_CHARS for c in s):
         return s
+    if "!" in s:
+        return "'" + s.replace("'", "'\\''") + "'"
     escaped = (
         s.replace("\\", "\\\\")
          .replace('"', '\\"')

@@ -63,6 +63,7 @@ from proot_distro.paths import (
     container_image_config, container_rootfs, open_container_pair,
 )
 
+from proot_distro.helpers.resolv import refresh_guest_dns
 from proot_distro.commands.login.env import (
     ANDROID_HOST_ENV_VARS, identity_env_pairs, image_env_pairs,
     inject_termux_profile,
@@ -592,6 +593,13 @@ def _login_with_rootfs(container_name: str, args, lock,
             child_env.get("PATH", ""), dist_type
         )
 
+    # 每个会话开始前把客人的 /etc/resolv.conf 刷新为当前决策（见
+    # helpers.resolv）：静态 8.8.8.8 在国内网络/Android 私人 DNS 下
+    # 常年不可用，是 apk/apt/dnf 解析失败的根因。只刷自己写过的文件
+    # （带管理标记）；客人自己接管过的 resolv.conf 不动。best-effort，
+    # 失败不影响会话。
+    refresh_guest_dns(rootfs_fd)
+
     # Every session writes the snippet, so what `su -` re-exports is what
     # *this* session was handed: written only by a default-mode Termux
     # login, it outlived that and an --isolated session after a rename
@@ -736,7 +744,13 @@ def _login_with_rootfs(container_name: str, args, lock,
              f"inside the directory it validated.")
         parts = ["env", "-i"]
         for k, v in child_env.items():
-            parts.append(f"{k}={dq(v)}")
+            # The whole assignment is one quoted word, key included: the
+            # key is filtered to identifier grammar where the pair was
+            # built (image_env_pairs, _VALID_ENV_KEY_RE), but the user's
+            # own --env can still name anything -- and an unquoted key
+            # with spaces or `;` would splice commands into the line the
+            # user pipes this output into, which is the documented use.
+            parts.append(dq(f"{k}={v}"))
         parts.extend(dq(a) for a in proot_args)
         _print_command(" \\\n  ".join(parts) + "\n")
         sys.exit(0)

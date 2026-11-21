@@ -65,6 +65,11 @@ from proot_distro.helpers.download import download_file
 from proot_distro.commands.install_local import install_from_local_file
 from proot_distro.i18n import _
 
+import re
+
+# ``--sha256`` 的形态：64 个十六进制字符（大小写均可）。
+_SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
+
 
 # Archive extensions stripped when deriving a container name from a filename.
 _ARCHIVE_EXTS = (
@@ -184,11 +189,18 @@ def command_install(args) -> None:
     )
 
     allow_insecure = bool(getattr(args, "allow_insecure", False))
+    expected_sha256 = getattr(args, "expected_sha256", None) or ""
+    expected_sha256 = expected_sha256.strip().lower()
+    if expected_sha256 and not _SHA256_RE.fullmatch(expected_sha256):
+        crit_error(_("--sha256 expects 64 hexadecimal characters, got "
+                     "'{value}'.", value=expected_sha256))
+        sys.exit(1)
 
     with ContainerLock(install_name, exclusive=True, command="install"):
         _run_install(
             install_name, image_ref, local_path, url, dist_arch,
             allow_insecure,
+            expected_sha256=expected_sha256 or None,
         )
 
 
@@ -244,6 +256,7 @@ def _run_install(
     url,
     dist_arch: str,
     allow_insecure: bool = False,
+    expected_sha256: str = None,
 ) -> None:
     """Inner install logic — called with the container lock already held."""
     container_path = container_dir(install_name)
@@ -314,7 +327,10 @@ def _run_install(
         elif url is not None:
             tmp_archive = _cache_temp_file(f"dl_install_{install_name}")
             log_info(_("Downloading archive..."))
-            download_file(url, tmp_archive, insecure=allow_insecure)
+            download_file(
+                url, tmp_archive, insecure=allow_insecure,
+                sha256=expected_sha256,
+            )
             log_info(_("Extracting rootfs from archive..."))
             metadata = install_from_local_file(
                 tmp_archive, rootfs_fd, dist_arch,
@@ -380,6 +396,20 @@ def _run_install(
 
         setup_fake_sysdata(rootfs_dir, container_fd=container_fd)
 
+        # The 'distro_mirror' setting: when it is on, the freshly
+        # extracted rootfs gets its package sources switched to a
+        # Chinese mirror right here, before the first `apt update`
+        # inside can be slow. Best effort -- a failure to switch is a
+        # warning, never an install failure: the container itself is
+        # fine. 坐在 try 里、传 rootfs_fd：曾经它在 finally 关掉描述符
+        # 之后按名字重解一次客人可换的 rootfs 路径——正是上面几段
+        # fixup 修过的那一类洞的重演；现在与 fixups 同规则，
+        # 复用安装自己钉住的描述符。
+        if distro_mirror_enabled():
+            switch_distro_mirror(
+                rootfs_dir, install_name, root_fd=rootfs_fd,
+            )
+
     except KeyboardInterrupt:
         clear_bar()
         log_error(_("Aborted by user."))
@@ -406,14 +436,6 @@ def _run_install(
                 os.remove(tmp_archive)
             except OSError:
                 pass
-
-    # The 'distro_mirror' setting: when it is on, the freshly extracted
-    # rootfs gets its package sources switched to a Chinese mirror right
-    # here, before the first `apt update` inside can be slow. Best
-    # effort -- a failure to switch is a warning, never an install
-    # failure: the container itself is fine.
-    if distro_mirror_enabled():
-        switch_distro_mirror(rootfs_dir, install_name)
 
     log_info(_("Finished installation."))
     msg()

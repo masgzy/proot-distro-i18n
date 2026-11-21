@@ -187,6 +187,35 @@ _RESOLV_CONF = (
     f"nameserver {DEFAULT_SECONDARY_NS}\n"
 )
 
+# DNS 决策已交给 proot_distro.helpers.resolv：安装/build stage 写入的
+# 不再是写死的 8.8.8.8，而是 ``dns`` 设置 > 宿主 resolv.conf > 静态默认
+# 的当前决策（带管理标记行，供 login 侧识别与刷新）；这里仅保留旧静态
+# 模板做向后兼容参照。见那个模块的 docstring —— 静态 Google DNS 在
+# 国内网络/Android 私人 DNS 下几乎不可用，是 apk/apt 解析失败的根因。
+
+
+def write_resolv_conf_at(etc_fd: int, servers=None) -> None:
+    """write_resolv_conf() against an open descriptor on `etc`.
+
+    *servers* 为 None 时取当前决策（见 helpers.resolv），显式列表时
+    直接采用（最多 3 个，写入侧截断）。
+    """
+    from proot_distro.helpers.resolv import resolv_conf_text
+
+    _replace_at(etc_fd, "resolv.conf", resolv_conf_text(servers))
+
+
+def write_resolv_conf(rootfs: str, *, root_fd=None) -> None:
+    """Replace /etc/resolv.conf with a plain file containing default DNS servers."""
+    etc_fd = _open_etc(rootfs, root_fd)
+    if etc_fd is None:
+        return
+    try:
+        write_resolv_conf_at(etc_fd)
+    finally:
+        os.close(etc_fd)
+
+
 _HOSTS = (
     "# IPv4.\n"
     "127.0.0.1   localhost.localdomain localhost\n\n"
@@ -199,22 +228,6 @@ _HOSTS = (
     "ff02::2     ip6-allrouters\n"
     "ff02::3     ip6-allhosts\n"
 )
-
-
-def write_resolv_conf_at(etc_fd: int) -> None:
-    """write_resolv_conf() against an open descriptor on `etc`."""
-    _replace_at(etc_fd, "resolv.conf", _RESOLV_CONF)
-
-
-def write_resolv_conf(rootfs: str, *, root_fd=None) -> None:
-    """Replace /etc/resolv.conf with a plain file containing default DNS servers."""
-    etc_fd = _open_etc(rootfs, root_fd)
-    if etc_fd is None:
-        return
-    try:
-        write_resolv_conf_at(etc_fd)
-    finally:
-        os.close(etc_fd)
 
 
 def write_hosts_at(etc_fd: int) -> None:

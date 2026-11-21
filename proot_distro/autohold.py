@@ -54,13 +54,16 @@ import os
 import subprocess
 import sys
 
+from proot_distro import dirfd
 from proot_distro.constants import IS_TERMUX, RUNTIME_DIR
 from proot_distro.i18n import _
 from proot_distro.message import C, msg
+from proot_distro.statedir import open_state_dir
 
 __all__ = ("maybe_auto_hold",)
 
 _HOLD_SENTINEL = os.path.join(RUNTIME_DIR, ".autohold-checked")
+_HOLD_SENTINEL_NAME = ".autohold-checked"
 _PKG = "proot-distro"
 _TIMEOUT = 15
 
@@ -99,8 +102,10 @@ def maybe_auto_hold() -> None:
         "1", "true", "yes", "on"
     ):
         return
-    # 2. 只在 Termux 上有意义；标记文件已写过则跳过
-    if not IS_TERMUX or os.path.exists(_HOLD_SENTINEL):
+    # 2. 只在 Termux 上有意义；标记文件已写过则跳过。lstat 而非
+    #    os.path.exists：exists 会追符号链接，悬空链接会被当成
+    #    “不存在”而继续往下——而写入那一侧本来就拒绝链接。
+    if not IS_TERMUX or _sentinel_present():
         return
 
     try:
@@ -144,11 +149,40 @@ def maybe_auto_hold() -> None:
         _mark_done()
 
 
-def _mark_done() -> None:
-    """写"已检测"标记；失败静默（顶多下次再查一遍）。"""
+def _sentinel_present() -> bool:
+    """标记条目本身存在（lstat 语义：链接也算“存在”）。"""
     try:
-        os.makedirs(RUNTIME_DIR, exist_ok=True)
-        with open(_HOLD_SENTINEL, "w", encoding="utf-8") as fh:
-            fh.write("checked\n")
+        st = os.lstat(_HOLD_SENTINEL)
     except OSError:
-        pass
+        return False
+    return st.st_mode is not None
+
+
+def _mark_done() -> None:
+    """写"已检测"标记；失败静默（顶多下次再查一遍）。
+
+    RUNTIME_DIR 在 Termux 上位于客人可写的 $PREFIX 之下，所以这里
+    曾经的 ``open(_HOLD_SENTINEL, "w")`` 按名字写入会追进客人种下的
+    符号链接——把任意一个客人选定的宿主文件截成 8 字节。改为经
+    open_state_dir 的 O_NOFOLLOW 下钻拿到目录描述符，再用 O_EXCL
+    创建条目：链接（无论悬空与否）都会被拒绝而不是被穿过，并且
+    已写过的标记不会被第二次写入覆盖。
+    """
+    try:
+        dir_fd = open_state_dir(RUNTIME_DIR, create=True)
+    except OSError:
+        return
+    try:
+        try:
+            fd, _st = dirfd.open_new_at(dir_fd, _HOLD_SENTINEL_NAME, 0o644)
+        except OSError:
+            # 已存在（或其它任何拒绝）——都当作“写过了”处理。
+            return
+        try:
+            os.write(fd, b"checked\n")
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dir_fd)

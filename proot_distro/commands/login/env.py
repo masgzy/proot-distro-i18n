@@ -137,6 +137,15 @@ def image_env_pairs(container_name: str):
         key, _, val = entry.partition("=")
         if not key or key in IMAGE_ENV_BLOCKED or is_host_exec_var(key):
             continue
+        # The name has to be a shell-and-execve identifier as well:
+        # --get-proot-cmd prints these as `KEY=value` words for a shell to
+        # evaluate, and the profile.d snippet writes them as `export KEY=…`
+        # lines -- a key carrying spaces, `;`, `$()` or quotes is either a
+        # syntax error for the first or command substitution for the
+        # second. The snippet builder re-runs this check; running it here
+        # keeps every other consumer of the pairs from having to.
+        if not _VALID_ENV_KEY_RE.match(key):
+            continue
         # A NUL, an unencodable code point or a string past what
         # execve(2) takes: each used to end the exec in a traceback, and
         # the file it comes out of is a guest's to write (execenv).

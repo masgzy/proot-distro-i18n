@@ -26,6 +26,22 @@
 # oci_manifests/ so a single `clear-cache` removes all build artefacts
 # together; `clear-cache --build-cache` drops this index alone and lets
 # the layer sweep collect what it was pinning.
+#
+# Trust posture (stated plainly, because the digest checks alone do not
+# settle it): every blob is re-hashed against the digest its cache name
+# declares, and every entry's recipe hash is a pure function of the
+# Dockerfile text and its inputs -- but the *index itself* lives under
+# the same $PREFIX a non-isolated container can write. A guest that
+# plants a self-consistent pair (a layer blob plus an index entry
+# mapping the next RUN's recipe hash to that blob) gets that layer
+# applied instead of executing the step. Nothing inside the prefix can
+# authenticate the index (no secret location exists under the default
+# Termux binds); the defenses are the digest gates, the O_NOFOLLOW walk
+# on every read, and the fact that a guest able to do this is already
+# able to write the prefix's own binaries. When the guest is not
+# trusted, build from an --isolated session or run `build --no-cache`;
+# see the module docs of locking.py for the same statement about the
+# lock files.
 
 import contextlib
 import fcntl

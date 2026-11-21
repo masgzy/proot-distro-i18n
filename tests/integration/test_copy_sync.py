@@ -874,7 +874,21 @@ def test_copy_handles_a_name_too_long_for_the_temp_suffix(tmp_path, builders):
         "data"
 
 
-def test_sync_steps_over_an_entry_it_cannot_write(tmp_path, builders, capsys):
+def _fixed_temp_name(name, suffix):
+    """还原“固定临时名”的旧世界，供预埋类测试用。
+
+    生产代码的临时名已带进程号 + 随机字节（预埋/并发占用不再可命中）；
+    这些测试验证的是“临时名被占用时写入侧的拒绝/绕行行为”，
+    把名字钉回固定形态后，预埋的目录/硬链接才能重新落在写入路径上。
+    """
+    marker = ".~pd_"
+    if marker in suffix:
+        suffix = suffix[suffix.rfind(marker):]
+    return name + suffix
+
+
+def test_sync_steps_over_an_entry_it_cannot_write(tmp_path, builders, capsys,
+                                                  monkeypatch):
     """One unwritable entry must not abandon the rest of the transfer.
 
     A container can arrange this at will: a *directory* under the temp
@@ -894,6 +908,7 @@ def test_sync_steps_over_an_entry_it_cannot_write(tmp_path, builders, capsys):
     os.makedirs(dst)
     os.mkdir(os.path.join(dst, "a.txt" + dirfd.TMP_SUFFIX.replace("copy",
                                                                   "sync")))
+    monkeypatch.setattr(dirfd, "temp_name", _fixed_temp_name)
 
     with pytest.raises(SystemExit) as exc:
         _sync(str(src), "box:/dst")
@@ -906,7 +921,8 @@ def test_sync_steps_over_an_entry_it_cannot_write(tmp_path, builders, capsys):
 
 
 def test_sync_leaves_the_old_content_when_a_write_is_blocked(tmp_path,
-                                                             builders):
+                                                             builders,
+                                                             monkeypatch):
     """A blocked write must not take the destination down with it.
 
     The content goes to a temp file and is renamed into place, so a write
@@ -925,6 +941,7 @@ def test_sync_leaves_the_old_content_when_a_write_is_blocked(tmp_path,
     with open(os.path.join(dst, "a.txt"), "w") as fh:
         fh.write("old")
     os.mkdir(os.path.join(dst, "a.txt.~pd_sync"))
+    monkeypatch.setattr(dirfd, "temp_name", _fixed_temp_name)
 
     with pytest.raises(SystemExit) as exc:
         _sync(str(src), "box:/dst", delete=True)

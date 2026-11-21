@@ -430,8 +430,71 @@ def test_a_byte_that_is_not_utf8_is_printed_as_that_byte(builders,
         command_login(_login_args("sbox"))
     assert exc.value.code == 0
     out = raw.getvalue()
-    assert b'X="a\xffb"' in out
+    # 整个 KEY=value 作为一个被引用的词输出（键一起进引号：用户自己的
+    # --env 键不再能拼接进 shell 元字符），字节本身原样透传。
+    assert b'"X=a\xffb"' in out
     snippet = os.path.join(container_rootfs("sbox"), "etc", "profile.d",
                            "termux-profile.sh")
     with open(snippet, "rb") as fh:
         assert b"export X='a\xffb'" in fh.read()
+
+
+def test_hostile_image_env_keys_are_dropped_and_user_env_is_quoted(
+        builders, capsys):
+    """--get-proot-cmd 的输出是给 shell 管道用的：键没走标识符语法
+    就不能裸拼（`X;touch /tmp/pwn=1`、`Y$(...)` 都是注入），镜像 Env
+    的键直接丢弃；用户自己的 --env 键无论长什么样都整个引用。
+    """
+    manifest = _builders.simple_image_manifest(env=[
+        "X;touch /tmp/pd-pwned-key=1",
+        "Y$(touch /tmp/pd-pwned-sub)=2",
+        "GOOD=plain",
+    ])
+    builders.make_container("envbox", arch=HOST_ARCH, manifest=manifest)
+    os.makedirs(os.path.join(container_rootfs("envbox"), "etc",
+                             "profile.d"), exist_ok=True)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(login_mod, "get_proot_bin", lambda: "/usr/bin/proot")
+        with pytest.raises(SystemExit) as exc:
+            command_login(_login_args(
+                "envbox",
+                env=["WEIRD KEY; rm -rf ~=value", "PLAIN=ok"],
+            ))
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    # 镜像 Env 的坏键根本没有成为环境的一部分。
+    assert "pd-pwned-key" not in out
+    assert "pd-pwned-sub" not in out
+    assert "GOOD=plain" in out
+    # 用户自己的 --env：整个赋值作为一个被引用的词出现，键里的
+    # 元字符不再有 shell 语义。
+    assert '"WEIRD KEY; rm -rf ~=value"' in out
+    assert "PLAIN=ok" in out
+    assert not os.path.exists("/tmp/pd-pwned-key")
+
+
+def test_image_env_cannot_set_nproot_host_side_knobs(builders, capsys):
+    """NPROOT_* 与 LD_*/PROOT_* 同类：host 侧运行时在 confinement
+    之前就读它们。镜像 Env 携带的 NPROOT_BACKEND/NPROOT_DEBUG 不得
+    到达 exec 环境，也就不会出现在打印的命令里。
+    """
+    manifest = _builders.simple_image_manifest(env=[
+        "NPROOT_BACKEND=proto",
+        "NPROOT_DEBUG=1",
+        "LD_PRELOAD=/evil.so",
+        "PROOT_TMP_DIR=/evil",
+        "KEEP=yes",
+    ])
+    builders.make_container("npr", arch=HOST_ARCH, manifest=manifest)
+    os.makedirs(os.path.join(container_rootfs("npr"), "etc",
+                             "profile.d"), exist_ok=True)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(login_mod, "get_proot_bin", lambda: "/usr/bin/proot")
+        with pytest.raises(SystemExit) as exc:
+            command_login(_login_args("npr"))
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "NPROOT_" not in out
+    assert "LD_PRELOAD" not in out
+    assert "PROOT_TMP_DIR" not in out
+    assert "KEEP=yes" in out

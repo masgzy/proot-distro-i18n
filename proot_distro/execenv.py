@@ -42,6 +42,16 @@ import os
 # set one of them gets to run its own code as the invoking user, outside
 # any container. That is not a race: `install` then `login` is enough.
 #
+# NPROOT_* is in the same class for this fork: nproot is the proot the
+# launcher actually execs, and its knobs (NPROOT_BACKEND, NPROOT_DEBUG,
+# ...) decide what the host-side runtime does before any confinement --
+# an image Env carrying NPROOT_BACKEND=proto is the image choosing the
+# runtime's backend, exactly what LD_/PROOT_ were refused for. Blocking
+# it from image sources also restores the user's own exports over the
+# image's: the passthrough in login/__init__.py copies host NPROOT_*
+# only into slots the image did not fill, so an image value used to
+# shadow the user's.
+#
 # The rule this expresses is about *provenance*, not about the name. A
 # value the invoking user set for *this invocation* --
 # `PROOT_NO_SECCOMP=1 proot-distro login debian`, a `--env` flag -- is
@@ -57,7 +67,7 @@ import os
 # three drop it here. The Dockerfile's line still reaches the image
 # config it is a statement about; only the host-side exec is refused it.
 
-_HOST_EXEC_PREFIXES = ("LD_", "PROOT_")
+_HOST_EXEC_PREFIXES = ("LD_", "PROOT_", "NPROOT_")
 
 # What a guest may ask about where it is running. PD_CONTAINER is the
 # container's name, PD_IMAGE the reference the rootfs was materialised

@@ -407,7 +407,14 @@ HELP_PAGES = {
              "plain HTTP, or an HTTPS endpoint (registry or download URL) "
              "whose TLS certificate is untrusted, expired, self-signed, or "
              "for a different hostname. Use only for trusted sources on a "
-             "network path you control."),
+             "network path you control. Note that under --allow-insecure a "
+             "URL install carries no content verification at all -- pair "
+             "it with --sha256."),
+            ("--sha256 [HEX]",
+             "Verify a URL install against this sha256 digest (64 hex "
+             "characters); a mismatch aborts the install before "
+             "extraction. Registry pulls do not need this -- their layers "
+             "are digest-verified already."),
             ("-q, --quiet", "Suppress non-error output."),
         ],
         "examples": [

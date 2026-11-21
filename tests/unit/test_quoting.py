@@ -58,3 +58,14 @@ def test_roundtrips_through_real_shell(s):
         ["sh", "-c", cmd], capture_output=True, text=True, check=True,
     )
     assert result.stdout == s
+
+
+def test_dq_falls_back_to_single_quotes_for_bang():
+    # bash 的交互式历史展开在双引号里仍然触发（!! 会把上一条命令拼进
+    # 用户粘贴的行里）；双引号没有不改变其它 shell 语义的转义写法，
+    # 含 ! 的串改用单引号。
+    from proot_distro.commands.login.quoting import dq
+    assert dq("a!b") == "'a!b'"
+    assert dq("!!") == "'!!'"
+    assert dq("safe") == "safe"
+    assert dq('q"uote$') == '"q\\"uote\\$"'

@@ -615,9 +615,15 @@ def test_copy_cannot_be_made_to_write_through_a_planted_hardlink(
 
 
 def test_sync_cannot_be_made_to_write_through_a_planted_hardlink(
-    tmp_path, builders
+    tmp_path, builders, monkeypatch
 ):
-    """Same trap, aimed at the temp name sync writes before renaming."""
+    """Same trap, aimed at the temp name sync writes before renaming.
+
+    生产代码的临时名已带进程号 + 随机字节，预埋无法命中；这里把
+    temp_name 钉回固定形态，让预埋的硬链接重新落在写入路径上，
+    验证 open_new_at 的“先摘掉预埋条目再 O_EXCL 新建”仍然保护
+    宿主文件不被写穿。
+    """
     builders.make_container("box")
     rootfs = container_rootfs("box")
     victim = tmp_path / "victim"
@@ -625,6 +631,16 @@ def test_sync_cannot_be_made_to_write_through_a_planted_hardlink(
     os.link(victim, os.path.join(rootfs, "dest.~pd_sync"))
     payload = tmp_path / "payload"
     payload.write_text("payload")
+
+    from proot_distro import dirfd as _dirfd
+
+    def _fixed(name, suffix):
+        marker = ".~pd_"
+        if marker in suffix:
+            suffix = suffix[suffix.rfind(marker):]
+        return name + suffix
+
+    monkeypatch.setattr(_dirfd, "temp_name", _fixed)
 
     _sync(str(payload), "box:/dest")
 

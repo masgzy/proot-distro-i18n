@@ -58,6 +58,9 @@ from proot_distro.i18n import _
 __all__ = (
     "IncompleteResponse",
     "InvalidRequest",
+    "MAX_DOWNLOAD_BYTES",
+    "MAX_EXTRACT_BYTES",
+    "MAX_EXTRACT_MEMBERS",
     "MAX_RETRY_AFTER",
     "NETWORK_ERRORS",
     "NETWORK_TIMEOUT",
@@ -73,11 +76,25 @@ __all__ = (
     "is_plaintext_http_tls_error",
     "is_retryable_http_error",
     "new_request",
+    "redact_url",
     "require_complete_body",
     "retry_after",
     "retry_http",
     "sha256_file",
 )
+
+# 一次下载的体积上限与一次解包的总量/条目数上限。
+#
+# 所有流式路径（下载、层拉取、tar 解包）都过去对“解压后有多大”没有
+# 任何限制：一个 10 KB 的 gzip 展开成几百 GB 也得先全写进盘里才会被
+# 摘要校验拒掉——手机 /data 分区先被填满。上限取得宽：合法 rootfs
+# 层压缩包几百 MB、展开 5-10 GB、几万条目，留一个数量级余量。
+# 超限像其它“拒绝”一样报错终止（临时文件随 atomic_write 一起清掉），
+# 不留半截。MAX_EXTRACT_* 被 tar_extract / copy_step 复用。
+_MAX_BYTES_32G = 32 * 1024**3
+MAX_DOWNLOAD_BYTES = _MAX_BYTES_32G
+MAX_EXTRACT_BYTES = _MAX_BYTES_32G
+MAX_EXTRACT_MEMBERS = 262144
 
 
 _insecure_ctx: ssl.SSLContext | None = None
@@ -748,9 +765,34 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
+def redact_url(url: str) -> str:
+    """把 URL 里的 userinfo（https://user:pass@host/...）掩掉。
+
+    重试日志、错误消息、进度行都会把 URL 原样回显给终端；带凭据的
+    私有仓库地址因此把密码打在屏幕上。请求本身用原 URL；屏幕上只
+    放掩过的这一份。
+    """
+    text = str(url)
+    try:
+        parts = urllib.parse.urlsplit(text)
+    except ValueError:
+        return text
+    if parts.username is None and parts.password is None:
+        return text
+    netloc = "***:***@" if parts.username else "@"
+    hostinfo = parts.hostname or ""
+    if parts.port is not None:
+        hostinfo = f"{hostinfo}:{parts.port}"
+    redacted = urllib.parse.urlunsplit(
+        (parts.scheme, f"{netloc}{hostinfo}", parts.path,
+         parts.query, parts.fragment)
+    )
+    return redacted
+
+
 def download_file(
     url: str, dest: str, max_retries: int = 5, retry_delay: int = 5,
-    insecure: bool = False, timeout: float = 60.0,
+    insecure: bool = False, timeout: float = 60.0, sha256: str = None,
 ) -> None:
     """Download *url* to *dest* with progress output, redirects, and retries.
 
@@ -759,8 +801,18 @@ def download_file(
     the download proceeds even if the server presents an untrusted/
     expired/self-signed certificate, or redirects to plain HTTP — the
     opt-in behaviour behind the install command's ``--allow-insecure``.
+
+    *sha256*（可选的十六进制摘要，来自 release 元数据或用户的
+    ``--sha256`` 参数）在写入时同步计算，写完即比对——不匹配当作
+    失败报错（临时文件随之清掉，坏字节不会以完成品形式出现），
+    URL 安装的校验链由此接回来。
+
+    体积封顶 MAX_DOWNLOAD_BYTES：服务端/中间人声称或实际送来多大
+    都好，超过上限立即中断，不再“先写完再拒”。屏幕上的 URL 一律
+    脱敏（redact_url）。
     """
     opener = http_opener(insecure=insecure)
+    shown_url = redact_url(url)
     try:
         host = urllib.parse.urlsplit(url).netloc or url
     except ValueError:
@@ -771,6 +823,7 @@ def download_file(
         req = new_request(
             url, headers={"User-Agent": f"{PROGRAM_NAME}/{PROGRAM_VERSION}"},
         )
+        hasher = hashlib.sha256() if sha256 else None
         with atomic_write(dest, "wb") as fh:
             with opener.open(req, timeout=timeout) as resp:
                 total = declared_length(resp)
@@ -779,18 +832,30 @@ def download_file(
                     chunk = resp.read(1 << 20)
                     if not chunk:
                         break
-                    fh.write(chunk)
                     downloaded += len(chunk)
+                    if downloaded > MAX_DOWNLOAD_BYTES:
+                        raise RuntimeError(_(
+                            "download exceeds the {limit} byte cap; refusing "
+                            "to keep writing.", limit=MAX_DOWNLOAD_BYTES))
+                    if hasher is not None:
+                        hasher.update(chunk)
+                    fh.write(chunk)
                     draw_bytes_bar(downloaded, total, noun=_("downloaded"))
                 # Inside atomic_write, so a short answer takes the
                 # temporary with it instead of publishing part of an
                 # archive as the whole of one.
                 require_complete_body(downloaded, total)
+                if hasher is not None and hasher.hexdigest() != sha256:
+                    raise RuntimeError(_(
+                        "checksum mismatch: expected sha256 {expected}, got "
+                        "{actual} for '{url}'.",
+                        expected=sha256, actual=hasher.hexdigest(),
+                        url=shown_url))
         clear_bar()
         log_info(_("Finished downloading ({size}).", size = fmt_size(downloaded)))
 
     try:
-        retry_http(_attempt, what=_("Downloading {url}", url=url),
+        retry_http(_attempt, what=_("Downloading {url}", url=shown_url),
                    max_retries=max_retries, retry_delay=retry_delay)
     except KeyboardInterrupt:
         clear_bar()
@@ -802,7 +867,7 @@ def download_file(
         # instead of leaking a raw SSL/HTTP error to the user.
         if isinstance(exc, RedirectRefused) and exc.plaintext:
             raise RuntimeError(
-                f"Cannot download {url}: {exc} If you trust this source "
+                f"Cannot download {shown_url}: {exc} If you trust this source "
                 f"and the network path to it, re-run with "
                 f"'--allow-insecure' to follow the redirect."
             ) from exc
@@ -813,7 +878,7 @@ def download_file(
             # A plaintext-HTTP reply to an https:// URL.
             if is_plaintext_http_tls_error(exc):
                 raise RuntimeError(
-                    f"The URL '{url}' uses HTTPS, but the server at "
+                    f"The URL '{shown_url}' uses HTTPS, but the server at "
                     f"'{host}' responded over plain HTTP (no TLS). If you "
                     f"trust this source, retry with the same URL using the "
                     f"'http://' scheme instead."
@@ -823,6 +888,6 @@ def download_file(
                     and 400 <= exc.code < 500
                     and exc.code not in (408, 429)):
                 raise RuntimeError(
-                    f"Cannot download {url}: HTTP {exc.code} {exc.reason}"
+                    f"Cannot download {shown_url}: HTTP {exc.code} {exc.reason}"
                 ) from exc
-        raise RuntimeError(f"Cannot download {url}: {exc}") from exc
+        raise RuntimeError(f"Cannot download {shown_url}: {exc}") from exc

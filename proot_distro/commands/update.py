@@ -72,7 +72,7 @@ from proot_distro.constants import (
     IS_TERMUX, PROGRAM_NAME, PROGRAM_VERSION, TERMUX_PREFIX,
 )
 from proot_distro.helpers.download import (
-    NETWORK_ERRORS, download_file, http_opener, new_request,
+    NETWORK_ERRORS, download_file, http_opener, new_request, redact_url,
 )
 from proot_distro.i18n import _
 from proot_distro.message import crit_error, log_info, msg, warn
@@ -123,7 +123,15 @@ def _github_api(url: str) -> dict:
     user exported one. A rate-limited reply is translated into a hint
     naming the variable that would raise the limit, instead of GitHub's
     raw 403 body.
+
+    重定向走带凭据剥离的 handler：默认 redirect handler 会把
+    Authorization 头原样带到任何目标主机——transport 层为此专门有
+    AuthStrippingRedirectHandler（“凭据只去它被寻址的那个源”），
+    自更新路径和它用同一条纪律。
     """
+    from proot_distro.helpers.docker.transport import (
+        AuthStrippingRedirectHandler,
+    )
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": f"{PROGRAM_NAME}/{PROGRAM_VERSION}",
@@ -132,8 +140,9 @@ def _github_api(url: str) -> dict:
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = new_request(url, headers=headers)
+    opener = http_opener(redirect=AuthStrippingRedirectHandler())
     try:
-        with http_opener().open(req, timeout=30) as resp:
+        with opener.open(req, timeout=30) as resp:
             data = json.load(resp)
     except urllib.error.HTTPError as exc:
         detail = ""
@@ -178,15 +187,40 @@ def _latest_release(repo: str) -> dict:
     return data
 
 
-def _parse_version(text: str) -> tuple:
-    """'v5.10.2' -> (5, 10, 2); 'rolling' -> () (nothing comparable)."""
-    token = str(text).strip().lstrip("vV")
-    parts = []
-    for piece in token.split("."):
-        if not piece.isdigit():
-            break
-        parts.append(int(piece))
-    return tuple(parts)
+_PHASE_RANK = {"dev": 0, "a": 1, "b": 2, "rc": 3, None: 4, "post": 5}
+
+_VERSION_RE = re.compile(
+    r"^[vV]?(\d+(?:\.\d+)*)"
+    r"(?:\.?(a|b|rc)(\d+))?"
+    r"(?:\.?(post)(\d+))?"
+    r"(?:\.?(dev)(\d+))?"
+)
+
+
+def _parse_version(text: str):
+    """'v5.10.2' -> ((5, 10, 2), 4, 0)；'rolling' -> None。
+
+    PEP 440 后缀有方向：5.10.3.post1 比 5.10.3 新，5.10.3a1 比它旧。
+    旧的解析在第一个非数字段截断，'5.10.3.post1' 变成 (5, 10, 3)
+    与当前相等——一次真正的 post 发布被当成“已是最新”静默跳过。
+    现在返回 (数字元组, 阶段序号, 阶段号)：dev < a < b < rc < 正式
+    < post；解析不出（rolling、垃圾）返回 None（不可比较）。
+    """
+    m = _VERSION_RE.match(str(text).strip())
+    if not m:
+        return None
+    nums = tuple(int(p) for p in m.group(1).split("."))
+    phase, number = None, 0
+    if m.group(2):          # a / b / rc
+        phase, number = m.group(2), int(m.group(3) or 0)
+    elif m.group(4):        # post
+        phase, number = m.group(4), int(m.group(5) or 0)
+    elif m.group(6):        # dev
+        phase, number = m.group(6), int(m.group(7) or 0)
+    rank = _PHASE_RANK.get(phase, 4)
+    if not nums and phase is None:
+        return None
+    return (nums, rank, number)
 
 
 def _version_label(text: str) -> str:
@@ -197,8 +231,28 @@ def _version_label(text: str) -> str:
 # pd (this package)
 # ---------------------------------------------------------------------------
 
+def _asset_digest(asset: dict) -> str:
+    """GitHub release asset 的 sha256（"sha256:<hex>" 字段），或 ""。
+
+    GitHub 从 2024 年起在 release assets 元数据里附带 digest。自更新
+    的下载过去只靠 TLS——这已是全部验证：--allow-insecure 下就是零
+    认证地把 pip 马上要执行的字节抓下来。现在资产元数据带 digest 时
+    一并校验。
+    """
+    digest = asset.get("digest") if isinstance(asset, dict) else None
+    if not isinstance(digest, str):
+        return ""
+    digest = digest.strip()
+    marker = "sha256:"
+    if digest.lower().startswith(marker):
+        hexpart = digest[len(marker):].strip()
+        if re.fullmatch(r"[0-9a-fA-F]{64}", hexpart):
+            return hexpart.lower()
+    return ""
+
+
 def _pick_wheel_asset(release: dict) -> tuple:
-    """(version, asset_url, asset_name) of the release's wheel, if any."""
+    """(version, asset_url, asset_name, sha256) of the release's wheel."""
     for asset in release.get("assets") or []:
         if not isinstance(asset, dict):
             continue
@@ -208,12 +262,12 @@ def _pick_wheel_asset(release: dict) -> tuple:
                 and name.startswith("proot_distro_i18n-")
                 and name.endswith("-py3-none-any.whl")):
             version = name[len("proot_distro_i18n-"):-len("-py3-none-any.whl")]
-            return version, url, name
-    return "", "", ""
+            return version, url, name, _asset_digest(asset)
+    return "", "", "", ""
 
 
 def _wheel_url_on_pypi() -> tuple:
-    """(version, asset_url, name) of the newest PyPI wheel, best effort."""
+    """(version, asset_url, name, sha256) of the newest PyPI wheel, best effort."""
     req = new_request(
         "https://pypi.org/pypi/proot-distro-i18n/json",
         headers={"User-Agent": f"{PROGRAM_NAME}/{PROGRAM_VERSION}"},
@@ -222,19 +276,23 @@ def _wheel_url_on_pypi() -> tuple:
         with http_opener().open(req, timeout=30) as resp:
             data = json.load(resp)
     except NETWORK_ERRORS:
-        return "", "", ""
+        return "", "", "", ""
     info = data.get("info") or {}
     version = info.get("version") or ""
     if not version:
-        return "", "", ""
+        return "", "", "", ""
     for asset in (data.get("urls") or []):
         name = asset.get("filename") or ""
         url = asset.get("url") or ""
         if (asset.get("packagetype") == "bdist_wheel"
                 and name.startswith("proot_distro_i18n-")
                 and name.endswith("-py3-none-any.whl")):
-            return version, url, name
-    return "", "", ""
+            digest = asset.get("digests") or {}
+            sha = ""
+            if isinstance(digest, dict):
+                sha = digest.get("sha256") or ""
+            return version, url, name, str(sha).lower() if sha else ""
+    return "", "", "", ""
 
 
 def _pip_install(wheel_path: str) -> None:
@@ -282,17 +340,26 @@ def _update_pd(check_only: bool, insecure: bool, force: bool) -> bool:
 
     Returns True when a change was applied (or would be, under
     --check), False when nothing was needed.
+
+    自更新绝不吃 --allow-insecure：它下载的是 pip 马上要安装执行的
+    代码，关掉证书校验等于把 RCE 交给任何一个中间人。真遇到坏证书
+    根，请修根证书或手动下载 wheel。
     """
+    if insecure:
+        raise RuntimeError(_(
+            "the self-update never runs with '--allow-insecure': it "
+            "downloads code this program will install and run. Fix the "
+            "trust store instead, or download the wheel by hand."))
     release = _latest_release(PD_REPO)
     tag = release.get("tag_name") or "?"
-    version, url, name = _pick_wheel_asset(release)
+    version, url, name, sha = _pick_wheel_asset(release)
 
     current = _parse_version(PROGRAM_VERSION)
     latest = _parse_version(version)
 
     if not version:
         # No wheel in the release: PyPI fallback, then honest failure.
-        version, url, name = _wheel_url_on_pypi()
+        version, url, name, sha = _wheel_url_on_pypi()
         latest = _parse_version(version)
         if not version:
             warn(_("{repo} has no wheel in its latest release ({tag}) and "
@@ -327,7 +394,7 @@ def _update_pd(check_only: bool, insecure: bool, force: bool) -> bool:
     tmpdir = tempfile.mkdtemp(prefix="pd-update-")
     try:
         wheel = os.path.join(tmpdir, name)
-        download_file(url, wheel, insecure=insecure)
+        download_file(url, wheel, insecure=insecure, sha256=sha or None)
         log_info(_("Installing with pip ..."))
         _pip_install(wheel)
     finally:
@@ -365,11 +432,11 @@ def _read_nproot_version(path: str) -> str:
 
 
 def _nproot_asset_for_device(release: dict) -> tuple:
-    """(tag, url, name) of this device's runtime asset, or ('', '', '')."""
+    """(tag, url, name, sha256) of this device's runtime asset."""
     tag = release.get("tag_name") or ""
     arch = _NPROOT_ASSET_ARCH.get(get_device_cpu_arch())
     if arch is None:
-        return "", "", ""
+        return "", "", "", ""
     wanted = f"nproot-android-{arch}.zip"
     for asset in release.get("assets") or []:
         if not isinstance(asset, dict):
@@ -377,8 +444,8 @@ def _nproot_asset_for_device(release: dict) -> tuple:
         name = asset.get("name")
         url = asset.get("browser_download_url")
         if name == wanted and isinstance(url, str):
-            return tag, url, name
-    return tag, "", ""
+            return tag, url, name, _asset_digest(asset)
+    return tag, "", "", ""
 
 
 def _extract_nproot_zip(zip_path: str, staging: str) -> list:
@@ -455,6 +522,13 @@ def _install_nproot_file(staging: str, rel: str, target_dir: str) -> None:
     name in the target directory and os.replace()d in one step, so a
     crash mid-install leaves either the old or the new file, never a
     truncated one and never a window with nothing at all.
+
+    目标目录在 Termux 上是 $PREFIX/bin——坐在读写的 prefix bind 里。
+    曾经固定名 + ``shutil.copyfile``（open 按“名字”、追符号链接）给
+    客人留了个免竞态的陷阱：预埋 ``nproot.pd-update-tmp ->
+    ~/.bashrc``，自更新就把 ELF 字节写进那个宿主文件再 chmod 755。
+    现在临时名由 mkstemp 随机生成，写入走描述符，发布前比对目录项
+    inode，rename 换的是目录项本身，不会追进链接。
     """
     dest = os.path.join(target_dir, rel)
     if os.path.isdir(dest) and not os.path.islink(dest):
@@ -465,19 +539,35 @@ def _install_nproot_file(staging: str, rel: str, target_dir: str) -> None:
     parent = os.path.dirname(dest)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    tmp = dest + ".pd-update-tmp"
-    shutil.copyfile(os.path.join(staging, rel), tmp)
-    os.chmod(tmp, 0o755)
+    fd, tmp = tempfile.mkstemp(
+        prefix=os.path.basename(rel) + ".pd-update-", suffix=".tmp",
+        dir=parent,
+    )
     try:
-        os.replace(tmp, dest)
-    except OSError as exc:
+        with open(fd, "wb", closefd=False) as out, \
+                open(os.path.join(staging, rel), "rb") as src:
+            shutil.copyfileobj(src, out, 1 << 17)
+            out.flush()
+            written = os.fstat(fd)
+        os.fchmod(fd, 0o755)
         try:
-            os.unlink(tmp)
+            entry = os.stat(tmp, follow_symlinks=False)
         except OSError:
-            pass
-        raise RuntimeError(_(
-            "cannot install {dest}: {exc}", dest=dest, exc=exc,
-        )) from exc
+            entry = None
+        if (entry is None
+                or (entry.st_dev, entry.st_ino)
+                != (written.st_dev, written.st_ino)):
+            raise RuntimeError(_(
+                "the temporary file was replaced while it was being "
+                "written; refusing to install {rel}.", rel=rel))
+        os.replace(tmp, dest)
+        tmp = None
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def _update_nproot(check_only: bool, insecure: bool, force: bool) -> bool:
@@ -487,9 +577,17 @@ def _update_nproot(check_only: bool, insecure: bool, force: bool) -> bool:
     --check), False when already current. Skips the whole target with
     a notice when no asset exists for this device (e.g. a desktop
     x86_64 box, where the release ships only Android builds).
+
+    与 pd 自更新同一条规矩：二进制下载不吃 --allow-insecure——它是
+    下一秒就要 exec 的代码。
     """
+    if insecure:
+        raise RuntimeError(_(
+            "the nproot self-update never runs with '--allow-insecure': "
+            "it downloads a binary this program will exec. Fix the trust "
+            "store instead, or download the zip by hand."))
     release = _latest_release(NPROOT_REPO)
-    tag, url, name = _nproot_asset_for_device(release)
+    tag, url, name, sha = _nproot_asset_for_device(release)
     if not url:
         device = get_device_cpu_arch()
         if check_only:
@@ -518,7 +616,7 @@ def _update_nproot(check_only: bool, insecure: bool, force: bool) -> bool:
     tmpdir = tempfile.mkdtemp(prefix="pd-nproot-update-")
     try:
         zip_path = os.path.join(tmpdir, name)
-        download_file(url, zip_path, insecure=insecure)
+        download_file(url, zip_path, insecure=insecure, sha256=sha or None)
         staging = os.path.join(tmpdir, "staging")
         os.makedirs(staging, exist_ok=True)
         installed = _extract_nproot_zip(zip_path, staging)

@@ -50,20 +50,26 @@
 
 from __future__ import annotations
 
-import json
 import os
 import socket
 import ssl
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
 from proot_distro.constants import PROGRAM_NAME
 from proot_distro.config import CONFIG_DIR as _CONFIG_DIR
-from proot_distro.helpers.download import insecure_ssl_context
+from proot_distro.config import (
+    _open_config_dir,
+    read_json_in_config as _read_json_in_config,
+    write_json_in_config as _write_json_in_config,
+)
+from proot_distro.helpers.download import http_opener
 from proot_distro.i18n import _
+from proot_distro.message import warn
 
 # ---------------------------------------------------------------------------
 # 配置文件路径（目录规则单一事实来源在 config.py，本模块只拼文件名）
@@ -234,7 +240,8 @@ def _load_user_mirrors() -> List[Dict[str, str]]:
     """读取用户自定义镜像源列表；文件不存在或损坏时返回空列表。
 
     使用 mtime 缓存：如果 ``USER_MIRRORS_FILE`` 自上次读取后未修改，
-    直接返回缓存值。
+    直接返回缓存值。读取本身走 O_NOFOLLOW 下钻 + 常规文件检查
+    （配置目录在 Termux 上是客人可写的）。
     """
     try:
         st = os.stat(USER_MIRRORS_FILE)
@@ -246,12 +253,7 @@ def _load_user_mirrors() -> List[Dict[str, str]]:
     if _user_mirrors_cache["mtime"] == st.st_mtime:
         return _user_mirrors_cache["data"]
 
-    try:
-        with open(USER_MIRRORS_FILE, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return _user_mirrors_cache["data"]
-
+    data = _read_json_in_config(USER_MIRRORS_FILE)
     if not isinstance(data, list):
         return _user_mirrors_cache["data"]
 
@@ -314,7 +316,10 @@ _active_cache: dict = {"mtime": None, "value": None}
 
 
 def _ensure_config_dir() -> None:
-    os.makedirs(_CONFIG_DIR, exist_ok=True)
+    """确保配置目录存在（O_NOFOLLOW 下钻式创建）。"""
+    dir_fd = _open_config_dir(MIRRORS_CONFIG_FILE, create=True)
+    if dir_fd is not None:
+        os.close(dir_fd)
 
 
 def _invalidate_active_cache() -> None:
@@ -328,6 +333,22 @@ def load_active_mirror() -> Optional[Dict[str, str]]:
 
     使用 mtime 缓存：如果配置文件自上次读取后未修改，直接返回缓存值。
     这避免 Docker pull 流程中每个 registry 请求都重读 JSON。
+
+    信任边界（本函数决定 transport 层拉哪个 registry）：
+
+    * 配置目录在 Termux 上坐在客人可写的 ``$PREFIX`` 里，所以
+      ``mirror.json`` 是陌生人可替换的文件。读取本身走 O_NOFOLLOW
+      下钻 + 常规文件检查（FIFO 不会挂住，链接不会被跟随）；
+    * **内置 id 一律解析到内置表自己的 URL**——文件里附带的
+      ``url`` 覆盖（无论写在 mirror.json 还是 mirrors.json 里）
+      一律忽略。于是被替换的文件顶多能把拉取指向另一台内置镜像，
+      选不了任意主机；
+    * 自定义 id/自定义 URL 必须是 ``https://`` + 合法 host、无
+      userinfo、无 query/fragment，否则当作未选中，回落默认源。
+      这挡住明文 HTTP 注入与垃圾值；挡不住“持有自己域名证书的
+      恶意 https registry”这一档——那需要（与 build cache 一样）
+      把客人当不可信源对待：不可信容器请用 ``--isolated`` 会话，
+      它不绑 ``$PREFIX``。
     """
     try:
         st = os.stat(MIRRORS_CONFIG_FILE)
@@ -341,13 +362,8 @@ def load_active_mirror() -> Optional[Dict[str, str]]:
     if _active_cache["mtime"] == st.st_mtime and _active_cache["value"] is not None:
         return _active_cache["value"]
 
-    # 缓存未命中 — 读文件
-    try:
-        with open(MIRRORS_CONFIG_FILE, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        _invalidate_active_cache()
-        return None
+    # 缓存未命中 — 读文件（硬化：O_NOFOLLOW 下钻 + 常规文件）
+    data = _read_json_in_config(MIRRORS_CONFIG_FILE)
     if not isinstance(data, dict):
         _invalidate_active_cache()
         return None
@@ -355,14 +371,16 @@ def load_active_mirror() -> Optional[Dict[str, str]]:
     mirror_id = data.get("id")
     url = data.get("url")
     result: Optional[Dict[str, str]] = None
-    # 优先按 id 在合并后的镜像源表里找（含用户自定义）
-    all_index = get_mirror_index()
-    if mirror_id and mirror_id in all_index:
-        m = dict(all_index[mirror_id])
-        if url:
-            m["url"] = url
-        result = m
-    elif url:
+    if mirror_id and mirror_id in _BUILTIN_INDEX:
+        # 内置 id：只用内置表的 URL，忽略文件附带的 url 覆盖。
+        result = dict(_BUILTIN_INDEX[mirror_id])
+    elif mirror_id and mirror_id not in ("custom",):
+        # 用户自定义 id：其 URL 必须是可用形态。
+        all_index = get_mirror_index()
+        m = all_index.get(mirror_id)
+        if isinstance(m, dict) and _usable_registry_url(m.get("url")):
+            result = dict(m)
+    elif url and _usable_registry_url(url):
         result = {
             "id": "custom",
             "name": data.get("name") or url,
@@ -376,13 +394,41 @@ def load_active_mirror() -> Optional[Dict[str, str]]:
     return result
 
 
+def _usable_registry_url(url) -> bool:
+    """一个可以作为拉取入口的 registry URL 该有的形态。
+
+    ``https://`` + 非空 host，无 userinfo（凭据不该藏在 URL 里），
+    无 query/fragment；路径允许（gh-proxy 这类带 /docker 前缀的镜像
+    是合法形态）。明文 ``http://`` 一律拒绝——不是不信任它慢，而是
+    这个值来自一个客人可替换的文件，明文意味着拉取链路完全可被
+    中间人改写。局域网 http registry 请用 ``PD_REGISTRY_URL`` 环境
+    变量（用户自己的环境，用户自己的选择）。
+    """
+    if not isinstance(url, str) or not url:
+        return False
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    if parts.scheme != "https":
+        return False
+    if not parts.netloc or "@" in parts.netloc:
+        return False
+    if parts.query or parts.fragment:
+        return False
+    return bool(parts.hostname)
+
+
 def save_active_mirror(mirror: Dict[str, str]) -> None:
     """持久化当前镜像源选择。
 
-    使用 atomic_replace（mkstemp 生成唯一 tmp 名）避免并发写竞态。
+    曾经的写入把 ``atomic_replace`` 交出的整数 fd 当作路径名传给
+    ``open(tmp, "w")``，而 ``open`` 默认在离开 with 时关闭 fd——
+    生成器随后在一个已关闭的 fd 上 fstat，EBADF，tmp 被清理，
+    mirror.json 从来没写进去过（``mirror use`` 每次都“成功后崩一把”）。
+    现在走 ``write_json_in_config``：唯一临时名 + 描述符直写 +
+    inode 一致性检查 + rename，配置目录的每一步都是 O_NOFOLLOW。
     """
-    from proot_distro.atomic import atomic_replace
-    _ensure_config_dir()
     payload = {
         "id": mirror.get("id", "custom"),
         "name": mirror.get("name", mirror.get("url", "")),
@@ -391,22 +437,32 @@ def save_active_mirror(mirror: Dict[str, str]) -> None:
         "note": mirror.get("note", ""),
         "updated_at": int(time.time()),
     }
-    with atomic_replace(MIRRORS_CONFIG_FILE) as tmp:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
+    if not _usable_registry_url(payload["url"]):
+        warn(_("non-https mirror URL '{url}' will not be used by pulls "
+               "(the config file is guest-writable on Termux); export "
+               "PD_REGISTRY_URL for plain-http registries.",
+               url=payload["url"]))
+    if not _write_json_in_config(MIRRORS_CONFIG_FILE, payload):
+        raise OSError(5, "cannot write " + MIRRORS_CONFIG_FILE)
     _invalidate_active_cache()
 
 
 def clear_active_mirror() -> bool:
-    """删除配置文件；返回是否实际删除。"""
+    """删除配置文件；返回是否实际删除（按目录描述符删目录项本身）。"""
+    from proot_distro import dirfd as _dirfd
+    dir_fd = _open_config_dir(MIRRORS_CONFIG_FILE)
+    if dir_fd is None:
+        return False
     try:
-        os.remove(MIRRORS_CONFIG_FILE)
+        if not _dirfd.exists_at(
+                dir_fd, os.path.basename(MIRRORS_CONFIG_FILE)):
+            return False
+        _dirfd.unlink_quietly(
+            dir_fd, os.path.basename(MIRRORS_CONFIG_FILE))
         _invalidate_active_cache()
         return True
-    except FileNotFoundError:
-        return False
-    except OSError:
-        return False
+    finally:
+        os.close(dir_fd)
 
 
 # ---------------------------------------------------------------------------
@@ -417,8 +473,11 @@ def resolve_registry_url() -> str:
     """返回 transport 层应当使用的 registry base URL。
 
     优先级：
-    1. ``PD_REGISTRY_URL`` 环境变量（最高，便于一次性覆盖）
-    2. 用户配置文件里的当前选中镜像源
+
+    1. ``PD_REGISTRY_URL`` 环境变量（最高，便于一次性覆盖；用户自己的
+       环境，信任它自己——局域网 http registry 走这里）
+    2. 用户配置文件里的当前选中镜像源（形态校验见
+       ``load_active_mirror``，不合法一律回落）
     3. 内置默认 (DaoCloud)
 
     注意：每次调用都会读 config 文件——为了避免在拉取流程中
@@ -429,7 +488,7 @@ def resolve_registry_url() -> str:
     if env_url:
         return env_url.rstrip("/")
     active = load_active_mirror()
-    if active and active.get("url"):
+    if active and active.get("url") and _usable_registry_url(active["url"]):
         return active["url"].rstrip("/")
     return get_default_mirror()["url"].rstrip("/")
 
@@ -454,9 +513,12 @@ def test_mirror(url: str, timeout: float = 6.0,
     if not target.startswith(("http://", "https://")):
         target = "https://" + target
 
-    ctx = None
-    if insecure or target.startswith("http://"):
-        ctx = insecure_ssl_context()
+    # 走程序统一的 opener：默认全局 urlopen 会装 ftp/file/data handler、
+    # 其重定向策略还会把 HTTPS 带到明文 HTTP——这个程序的每一条请求
+    # 都该受 download.py 的 RedirectPolicyHandler 约束，探测请求也不例外
+    # （不带凭据，但纪律一致）。
+    opener = http_opener(insecure=bool(
+        insecure or target.startswith("http://")))
 
     req = urllib.request.Request(target, method="GET", headers={
         "User-Agent": f"{PROGRAM_NAME}/mirror-test",
@@ -464,7 +526,7 @@ def test_mirror(url: str, timeout: float = 6.0,
     })
     t0 = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             resp.read(64)
         latency = (time.monotonic() - t0) * 1000.0
         return True, latency, _("HTTP {code} OK", code=resp.status)

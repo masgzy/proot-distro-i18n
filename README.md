@@ -41,7 +41,9 @@ PRoot-Distro 是 proot 用户空间模拟器（chroot、mount --bind、binfmt_mi
   - registry 认证：给以 Basic 质询的 registry（Nexus、Artifactory、htpasswd）发凭据；`PD_DOCKER_AUTH` 错误在 pull/push 开始前就报告；
   - login 预设 `MOZ_SHM_NO_SEALS=1`（容器内跑 Firefox 不再需要手动设）。
 - **新设置项 `distro_mirror`**：安装容器时自动把容器内软件源切到国内镜像（阿里云/清华），适配 Debian/Ubuntu/Kali/Alpine/Arch/Manjaro/Fedora/Rocky/Alma/openSUSE/Void/Gentoo；手动入口 `pd mirror distro <容器>`，`--revert` 还原。
+- **新设置项 `dns` 与容器 DNS 重刷**：容器内 `/etc/resolv.conf` 默认跟随宿主（不再写死 8.8.8.8——国内网络 apk/apt 解析失败的根因），可固定为最多 3 个 IP；每次 login 前重刷，客人自己接管过的配置不动。
 - **`passthrough` 默认值改为关闭**：容器默认不再透传宿主 Termux 命令，需要时 `pd setting put passthrough true`。
+- **安全与竞态专项（v5.10.4）**：`--get-proot-cmd` 环境键注入/`NPROOT_*` 前缀过滤、镜像源指针文件 https 校验与配置目录 O_NOFOLLOW 读写、自更新摘要校验且拒发 `--allow-insecure`、解包/下载体积与条目数上限（防压缩炸弹）、各固定临时名改随机化并在发布前比对 inode、锁文件 flock 后重验、restore 半状态清除、URL 安装可选 `--sha256` 校验。
 - **界面配色升级为 Catppuccin**：Mocha（深色）/ Latte（浅色）自适应（`CLI_THEME` 覆盖、`COLORFGBG` 探测），真彩终端用官方色值，非真彩终端降级到基础 16 色，语义映射不变；支持 `NO_COLOR`/`CLICOLOR=0`/`PD_FORCE_COLORS`/`FORCE_COLOR`。
 - **发布链路**：GitHub Release note 与 PyPI 摘要全中文；PyPI 走 trusted publishing（OIDC）正式发布。
 
@@ -352,6 +354,8 @@ pd setting ls                          # 列出全部设置项（不带子动作
 pd setting put passthrough true        # 打开宿主 Termux 穿透
 pd setting put passthrough false       # 关闭（默认）
 pd setting put distro_mirror true      # 装容器时自动切国内软件源
+pd setting put dns auto               # 容器 DNS 跟随宿主（默认）
+pd setting put dns 223.5.5.5,119.29.29.29   # 固定容器内 nameserver
 pd setting reset passthrough           # 单项恢复默认
 pd setting reset                       # 全部恢复默认（不影响 lang 写入的语言）
 pd setting help                        # 完整帮助
@@ -390,6 +394,31 @@ Gentoo，识别靠容器内 `/etc/os-release`。原文件自动备份为
 ```bash
 pd mirror distro debian               # 手动给已装容器切源
 pd mirror distro debian --revert      # 还原备份的原始源
+```
+
+`pd mirror distro <容器>` 持有该容器的独占锁；源已指向国内镜像时
+重复执行是幂等成功（退出码 0）；切源/还原期间的临时文件名带进程号
++ 随机字节，发布前比对 inode，容器内预埋的链接不会被带进结果。
+
+### dns：容器内 /etc/resolv.conf
+
+| 取值 | 行为 |
+|---|---|
+| `auto`（默认） | 跟随宿主当前的解析配置（Termux 上先看 `$PREFIX/etc/resolv.conf` 再看 `/etc/resolv.conf`），没有才落回静态 8.8.8.8/8.8.4.4 |
+| 最多 3 个 IP（逗号/空格分隔） | 容器内 nameserver 固定为这几个（musl/glibc 各自最多读 3 个） |
+
+这是国内网络里 `apk`/`apt`/`dnf` 解析失败的根因修复：上游把
+`nameserver 8.8.8.8` 写死进每个新容器，而国内网络与开了
+Android「私人 DNS」的设备对这两个地址的明文 53 常年不可达。
+
+生效时机：`install` 解包完成即写入；此后**每次 login 前重刷**
+（DNS 设置改动、宿主网络变化都不用重装）。重刷只针对本程序写入的
+resolv.conf（带管理标记行）；容器内 root 自己改过的、或 dhcpcd
+一类工具接管过的文件一律不动。IPv6 地址同样支持。
+
+```bash
+pd setting put dns 223.5.5.5,119.29.29.29
+pd setting reset dns                  # 回到 auto（跟随宿主）
 ```
 
 ### Mozilla 系基线变量（对齐上游 5.10.3）

@@ -83,8 +83,14 @@ REFUSED = frozenset((errno.ELOOP, errno.ENOTDIR))
 
 # Suffix for the sibling file a replacing copy writes before renaming it
 # into place. `sync` has its own (.~pd_sync) so a leftover says which pass
-# left it behind.
+# left it behind. 每次调用再拼进程号 + 随机字节（见 _unique_suffix）：
+# 固定名让两个并发 pd / 盯着 readdir 的客人能预知并占用这个名字。
 TMP_SUFFIX = ".~pd_copy"
+
+
+def _unique_suffix(base: str) -> str:
+    """base 后拼一段进程号 + 随机字节的临时后缀。"""
+    return f".{os.getpid()}.{os.urandom(4).hex()}{base}"
 
 # Longest single path component Linux accepts, in bytes.
 NAME_MAX = 255
@@ -705,16 +711,34 @@ def copy_file_at(src_dir_fd: int, src_name: str,
                 raise OSError(errno.EEXIST,
                               "destination exists and is not a regular file",
                               dst_name)
-        name = temp_name(dst_name, TMP_SUFFIX) if replace else dst_name
+        name = (temp_name(dst_name, _unique_suffix(TMP_SUFFIX))
+                if replace else dst_name)
         try:
             dfd, _ = open_new_at(dst_dir_fd, name,
                                  stat.S_IMODE(sfd_st.st_mode))
             try:
                 copy_data(sfd, dfd, sfd_st)
                 copy_metadata(sfd, dfd, sfd_st)
+                written_st = os.fstat(dfd)
             finally:
                 os.close(dfd)
             if replace:
+                # rename 换的是目录项本身，但期间名字仍可被换掉（写盘的
+                # 整个窗口都在）。比对目录项与写入 fd 的 inode：不一致
+                # 就拒绝发布——不把别人种的链接/半截文件 rename 到
+                # 目标名上（与 atomic._publish_at 同一条纪律）。
+                try:
+                    entry = lstat_at(dst_dir_fd, name)
+                except OSError:
+                    entry = None
+                if (entry is None
+                        or (entry.st_dev, entry.st_ino)
+                        != (written_st.st_dev, written_st.st_ino)):
+                    raise OSError(
+                        errno.ESTALE,
+                        "the temporary file was replaced while it was "
+                        "being written", name,
+                    )
                 os.replace(name, dst_name,
                            src_dir_fd=dst_dir_fd, dst_dir_fd=dst_dir_fd)
         except BaseException:

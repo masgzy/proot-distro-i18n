@@ -67,6 +67,7 @@
 # dirfd.Levels parks the shallow levels, so the number of open fds stays
 # bounded however deep or large the tree is.
 
+import errno
 import os
 import stat
 import sys
@@ -405,7 +406,12 @@ def _sync_file(src_fd, src_name, dst_fd, dst_name, ctx, rel):
     a leftover to be unlinked but an EISDIR.
     """
     where = ctx.shown(rel)
-    tmp = dirfd.temp_name(dst_name, _TMP_SUFFIX)
+    # 唯一临时名（进程号 + 随机字节）：固定名让两个并发 sync/copy
+    # 互相覆盖对方的临时文件（或被客人预占）。发布前比对 inode，
+    # 不一致拒绝发布——与 dirfd.copy_file_at / atomic._publish_at
+    # 同一条纪律。
+    tmp = dirfd.temp_name(
+        dst_name, f".{os.getpid()}.{os.urandom(4).hex()}{_TMP_SUFFIX}")
 
     # A directory standing where the source has a regular file. rsync refuses
     # this too (it takes --force to clear one out of the way), and renaming
@@ -443,8 +449,21 @@ def _sync_file(src_fd, src_name, dst_fd, dst_name, ctx, rel):
             try:
                 dirfd.copy_data(sfd, tfd, sfd_st)
                 dirfd.copy_metadata(sfd, tfd, sfd_st)
+                written_st = os.fstat(tfd)
             finally:
                 os.close(tfd)
+            try:
+                entry = dirfd.lstat_at(dst_fd, tmp)
+            except OSError:
+                entry = None
+            if (entry is None
+                    or (entry.st_dev, entry.st_ino)
+                    != (written_st.st_dev, written_st.st_ino)):
+                raise OSError(
+                    errno.ESTALE,
+                    "the temporary file was replaced while it was "
+                    "being written", tmp,
+                )
             os.replace(tmp, dst_name, src_dir_fd=dst_fd, dst_dir_fd=dst_fd)
         except OSError as exc:
             dirfd.unlink_quietly(dst_fd, tmp)

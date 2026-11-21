@@ -320,6 +320,12 @@ def _install(sub):
     p.add_argument(
         "--allow-insecure", dest="allow_insecure", action="store_true",
     )
+    p.add_argument(
+        "--sha256", dest="expected_sha256", metavar="HEX", default=None,
+        help=("verify a URL install against this sha256 (64 hex chars); "
+              "ignored for registry pulls, which are digest-verified "
+              "already"),
+    )
     p.add_argument("-q", "--quiet", action="store_true")
     p.add_argument("-h", "--help", action="store_true")
 

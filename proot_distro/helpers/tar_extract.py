@@ -99,6 +99,7 @@ from proot_distro import dirfd
 from proot_distro.compress import (
     require_read_support, require_read_support_fd,
 )
+from proot_distro.i18n import _
 from proot_distro.progress import ByteCounter, clear_bar, draw_bytes_bar
 
 
@@ -273,15 +274,38 @@ class _Parents:
 
 def _extract_stream(raw_fh, total_size, rootfs_fd, *, strip,
                     handle_whiteouts) -> None:
-    """The extraction proper, over an already-open binary stream."""
+    """The extraction proper, over an already-open binary stream.
+
+    解包量封顶（MAX_EXTRACT_BYTES / MAX_EXTRACT_MEMBERS，取自
+    helpers.download）：压缩炸弹/海量小条目在写盘阶段就被拦断，
+    而不是等流完几百 GB 之后才被摘要校验拒掉——手机 /data 分区
+    填满是恢复级别的故障。上限取得宽（合法 rootfs 展开几 GB、几万
+    条目，留一个数量级余量）。
+    """
+    from proot_distro.helpers.download import (
+        MAX_EXTRACT_BYTES, MAX_EXTRACT_MEMBERS,
+    )
     deferred_links: list = []  # (dest, src) — copied after all regular files
     deferred_dirs: list = []   # (parts, mtime) — stamped after all writes
+    members = 0
+    declared = 0
 
     parents = _Parents(rootfs_fd)
     try:
         counter = ByteCounter(raw_fh)
         with tarfile.open(fileobj=counter, mode="r|*") as tf:
             for member in tf:
+                members += 1
+                declared += max(int(getattr(member, "size", 0)), 0)
+                if members > MAX_EXTRACT_MEMBERS:
+                    raise tarfile.TarError(_(
+                        "archive holds more than {limit} members; refusing "
+                        "to unpack it.", limit=MAX_EXTRACT_MEMBERS))
+                if declared > MAX_EXTRACT_BYTES:
+                    raise tarfile.TarError(_(
+                        "archive declares more than {limit} bytes of "
+                        "content; refusing to unpack it.",
+                        limit=MAX_EXTRACT_BYTES))
                 _process_member(
                     member, tf, rootfs_fd, parents,
                     strip=strip,

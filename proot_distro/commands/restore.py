@@ -554,6 +554,37 @@ def command_restore(args) -> None:
         except OSError:
             return
 
+    def _cleanup_after_commit_failure() -> None:
+        """提交点（清空旧 rootfs）之后的失败善后。
+
+        曾经 Ctrl-C / 坏成员在提交后直接退出：旧 rootfs 已删、新的
+        只写了一半、manifest 还是旧的——容器在后续命令眼里仍是
+        “已安装”，下一次 login 就进一个残缺文件系统。现在把整棵
+        容器目录删掉（与 install 失败时的契约一致），用户修好归档
+        重跑 restore 即可；实在删不掉（如 ENOSPC）也把话说清楚，
+        而不是静默留下半截容器。
+        """
+        if not committed or restore_name is None:
+            return
+        if dests is not None:
+            dests.close()
+        if root_fd is not None:
+            try:
+                os.close(root_fd)
+            except OSError:
+                pass
+        if statedir.remove_state_tree(container_dir(restore_name)):
+            log_error(_(
+                "Removed the half-restored container '{restore_name}'; "
+                "re-run the restore once the archive is fixed.",
+                restore_name=restore_name))
+        else:
+            log_error(_(
+                "The restore did not finish and container "
+                "'{restore_name}' is incomplete. Remove it "
+                "('{cmd} remove {restore_name}') and restore "
+                "again.", restore_name=restore_name, cmd=PROGRAM_NAME))
+
     try:
         if archive:
             total_size = os.path.getsize(archive)
@@ -751,12 +782,14 @@ def command_restore(args) -> None:
     except KeyboardInterrupt:
         clear_bar()
         log_error(_("Aborted by user."))
+        _cleanup_after_commit_failure()
         sys.exit(1)
     except (EOFError, OSError, tarfile.TarError) as exc:
         clear_bar()
         log_error(_("Failed to restore container: {exc}", exc = quote_error(exc)))
         log_error(f"{C['BRED']}The archive either was corrupted or has "
                   f"unexpected structure.{C['RST']}")
+        _cleanup_after_commit_failure()
         sys.exit(1)
     finally:
         # Close raw_fh first, but don't let an OSError from close()

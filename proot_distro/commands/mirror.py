@@ -87,7 +87,9 @@ from proot_distro.distro_mirror import (
     SUPPORTED_DISTROS, revert_distro_mirror, switch_distro_mirror,
 )
 from proot_distro.i18n import _
+from proot_distro.locking import ContainerLock
 from proot_distro.message import C, crit_error, log_info, msg, warn
+from proot_distro.names import require_valid_name
 from proot_distro.paths import (
     container_is_installed, container_rootfs,
 )
@@ -712,16 +714,25 @@ def _action_distro(target: str, revert: bool) -> int:
                    supported="; ".join(SUPPORTED_DISTROS)))
         msg()
         return 1
+    # 曾经漏了这层校验：``mirror distro ../..`` 的原始 ValueError 会
+    # （状态树下钻拒绖逃逸后）直接把 traceback 抛给用户。名字先过
+    # 语法，再谈别的。
+    require_valid_name(target)
     if not container_is_installed(target):
         msg()
         crit_error(_("container '{name}' is not installed.", name=target))
         msg()
         return 1
     rootfs = container_rootfs(target)
-    if revert:
-        ok = revert_distro_mirror(rootfs, target)
-    else:
-        ok = switch_distro_mirror(rootfs, target)
+    # 独占锁：正改写源文件时，另一个 mirror distro / --revert /
+    # login 的会话不应当同时进去读写同一批文件（install 触发的切换
+    # 本来就持着安装锁，走不到这里）。
+    with ContainerLock(target, exclusive=True,
+                       command="mirror distro"):
+        if revert:
+            ok = revert_distro_mirror(rootfs, target)
+        else:
+            ok = switch_distro_mirror(rootfs, target)
     return 0 if ok else 1
 
 

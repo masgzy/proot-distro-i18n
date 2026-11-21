@@ -134,6 +134,8 @@ def _render_value(value) -> str:
     """A JSON-ish rendering of a stored value for the list."""
     if isinstance(value, bool):
         return "true" if value else "false"
+    if isinstance(value, list):
+        return ", ".join(str(v) for v in value)
     return str(value)
 
 def _action_list() -> int:

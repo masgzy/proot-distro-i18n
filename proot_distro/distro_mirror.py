@@ -66,6 +66,7 @@ openat 通道：
 from __future__ import annotations
 
 import os
+import re
 import stat
 
 from proot_distro import dirfd
@@ -75,9 +76,13 @@ from proot_distro.message import log_error, log_info, msg, warn
 __all__ = (
     "SUPPORTED_DISTROS", "revert_distro_mirror", "switch_distro_mirror",
 )
-
 _BAK_SUFFIX = ".pd.bak"
 _TMP_SUFFIX = ".pd.tmp"
+
+# 写入临时名的唯一后缀：同目录里可能同时跑两个 pd（或客人在 readdir
+# 里盯着固定名字使坏），固定名会互相覆盖/被指哪换哪。进程号 + 随机
+# 字节让名字不可预测，发布前再比对目录项与写入 fd 的 inode。
+_UNIQUE_TMP = ".{pid}.{rnd}"
 
 # ---------------------------------------------------------------------------
 # 镜像源表：家族 -> (镜像显示名, 文本替换规则)。
@@ -160,31 +165,63 @@ SUPPORTED_DISTROS = (
 # os-release 探测
 # ---------------------------------------------------------------------------
 
-def detect_family(etc_fd: int) -> "str | None":
-    """Read /etc/os-release and return the adapter family, or None."""
-    for name in ("os-release", "../usr/lib/os-release"):
+def detect_family(etc_fd: int, rootfs_fd: int = None) -> "str | None":
+    """Read /etc/os-release (then /usr/lib/os-release) → adapter family.
+
+    /usr/lib/os-release 的旧路径是 ``../usr/lib/os-release``：名字里
+    带 ``/`` 与 ``..``，openat 的 O_NOFOLLOW 只保护最后一段，中间的
+    ``usr``、``lib`` 客人可以种链接穿过去——和本模块自宫的“每个
+    目录都 lstat + O_NOFOLLOW”矛盾。现在改由调用方传入 rootfs 的
+    描述符，逐层下钻 ("usr", "lib") 后再打开 os-release。
+    """
+    for name in ("os-release",):
         try:
             fd, _st = dirfd.open_regular_at(etc_fd, name, os.O_RDONLY)
         except OSError:
-            continue
-        try:
-            with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as fh:
-                fields = {}
-                for line in fh:
-                    key, sep, val = line.partition("=")
-                    if sep:
-                        fields[key.strip()] = val.strip().strip('"')
-        except OSError:
-            continue
-        dist_id = fields.get("ID", "").lower()
-        if dist_id in _FAMILY_BY_ID:
-            return _FAMILY_BY_ID[dist_id]
-        id_like = fields.get("ID_LIKE", "").lower()
-        for token, family in _FAMILY_BY_LIKE:
-            if token in id_like:
+            fd = None
+        if fd is not None:
+            family = _family_from_os_release(fd)
+            if family is not None:
                 return family
-        if dist_id:
-            return None
+    if rootfs_fd is not None:
+        try:
+            lib_fd = dirfd.descend_at(rootfs_fd, ("usr", "lib"))
+        except OSError:
+            lib_fd = None
+        if lib_fd is not None:
+            try:
+                try:
+                    fd, _st = dirfd.open_regular_at(
+                        lib_fd, "os-release", os.O_RDONLY)
+                except OSError:
+                    fd = None
+                if fd is not None:
+                    return _family_from_os_release(fd)
+            finally:
+                os.close(lib_fd)
+    return None
+
+
+def _family_from_os_release(fd: int) -> "str | None":
+    """一个已打开的 os-release fd → 家族；读不出认不出的 → None。"""
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as fh:
+            fields = {}
+            for line in fh:
+                key, sep, val = line.partition("=")
+                if sep:
+                    fields[key.strip()] = val.strip().strip('"')
+    except OSError:
+        return None
+    dist_id = fields.get("ID", "").lower()
+    if dist_id in _FAMILY_BY_ID:
+        return _FAMILY_BY_ID[dist_id]
+    id_like = fields.get("ID_LIKE", "").lower()
+    for token, family in _FAMILY_BY_LIKE:
+        if token in id_like:
+            return family
+    if dist_id:
+        return None
     return None
 
 
@@ -224,17 +261,29 @@ def _open_excl(fd: int, name: str):
 def _write_text_at(fd: int, name: str, text: str) -> bool:
     """Replace *name* at *fd* with *text*, via temp + rename.
 
-    The caller lstat'ed the entry before reading it; rename swaps the
-    directory entry itself, so a link planted between read and write
-    cannot be followed.
+    临时名带进程号 + 随机字节（两个并发 pd / 客人在 readdir 里盯
+    固定名字都不可预测）；写入后比对目录项与写入 fd 的
+    (st_dev, st_ino)——中途被换掉就拒绝发布（ESTALE 语义），
+    不把客人种的链接 rename 到目标名字上。
     """
-    temp = dirfd.temp_name(name, _TMP_SUFFIX)
+    temp = dirfd.temp_name(
+        name, _UNIQUE_TMP.format(pid=os.getpid(), rnd=os.urandom(4).hex())
+        + _TMP_SUFFIX)
     fh = None
     try:
         fh = _open_excl(fd, temp)
         with os.fdopen(fh, "w", encoding="utf-8") as f:
             fh = None
             f.write(text)
+            st = os.fstat(f.fileno())
+        try:
+            entry = dirfd.lstat_at(fd, temp)
+        except OSError:
+            entry = None
+        if (entry is None
+                or (entry.st_dev, entry.st_ino) != (st.st_dev, st.st_ino)):
+            raise OSError(11, "temporary file was replaced during write",
+                          temp)  # errno.ESTALE
         os.rename(temp, name, src_dir_fd=fd, dst_dir_fd=fd)
         return True
     except OSError as exc:
@@ -278,8 +327,22 @@ def _backup_at(fd: int, name: str, original_text: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def _replace_domains(text: str, rules) -> str:
+    """按规则替换域名，但只在域名边界上匹配。
+
+    纯 ``str.replace`` 会把 ``http://deb.debian.org.attacker.cn``
+    “成功”替换成 ``https://mirrors.aliyun.com.attacker.cn``——切换
+    声称成功，恶意后缀域名却还在；同一台主机名前缀也同理。这里用
+    左右环视锁住边界：替换的必须恰好是规则里的那个 origin，
+    后面跟的不是域名继续符（字母/数字/点/连字符）。
+    """
     for old, new in rules:
-        text = text.replace(old, new)
+        scheme, _, rest = old.partition("://")
+        host = rest
+        pattern = re.compile(
+            r"(?<![\w.\-])" + re.escape(scheme) + r"://"
+            + re.escape(host) + r"(?![\w.\-])"
+        )
+        text = pattern.sub(new.replace("\\", r"\\\\"), text)
     return text
 
 
@@ -301,7 +364,11 @@ def _family_domain_files(etc_fd: int, family: str,
         # etc/apt itself too: sources.list lives one level down.
         return [(), ("apt",), ("apt", "sources.list.d")]
     if family == "alpine":
-        return [()]
+        # /etc/apk/repositories：曾经返回 [()]（只扫 etc 自己），
+        # 而 _switchable_name 只在 prefix "apk" 下认 "repositories"——
+        # Alpine 的切换因此是彻底的空转，直到 revert 列表里那行
+        # ("apk",) 才暴露出本意。
+        return [("apk",)]
     if family == "suse":
         return [("zypp", "repos.d")]
     if family == "void":
@@ -323,11 +390,19 @@ def _scan_source_dirs(etc_fd: int, rootfs_fd: int, dirs) -> list:
     A directory that does not exist, or one that is a symlink or a
     plain file, contributes nothing -- there is nothing to switch
     behind it.
+
+    同一个目录的多个文件共享同一个 fd：关闭时要按 fd 去重——曾经
+    每个“文件”关一次，第二个 os.close(fd) 就是 EBADF，把已经切完
+    源的整次调用拖成失败退出码（常见于 sources.list.d 里有两个
+    .list 的 Ubuntu）。listdir 失败的目录也在这里把已打开的 fd
+    关掉，不再泄漏。
     """
     rows = []
+    opened = set()
     for parts in dirs:
         from_root = bool(parts) and parts[0] == "usr"
         base_fd = rootfs_fd if from_root else etc_fd
+        fd = None
         try:
             fd = dirfd.descend_at(base_fd, parts) if parts else None
         except OSError:
@@ -342,12 +417,16 @@ def _scan_source_dirs(etc_fd: int, rootfs_fd: int, dirs) -> list:
                     continue
                 rows.append((fd, prefix, entry))
         except OSError:
-            pass
-    # The descriptors in the rows stay open: the switch reads and
-    # rewrites through them, and closes them when it is done. A
-    # directory whose listdir failed contributes nothing and its fd is
-    # closed here.
-    return rows
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                fd = None
+        if fd is not None:
+            opened.add(fd)
+    # 描述符集合挂在 rows 的第一个元素上：调用方结束后按集合关闭。
+    return rows, opened
 
 
 def _switchable_name(prefix: str, name: str) -> bool:
@@ -370,8 +449,12 @@ def _switchable_name(prefix: str, name: str) -> bool:
     return False
 
 
-def _rewrite_for_family(family: str, text: str) -> "str | None":
-    """The switched text for *family*, or None when nothing matched."""
+def _rewrite_for_family(family: str, text: str, filename: str = "") -> "str | None":
+    """The switched text for *family*, or None when nothing matched.
+
+    *filename* 供需要按文件区分处理的家族（Fedora）判断自己面对
+    的是哪一个 repo 文件。
+    """
     if family in _DOMAIN_RULES:
         rules = _DOMAIN_RULES[family]
         if not any(old in text for old, _new in rules):
@@ -379,9 +462,13 @@ def _rewrite_for_family(family: str, text: str) -> "str | None":
         return _replace_domains(text, rules)
     if family in ("arch", "manjaro"):
         if family == "arch":
+            # Arch 官方布局：<mirror>/archlinux/$repo/os/$arch。
             server = f"https://{_ALIYUN}/archlinux/$repo/os/$arch"
         else:
-            server = f"https://{_ALIYUN}/manjaro/stable/$repo/os/$arch"
+            # Manjaro 的仓库布局与 Arch 不同：<mirror>/manjaro/<branch>/
+            # $repo/$arch——没有 /os/（那是 Arch 的目录层级）。曾经照抄
+            # Arch 的 /os/，切完后 pacman 全部 404。
+            server = f"https://{_ALIYUN}/manjaro/stable/$repo/$arch"
         body = (
             f"# 由 proot-distro-i18n 切换到国内镜像（{server}）\n"
             f"# 原始文件已备份为 mirrorlist{_BAK_SUFFIX}\n"
@@ -389,28 +476,7 @@ def _rewrite_for_family(family: str, text: str) -> "str | None":
         )
         return body
     if family == "fedora":
-        if "fedoraproject.org" not in text:
-            return None
-        updates = "updates" in text
-        if updates:
-            base = (f"https://{_ALIYUN}/fedora/updates/$releasever/"
-                    f"Everything/$basearch/Packages/")
-            name = "Fedora $releasever - Updates - $basearch"
-        else:
-            base = (f"https://{_ALIYUN}/fedora/releases/$releasever/"
-                    f"Everything/$basearch/os/")
-            name = "Fedora $releasever - $basearch"
-        key = (f"https://{_ALIYUN}/fedora/releases/$releasever/"
-               f"Everything/$basearch/os/RPM-GPG-KEY-fedora-$releasever-primary")
-        body = (
-            f"[mirror-cn]\n"
-            f"name={name}\n"
-            f"baseurl={base}\n"
-            f"enabled=1\n"
-            f"gpgcheck=1\n"
-            f"gpgkey={key}\n"
-        )
-        return body
+        return _rewrite_fedora(text, filename)
     if family in ("rocky", "almalinux"):
         bases = (
             [f"https://dl.rockylinux.org/$contentdir",
@@ -465,24 +531,86 @@ def _rewrite_for_family(family: str, text: str) -> "str | None":
 
 
 # ---------------------------------------------------------------------------
-# 主入口：切换 / 还原
+# Fedora 专属适配器（逐文件）
 # ---------------------------------------------------------------------------
 
+def _rewrite_fedora(text: str, filename: str) -> "str | None":
+    """Fedora 的逐文件重写：只处理本程序能映射的那两个官方 repo。
+
+    曾经的实现是“文件里出现 fedoraproject.org 就整文件换成一段
+    [mirror-cn]”：fedora-updates.repo、fedora-cisco-openh264.repo、
+    modular、用户自建 repo 全部被採平成同一个 repo id、同一组
+    baseurl（updates 与 base 靠文件名里有没有 "updates" 猜）。现在：
+
+    * 只重写 repo id 为 ``fedora`` / ``fedora-updates`` 的文件
+      （其余文件一律不动）；
+    * 生成的段沿用该文件自己的 repo id 与官方密钥路径
+      （``file:///etc/pki/rpm-gpg/...``，镜像站不必可信赖地托管密钥）；
+    * updates 走 fedora-updates 布局，base 走 releases 布局。
+    """
+    ids = [line.strip()[1:-1].strip().lower()
+           for line in text.splitlines()
+           if line.strip().startswith("[") and line.strip().endswith("]")]
+    repo_id = ids[0] if ids else ""
+    # fedora 与 fedora-updates 是本程序能正确合成的两个官方 repo；
+    # 旧版 fedora-updates.repo 的 id 叫 [updates]，新版叫
+    # [fedora-updates]——两个都认。其余（h264、modular、用户自建）不属于
+    # 能安全合成的范围，交还给用户。
+    if repo_id not in ("fedora", "fedora-updates", "updates"):
+        return None
+    if "fedoraproject.org" not in text:
+        return None
+    updates = repo_id in ("fedora-updates", "updates")
+    if updates:
+        base = (f"https://{_ALIYUN}/fedora/updates/$releasever/"
+                f"Everything/$basearch/Packages/")
+        name = "Fedora $releasever - Updates - $basearch"
+        key = ("file:///etc/pki/rpm-gpg/"
+               "RPM-GPG-KEY-fedora-$releasever-primary")
+    else:
+        base = (f"https://{_ALIYUN}/fedora/releases/$releasever/"
+                f"Everything/$basearch/os/")
+        name = "Fedora $releasever - $basearch"
+        key = ("file:///etc/pki/rpm-gpg/"
+               "RPM-GPG-KEY-fedora-$releasever-primary")
+    body = (
+        f"#{repo_id}（由 proot-distro-i18n 切换到阿里云镜像）\n"
+        f"[{repo_id}]\n"
+        f"name={name}\n"
+        f"baseurl={base}\n"
+        f"enabled=1\n"
+        f"gpgcheck=1\n"
+        f"gpgkey={key}\n"
+    )
+    return body
+
+
+
 def switch_distro_mirror(rootfs: str, container_name: str,
-                         dist_names: "set | None" = None) -> bool:
+                         dist_names: "set | None" = None, *,
+                         root_fd: int = None) -> bool:
     """Switch *container_name*'s package sources to a Chinese mirror.
 
     *rootfs* is the container's rootfs path; *dist_names* is the set of
     distribution names the manifest records, kept for callers that want
-    to display it -- identification here is os-release-driven. Returns
-    True when at least one source file was rewritten; never raises --
-    every failure is reported and the install that triggered it
-    carries on.
+    to display it -- identification here is os-release-driven.
+    *root_fd* 是调用方钉住的 rootfs 描述符（install 在持有描述符的
+    try 块里直接传，避免闭锁后按名字重解一次客人可换的路径）；
+    None 时才按名字打开。
+
+    Returns True when at least one source file was rewritten **or
+    nothing needed doing**（已指向国内镜像的重复执行是幂等成功，
+    脚本化调用不必因“已经是了”而失败）; never raises -- every
+    failure is reported and the install that triggered it carries on.
     """
+    own_root_fd = None
     rootfs_fd = None
     etc_fd = None
     try:
-        rootfs_fd = dirfd.opendir(rootfs)
+        if root_fd is not None:
+            rootfs_fd = dirfd.reopen(root_fd)
+        else:
+            own_root_fd = rootfs_fd = dirfd.opendir(rootfs)
         try:
             etc_fd = dirfd.opendir_at(rootfs_fd, "etc")
         except OSError as exc:
@@ -491,7 +619,7 @@ def switch_distro_mirror(rootfs: str, container_name: str,
                    container=container_name, exc=exc))
             return False
 
-        family = detect_family(etc_fd)
+        family = detect_family(etc_fd, rootfs_fd)
         if family is None:
             warn(_("no mirror mapping for this distro (identified via "
                    "/etc/os-release). Supported: {supported}",
@@ -510,14 +638,14 @@ def switch_distro_mirror(rootfs: str, container_name: str,
                    container=container_name, label=label))
 
         changed = []
-        rows = _scan_source_dirs(etc_fd, rootfs_fd, dirs)
+        rows, opened = _scan_source_dirs(etc_fd, rootfs_fd, dirs)
         try:
             for fd, prefix, name in rows:
                 target_fd = etc_fd if fd is None else fd
                 original = _read_at(target_fd, name)
                 if original is None:
                     continue
-                rewritten = _rewrite_for_family(family, original)
+                rewritten = _rewrite_for_family(family, original, name)
                 if rewritten is None or rewritten == original:
                     continue
                 if not _backup_at(target_fd, name, original):
@@ -527,14 +655,18 @@ def switch_distro_mirror(rootfs: str, container_name: str,
                              else f"/etc/{name}")
                     changed.append(shown)
         finally:
-            for fd, _prefix, _name in rows:
-                if fd is not None:
+            for fd in opened:
+                try:
                     os.close(fd)
+                except OSError:
+                    pass
 
         if not changed:
-            warn(_("sources already point at a Chinese mirror, or no "
-                   "known upstream domain matched; nothing changed."))
-            return False
+            # 幂等成功，不是失败：源已指向国内镜像（或本来就没有官方
+            # 域名可换）时，脚本化重跑不应当拿到非零退出码。
+            log_info(_("sources already point at a Chinese mirror, or no "
+                       "known upstream domain matched; nothing changed."))
+            return True
 
         msg()
         log_info(_("rewrote {n} file(s):", n=len(changed)))
@@ -551,8 +683,8 @@ def switch_distro_mirror(rootfs: str, container_name: str,
     finally:
         if etc_fd is not None:
             os.close(etc_fd)
-        if rootfs_fd is not None:
-            os.close(rootfs_fd)
+        if own_root_fd is not None:
+            os.close(own_root_fd)
 
 
 def revert_distro_mirror(rootfs: str, container_name: str) -> bool:

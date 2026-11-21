@@ -130,8 +130,9 @@ def test_reset_all_when_nothing_stored(isolated_config):
 def test_reset_all_removes_every_owned_key(isolated_config):
     settings.set_setting("passthrough", "true")
     settings.set_setting("distro_mirror", "true")
+    settings.set_setting("dns", "223.5.5.5,119.29.29.29")
     removed = settings.reset_settings()
-    assert removed == ["passthrough", "distro_mirror"]
+    assert removed == ["passthrough", "distro_mirror", "dns"]
     assert not isolated_config.joinpath("config.json").exists()
 
 
@@ -141,11 +142,16 @@ def test_reset_all_removes_every_owned_key(isolated_config):
 
 def test_list_settings_rows(isolated_config):
     rows = settings.list_settings()
-    assert [r[0] for r in rows] == ["passthrough", "distro_mirror"]
+    assert [r[0] for r in rows] == ["passthrough", "distro_mirror", "dns"]
     name, current, default, is_default, doc = rows[0]
     assert name == "passthrough"
     assert current is False and default is False and is_default is True
     assert doc
+
+    # dns：auto 跟随宿主；可固定为最多 3 个 IP。
+    _name, current, default, is_default, doc = rows[2]
+    assert _name == "dns"
+    assert current == "auto" and default == "auto" and is_default is True
 
     settings.set_setting("passthrough", "true")
     name, current, default, is_default, _doc = settings.list_settings()[0]
@@ -204,3 +210,52 @@ def test_compose_path_off_keeps_termux_type_container(monkeypatch):
 def test_compose_path_off_leaves_empty_but_not_broken(monkeypatch):
     _with_passthrough(monkeypatch, False)
     assert login_mod._compose_guest_path(TERMUX_BIN, "normal") == ""
+
+
+# ---------------------------------------------------------------------------
+# the dns setting (ip_list kind)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("raw,expected", [
+    ("auto", "auto"),
+    ("AUTO", "auto"),
+    ("default", "auto"),
+    ("host", "auto"),
+    ("223.5.5.5", ["223.5.5.5"]),
+    ("223.5.5.5,119.29.29.29", ["223.5.5.5", "119.29.29.29"]),
+    ("223.5.5.5 119.29.29.29", ["223.5.5.5", "119.29.29.29"]),
+    (" 223.5.5.5 , 119.29.29.29 ", ["223.5.5.5", "119.29.29.29"]),
+    ("223.5.5.5,223.5.5.5", ["223.5.5.5"]),          # dedupe
+    ("2001:4860:4860::8888", ["2001:4860:4860::8888"]),
+    ("1.1.1.1,2.2.2.2,3.3.3.3", ["1.1.1.1", "2.2.2.2", "3.3.3.3"]),
+])
+def test_normalize_dns_accepts_ips_and_auto(raw, expected):
+    assert settings.normalize_ip_list(raw) == expected
+
+
+@pytest.mark.parametrize("raw", [
+    "", "not-an-ip", "223.5.5", "1.1.1.1,banana",
+    "1.1.1.1,2.2.2.2,3.3.3.3,4.4.4.4",   # 第 4 个：musl/glibc 都只读 3 个
+    "999.999.999.999",
+])
+def test_normalize_dns_refuses_junk(raw):
+    with pytest.raises(settings.SettingError):
+        settings.normalize_ip_list(raw)
+
+
+def test_dns_setting_roundtrip(isolated_config):
+    assert settings.set_setting("dns", "223.5.5.5,119.29.29.29") == [
+        "223.5.5.5", "119.29.29.29"]
+    assert settings.get_setting("dns") == ["223.5.5.5", "119.29.29.29"]
+    settings.set_setting("dns", "auto")
+    assert settings.get_setting("dns") == "auto"
+    assert settings.reset_settings("dns") == ["dns"]
+    assert settings.get_setting("dns") == "auto"
+
+
+def test_dns_stored_junk_reads_as_unset(isolated_config):
+    # 手改坏的 config.json 读作未设置，绝不炸读路径。
+    config_mod.save_user_config({"dns": "still not an ip"})
+    assert settings.get_setting("dns") == "auto"
+    config_mod.save_user_config({"dns": ["1.2.3.4", "banana"]})
+    assert settings.get_setting("dns") == "auto"

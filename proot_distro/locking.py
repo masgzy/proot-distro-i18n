@@ -585,6 +585,18 @@ class _FlockBase:
         container can arrange with one chmod, and the reason that is not
         treated as "this filesystem cannot hold locks". blocked_detail()
         tells them apart.
+
+        flock 之后校验锁文件的名字仍然指向**我们锁住的 inode**
+        （lstat 对 fstat），并且该 inode 没有被摘链（st_nlink==0）。
+        锁名坐在客人可写的目录里：另一个 pd 打开名字到 flock 之间、
+        或我们 flock 到校验之间被换名/摘链，都会让两个进程各自锁住
+        不同的 inode——互斥悄悄失效。校验失败就关掉重来（至多 3 次），
+        仍失败按“名字被敌意占用”处理（fail closed）。
+
+        残余窗口（如实记录）：校验**之后**发生的摘链/换名检测不到——
+        同用户攻击者本就能在任意时刻换名。flock-by-name 在可写目录里
+        只能做到这一步；会话清单（session.py）靠 /proc fd 扫描、
+        不依赖名字，才是对“换名”免疫的那一层。
         """
         if self._lock_path in _held_exclusive:
             # This process already holds an exclusive lock on this path
@@ -592,55 +604,101 @@ class _FlockBase:
             self._reentrant = True
             return True
 
-        lock_dir = os.path.dirname(self._lock_path)
-        try:
-            dir_fd = _locks_dir_fd(self._dir_parts, create=True)
-            if dir_fd is None:
-                return True  # Cannot create locks dir; proceed unlocked.
+        name = os.path.basename(self._lock_path)
+        fd = None
+        stale = False
+        for _attempt in range(3):
+            stale = False
             try:
-                raw = _open_lock_file(
-                    dir_fd, os.path.basename(self._lock_path), self._lock_path,
-                )
-            finally:
-                os.close(dir_fd)
-        except _HostileLockPath as exc:
-            self._hostile = str(exc)
-            return False
-        except _LockPathDenied as exc:
-            self._denied = str(exc)
-            return False
-        if raw is None:
-            return True  # Cannot open/create lock file; proceed unlocked.
+                dir_fd = _locks_dir_fd(self._dir_parts, create=True)
+                if dir_fd is None:
+                    return True  # Cannot create locks dir; proceed unlocked.
+                try:
+                    raw = _open_lock_file(
+                        dir_fd, name, self._lock_path,
+                    )
+                finally:
+                    os.close(dir_fd)
+            except _HostileLockPath as exc:
+                self._hostile = str(exc)
+                return False
+            except _LockPathDenied as exc:
+                self._denied = str(exc)
+                return False
+            if raw is None:
+                return True  # Cannot open/create lock file; proceed unlocked.
 
-        # Open with "a+" (read+append, no truncate) so that a failed
-        # flock attempt doesn't clobber the PID/command recorded by the
-        # current lock holder. We truncate explicitly only after
-        # successfully acquiring the lock.
-        try:
-            fd = os.fdopen(raw, "r+")
-        except OSError:
-            os.close(raw)
-            return True
-
-        if self._inheritable:
+            # Open with "r+" (read+write, no truncate) so that a failed
+            # flock attempt doesn't clobber the PID/command recorded by the
+            # current lock holder. We truncate explicitly only after
+            # successfully acquiring the lock.
             try:
-                os.set_inheritable(fd.fileno(), True)
+                fd = os.fdopen(raw, "r+")
             except OSError:
-                pass
+                os.close(raw)
+                return True
 
-        lock_op = (
-            (fcntl.LOCK_EX if self._exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB
-        )
-        try:
-            fcntl.flock(fd.fileno(), lock_op)
-        except OSError as exc:
-            fd.close()
-            if exc.errno in (errno.EACCES, errno.EAGAIN):
-                return False  # held by another process — normal contention
-            # flock not supported on this filesystem — proceed unlocked
-            # but warn so the user understands locking is best-effort.
-            warn(f"flock not supported on {self._lock_path}, proceeding without lock")
-            return True
+            if self._inheritable:
+                try:
+                    os.set_inheritable(fd.fileno(), True)
+                except OSError:
+                    pass
+
+            lock_op = (
+                (fcntl.LOCK_EX if self._exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB
+            )
+            try:
+                fcntl.flock(fd.fileno(), lock_op)
+            except OSError as exc:
+                fd.close()
+                fd = None
+                if exc.errno in (errno.EACCES, errno.EAGAIN):
+                    return False  # held by another process — normal contention
+                # flock not supported on this filesystem — proceed unlocked
+                # but warn so the user understands locking is best-effort.
+                warn(f"flock not supported on {self._lock_path}, proceeding without lock")
+                return True
+
+            # The name still names the inode we just locked?
+            try:
+                own = os.fstat(fd.fileno())
+                if own.st_nlink == 0:
+                    raise OSError(errno.ESTALE,
+                                  "the lock file was unlinked while being "
+                                  "acquired", self._lock_path)
+                dir_fd = _locks_dir_fd(self._dir_parts)
+                if dir_fd is None:
+                    entry = None
+                else:
+                    try:
+                        entry = dirfd.lstat_at(dir_fd, name)
+                    except OSError:
+                        entry = None
+                    finally:
+                        os.close(dir_fd)
+                if (entry is None
+                        or (entry.st_dev, entry.st_ino)
+                        != (own.st_dev, own.st_ino)):
+                    raise OSError(errno.ESTALE,
+                                  "the lock file was replaced while being "
+                                  "acquired", self._lock_path)
+            except OSError as exc:
+                if exc.errno == errno.ESTALE:
+                    # Close and take a fresh run at the name; a swap that
+                    # keeps landing means someone is working against us.
+                    fd.close()
+                    fd = None
+                    stale = True
+                    continue
+                pass  # an unverifiable name is not a refusal to lock
+            # 走到这里锁已在手（校验通过，或名字不可校验但锁在手）：
+            # 再进下一轮会在同一文件上用另一个 fd 二次 flock——
+            # flock 按 open file description 计锁，会自己把自己锁死。
+            break
+
+        if fd is None or stale:
+            self._hostile = self._lock_path
+            return False
 
         # Record PID + command in the file for diagnostic purposes. The
         # truncation happens *after* the flock, not as part of opening

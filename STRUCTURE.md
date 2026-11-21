@@ -97,7 +97,8 @@ what the command takes (see `locking.py`).
 | `helpers/oci_writer.py` | Final `build` outputs: manifest cache entry and OCI image-layout tarball. |
 | `helpers/tar_extract.py` | The single streaming tar -> rootfs extractor, used for layers and plain tarballs. |
 | `helpers/rootfs.py` | Post-extraction fixups: `resolv.conf`, `/etc/hosts`, Android uid/gid entries. |
-| `helpers/download.py` | HTTP opener, redirect policy, retries, `download_file`, `sha256_file`. |
+| `helpers/resolv.py` | Fork: the DNS decision chain (`dns` setting > host's resolv.conf > static fallback), the managed-marker line, and the login-time refresh that never touches a guest-owned resolv.conf. |
+| `helpers/download.py` | HTTP opener, redirect policy, retries, `download_file` (sha256 verification, byte caps, URL redaction), `sha256_file`. |
 
 ### Foundation modules
 
