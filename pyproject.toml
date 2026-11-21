@@ -9,8 +9,8 @@ backend-path = ["."]
 
 [project]
 name = "proot-distro-i18n"
-version = "5.10.2"
-description = "PRoot-Distro 的中文汉化版（基于官方 v5.10.0），附带镜像源管理与下载提速。"
+version = "5.10.3"
+description = "PRoot-Distro 的中文汉化版（基于官方 v5.10.3），附带容器内软件源一键切国内镜像、Docker 镜像源管理与下载提速。"
 
 readme = "README.md"
 requires-python = ">=3.9"
