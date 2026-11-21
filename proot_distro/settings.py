@@ -41,18 +41,29 @@ belongs to ``pd lang`` and is never touched here. ``reset`` only
 removes keys this registry owns, so ``pd setting reset`` cannot
 silently change the UI language.
 
-The flagship setting is ``passthrough`` (default on):
+The flagship setting is ``passthrough`` (default OFF):
 
-* on  -- a normal-type container keeps the host Termux ``bin`` dir
-  appended last on the guest PATH (container programs first, Termux
-  binaries as the fallback), and the profile.d snippet re-appends it
-  for every login shell.
-* off -- that PATH entry is stripped instead, and the snippet drops
-  the append block, so Termux binaries are no longer reachable from
-  the container. The Termux prefix itself stays bound into the guest
+* off -- the default. A normal-type container's PATH has the host
+  Termux ``bin`` dir stripped, and the profile.d snippet drops the
+  append block, so Termux binaries are not reachable from inside the
+  container. The Termux prefix itself stays bound into the guest
   (files are still readable at absolute paths); only PATH resolution
-  changes. Sessions must be restarted for a change to apply -- PATH
-  and the snippet are both decided when a session starts.
+  changes. This keeps a container self-contained: no accidental
+  escape into host tools, no surprise when a guest package name
+  shadows a host one.
+* on  -- the host Termux ``bin`` dir is appended last on the guest
+  PATH (container programs first, Termux binaries as the fallback),
+  and the profile.d snippet re-appends it for every login shell.
+
+Sessions must be restarted for a change to apply -- PATH and the
+snippet are both decided when a session starts.
+
+The other registry entry, ``distro_mirror``, is not about the
+session: when it is on, the moment an ``install`` finishes the
+rootfs' package-manager sources are switched to a Chinese mirror
+(distro_mirror.py does the work), so the first ``apt update`` inside
+a fresh container is already fast. It never touches installed
+containers by itself -- ``pd mirror distro`` does that on demand.
 """
 
 from __future__ import annotations
@@ -108,12 +119,24 @@ def normalize_bool(raw: str) -> bool:
 SETTINGS: dict = {
     "passthrough": {
         "kind": SETTING_KIND_BOOL,
-        "default": True,
+        "default": False,
         "doc": (
-            "host Termux passthrough. on: container programs first, "
-            "Termux binaries as the fallback (the current behavior). "
-            "off: Termux binaries are removed from the container PATH "
-            "and cannot be executed. Applies to new sessions."
+            "host Termux passthrough. off (default): Termux binaries "
+            "are removed from the container PATH and cannot be "
+            "executed. on: container programs first, Termux binaries "
+            "as the fallback. Applies to new sessions."
+        ),
+    },
+    "distro_mirror": {
+        "kind": SETTING_KIND_BOOL,
+        "default": False,
+        "doc": (
+            "switch a freshly installed container's package sources "
+            "to a Chinese mirror (Aliyun/TUNA). off (default): keep "
+            "the image's own sources. on: 'install' rewrites apt/apk/"
+            "dnf/pacman/zypp sources right after extraction; switch "
+            "an existing container with 'mirror distro', revert it "
+            "with 'mirror distro <name> --revert'."
         ),
     },
 }
@@ -177,8 +200,13 @@ def get_setting(name: str):
 
 
 def passthrough_enabled() -> bool:
-    """Whether host Termux binaries ride the guest PATH (default: yes)."""
+    """Whether host Termux binaries ride the guest PATH (default: no)."""
     return bool(get_setting("passthrough"))
+
+
+def distro_mirror_enabled() -> bool:
+    """Whether install should switch the guest's package sources (default: no)."""
+    return bool(get_setting("distro_mirror"))
 
 
 def set_setting(name: str, raw: str):

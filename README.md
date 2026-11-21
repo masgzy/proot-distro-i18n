@@ -2,7 +2,7 @@
 
 > proot-distro 的完整中文汉化(i18n国际化)版本，附带 Docker registry 镜像源管理子命令、性能优化与逻辑改进。
 >
-> 本 README 对应 `proot-distro-i18n` v5.10.0（已合并官方 5.5.0 ~ 5.10.0 全部更新）。
+> 本 README 对应 `proot-distro-i18n` v5.10.3（已合并官方 5.5.0 ~ 5.10.3 全部更新）。
 
 ## 目录
 
@@ -34,7 +34,18 @@ PRoot-Distro 是 proot 用户空间模拟器（chroot、mount --bind、binfmt_mi
 
 ## 主要改动
 
-### 本次合并的官方更新（v5.5.0 → v5.10.0）
+### v5.10.3：上游跟进 + 容器内软件源一键切国内镜像
+
+- **上游跟进（官方 5.10.1 → 5.10.3）**：
+  - registry 429 限速：尊重 `Retry-After`、配额耗尽立即失败并说明是谁的限额（pull/push 各自提示）；
+  - registry 认证：给以 Basic 质询的 registry（Nexus、Artifactory、htpasswd）发凭据；`PD_DOCKER_AUTH` 错误在 pull/push 开始前就报告；
+  - login 预设 `MOZ_SHM_NO_SEALS=1`（容器内跑 Firefox 不再需要手动设）。
+- **新设置项 `distro_mirror`**：安装容器时自动把容器内软件源切到国内镜像（阿里云/清华），适配 Debian/Ubuntu/Kali/Alpine/Arch/Manjaro/Fedora/Rocky/Alma/openSUSE/Void/Gentoo；手动入口 `pd mirror distro <容器>`，`--revert` 还原。
+- **`passthrough` 默认值改为关闭**：容器默认不再透传宿主 Termux 命令，需要时 `pd setting put passthrough true`。
+- **界面配色升级为 Catppuccin**：Mocha（深色）/ Latte（浅色）自适应（`CLI_THEME` 覆盖、`COLORFGBG` 探测），真彩终端用官方色值，非真彩终端降级到基础 16 色，语义映射不变；支持 `NO_COLOR`/`CLICOLOR=0`/`PD_FORCE_COLORS`/`FORCE_COLOR`。
+- **发布链路**：GitHub Release note 与 PyPI 摘要全中文；PyPI 走 trusted publishing（OIDC）正式发布。
+
+### 已合并的官方更新（v5.5.0 → v5.10.0）
 
 - **新命令 `search`**：在 Docker Hub 搜索镜像（支持 `--limit`、`--quiet`），结果可直接传给 `install`。
 - **`remove --image` / `list --image`**：直接管理缓存的 OCI 镜像及其层 blob。
@@ -178,6 +189,7 @@ proot-distro remove ubuntu
 | `use` / `set ID\|URL` | 选中一个镜像源（按 id、name 或 URL） |
 | `unset` / `clear` / `off` | 清除当前选中，回到默认 |
 | `show` | 仅打印当前生效 URL（脚本友好） |
+| `distro 容器名 [--revert]` | 容器内软件源一键切国内镜像（apt/apk/dnf/pacman/zypp/xbps/portage）；`--revert` 还原备份 |
 
 ### 选项
 
@@ -336,20 +348,25 @@ Termux 的 locale 支持是残缺的：`LANG` 通常为 `C` 或未设置，Andro
 容器不受影响。
 
 ```bash
-pd setting ls                       # 列出全部设置项（不带子动作时也是这个）
-pd setting put passthrough false    # 关闭宿主 Termux 穿透
-pd setting put passthrough true     # 重新打开（默认）
-pd setting reset passthrough        # 单项恢复默认
-pd setting reset                    # 全部恢复默认（不影响 lang 写入的语言）
-pd setting help                     # 完整帮助
+pd setting ls                          # 列出全部设置项（不带子动作时也是这个）
+pd setting put passthrough true        # 打开宿主 Termux 穿透
+pd setting put passthrough false       # 关闭（默认）
+pd setting put distro_mirror true      # 装容器时自动切国内软件源
+pd setting reset passthrough           # 单项恢复默认
+pd setting reset                       # 全部恢复默认（不影响 lang 写入的语言）
+pd setting help                        # 完整帮助
 ```
 
 ### passthrough：宿主 Termux 穿透
 
 | 取值 | 行为 |
 |---|---|
-| `true`（默认） | 容器内程序优先，Termux 二进制兜底：Termux 的 bin 目录追加在容器 PATH 末尾 |
-| `false` | 从容器 PATH 移除 Termux 的 bin 目录，容器内执行不到 Termux 程序 |
+| `false`（默认，v5.10.3 起） | 从容器 PATH 移除 Termux 的 bin 目录，容器内执行不到 Termux 程序 |
+| `true` | 容器内程序优先，Termux 二进制兜底：Termux 的 bin 目录追加在容器 PATH 末尾 |
+
+默认值自 v5.10.3 起改为**关闭**：容器自成一体——容器里的同名包不
+会波及宿主，也不会误执行宿主工具；需要 Termux 二进制的用户显式打
+开。
 
 取值写法随意：`true/false`、`1/0`、`t/f`（大小写均可）、`yes/no`、
 `on/off` 都行，存储时统一归一化。
@@ -357,6 +374,29 @@ pd setting help                     # 完整帮助
 关闭穿透只改变 PATH 解析：Termux 前缀仍绑定进容器，按绝对路径仍能
 访问其中的文件，只是 shell 不再找到它们。termux 类型的容器（Termux
 自身镜像）不受影响——它的 PATH 本来就是 Termux 前缀。
+
+### distro_mirror：安装时切换国内软件源
+
+| 取值 | 行为 |
+|---|---|
+| `false`（默认） | 保留镜像自带的软件源 |
+| `true` | `install` 解包完成后立即把容器内 apt/apk/dnf/pacman/zypp/xbps/portage 源切到国内镜像（阿里云/清华） |
+
+适配 Debian/Ubuntu/Kali（含 ubuntu-ports 与 deb822 `.sources`）、
+Alpine、Arch/Manjaro、Fedora、Rocky/AlmaLinux、openSUSE、Void、
+Gentoo，识别靠容器内 `/etc/os-release`。原文件自动备份为
+`<文件名>.pd.bak`：
+
+```bash
+pd mirror distro debian               # 手动给已装容器切源
+pd mirror distro debian --revert      # 还原备份的原始源
+```
+
+### Mozilla 系基线变量（对齐上游 5.10.3）
+
+normal 型容器在 Termux 上默认导出 `MOZ_FAKE_NO_SANDBOX=1`、
+`MOZ_SHM_NO_SEALS=1`、`PULSE_SERVER=127.0.0.1`：容器内跑 Firefox 不
+再需要手动设这些。镜像的 Env 无法覆盖它们，`--env` 可以。
 
 ## 自动更新（update 子命令）
 

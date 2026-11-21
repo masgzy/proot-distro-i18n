@@ -347,14 +347,18 @@ _proot_distro() {
             else
                 # 第一个位置参数: 子动作; 第二个: ID|URL
                 # 简化: 如果当前词是已知动作, 补动作; 否则补镜像 ID
-                local actions="ls list test use set unset clear off show"
+                local actions="ls list test use set unset clear off show distro cn"
                 if [[ " ${actions} " == *" ${cur} "* ]]; then
                     COMPREPLY=($(compgen -W "${actions}" -- "${cur}"))
                 else
-                    # 看上一个词是不是动作, 是就补 ID
+                    # 看上一个词是不是动作, 是就补 ID/容器名
                     local prev_word="${words[cword-1]}"
                     if [[ " ${actions} " == *" ${prev_word} "* ]]; then
-                        COMPREPLY=($(compgen -W "$(_proot_distro_get_mirrors)" -- "${cur}"))
+                        if [[ "${prev_word}" == "distro" || "${prev_word}" == "cn" ]]; then
+                            COMPREPLY=($(compgen -W "$(${COMP_WORDS[0]} list -q 2>/dev/null)" -- "${cur}"))
+                        else
+                            COMPREPLY=($(compgen -W "$(_proot_distro_get_mirrors)" -- "${cur}"))
+                        fi
                     else
                         COMPREPLY=($(compgen -W "${actions}" -- "${cur}"))
                     fi

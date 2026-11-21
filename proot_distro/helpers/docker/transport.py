@@ -59,6 +59,7 @@
 import base64
 import http.client
 import json
+import math
 import os
 import re
 import socket
@@ -79,6 +80,7 @@ from proot_distro.helpers.download import (
     is_plaintext_http_tls_error,
     new_request,
     require_complete_body,
+    retry_after,
     retry_http,
     _tune_socket,
     TunedHTTPSConnection,
@@ -95,6 +97,7 @@ from proot_distro.helpers.download import (
 from proot_distro.mirrors import resolve_registry_url as _resolve_registry_url
 
 AUTH_URL = "https://auth.docker.io/token"
+HUB_SERVICE = "registry.docker.io"
 
 # 官方 Docker Hub 的 registry 端点。配置了镜像源时，实际端点由
 # mirrors.resolve_registry_url() 动态返回（见 registry_base_url），
@@ -271,6 +274,22 @@ def _request_body(open_fn, req, what: str, limit: int = None) -> bytes:
     return retry_http(_attempt, what=what)
 
 
+def _release(exc: urllib.error.HTTPError) -> None:
+    """Close the connection behind *exc*, whose body nobody will read.
+
+    An HTTPError holds the response it was raised for, socket and all,
+    and one that ends up in a chained exception sits in a reference
+    cycle (the exception, its traceback, the frame binding it) that only
+    the cyclic garbage collector frees. Until it runs the socket stays
+    open. Called once the status and headers have been read, which do
+    not need the connection; an HTTPError made without a response has
+    nothing to close (upstream proot-distro 5.10.2).
+    """
+    fp = getattr(exc, "fp", None)
+    if fp is not None:
+        fp.close()
+
+
 def _grant_token(data: dict, what: str) -> str:
     """Pull the Bearer token out of a token-endpoint grant.
 
@@ -300,6 +319,11 @@ def _grant_token(data: dict, what: str) -> str:
             f"HTTP header cannot carry."
         )
     return token
+
+
+def _bearer(token: str) -> str:
+    """The Authorization value for a granted *token*; '' for no token."""
+    return f"Bearer {token}" if token else ""
 
 
 def decode_json_object(body: bytes, what: str) -> dict:
@@ -420,6 +444,100 @@ def auth_denied_msg(image_ref: str, code: int) -> str:
     )
 
 
+def _wait_text(seconds: float) -> str:
+    """A Retry-After, rounded to what a person would say."""
+    if not math.isfinite(seconds) or seconds >= 86400:
+        return "more than a day"
+    if seconds >= 5400:
+        return f"about {round(seconds / 3600)} hours"
+    if seconds >= 90:
+        return f"about {round(seconds / 60)} minutes"
+    return f"{math.ceil(seconds)} seconds"
+
+
+def _relays_docker_hub(registry: str, exc: urllib.error.HTTPError) -> bool:
+    """Whether *registry* answered *exc* on Docker Hub's behalf.
+
+    Docker Hub marks every answer it counts against a pull quota with
+    Docker-RateLimit-Source, the address or account the pull was counted
+    against. The same header on a refusal from another registry is a
+    front end passing requests on to Docker Hub -- a vanity name such as
+    docker.n8n.io, a pull-through mirror. The refusal has to have come
+    from that registry itself: one that redirected the request to Docker
+    Hub (as such front ends do for clients they recognise) got its
+    answer from Docker Hub, counted against this machine's own address.
+    """
+    if not registry or exc.headers is None:
+        return False
+    if exc.headers.get("Docker-RateLimit-Source") is None:
+        return False
+    try:
+        host = urllib.parse.urlsplit(getattr(exc, "url", "") or "").netloc
+    except ValueError:
+        return False
+    return host.lower() == registry.lower()
+
+
+def rate_limited_msg(
+    image_ref: str, ref, exc: urllib.error.HTTPError, action: str = "pull",
+) -> str:
+    """Return the error shown when a registry answers 429 Too Many Requests.
+
+    *ref* is the parsed *image_ref*, and *action* is "pull" or "push".
+    The advice depends on whose limit it is. With PD_DOCKER_AUTH set it
+    is the account's, and there is nothing to do but wait. Anonymous
+    pulls from Docker Hub are counted per network address, which a
+    mobile carrier's NAT shares among many people. A front end relaying
+    Docker Hub (_relays_docker_hub) is one address to Docker Hub however
+    many people pull through it, so its anonymous quota is spent by all
+    of them at once and is often simply gone; the image is usually on
+    Docker Hub under the same repository, and pulling it from there is
+    counted against this machine's own address instead (upstream
+    proot-distro 5.10.1 + 5.10.2).
+    """
+    pulling = action == "pull"
+    registry = ref.registry
+    who = f"Registry '{registry}'" if registry else "Docker Hub"
+    text = (
+        f"{who} refused to {'serve' if pulling else 'accept'} "
+        f"'{image_ref}' (HTTP 429 Too Many Requests): its rate limit is "
+        f"reached"
+    )
+    wait = retry_after(exc)
+    when = f"in {_wait_text(wait)}" if wait else "later"
+    if os.environ.get("PD_DOCKER_AUTH"):
+        return f"{text} for the account in PD_DOCKER_AUTH. Try again {when}."
+    hub_account = (
+        f"set PD_DOCKER_AUTH=username:password to {action} with a Docker "
+        f"Hub account, which has a limit of its own"
+    )
+    if not registry:
+        why = (
+            "Docker Hub limits anonymous pulls per network address, which "
+            "mobile and shared networks give to many people at once. "
+            if pulling else ""
+        )
+        return f"{text}. {why}Try again {when}, or {hub_account}."
+    if _relays_docker_hub(registry, exc):
+        shared = (
+            f"{text}. '{registry}' passes requests on to Docker Hub, and "
+            f"everyone using it anonymously shares one Docker Hub limit."
+        )
+        if not pulling:
+            return f"{shared} Try again {when}, or {hub_account}."
+        hub_ref = ref._replace(registry="").canonical
+        return (
+            f"{shared} If the image is published on Docker Hub too, "
+            f"install it from there: '{hub_ref}'. Otherwise try again "
+            f"{when}, or {hub_account}."
+        )
+    return (
+        f"{text}. Try again {when}, or set "
+        f"PD_DOCKER_AUTH=username:password to {action} with an account; "
+        f"registries usually allow signed-in users more."
+    )
+
+
 def push_denied_msg(image_ref: str, code: int) -> str:
     """Return a context-sensitive error string for 401/403 on push."""
     if os.environ.get("PD_DOCKER_AUTH"):
@@ -531,19 +649,98 @@ def _require_usable_realm(realm: str, registry: str, insecure: bool) -> None:
     )
 
 
+def _token_url(realm: str, service: str, scope: str = "") -> str:
+    """The token request URL for *realm*, naming *service* and *scope*.
+
+    Either may be empty, and is then left out: a challenge need not name
+    a service, and the credential check asks for no scope at all.
+    """
+    params = []
+    if service:
+        params.append(f"service={urllib.parse.quote(service, safe='')}")
+    if scope:
+        params.append(f"scope={scope}")
+    if not params:
+        return realm
+    sep = "&" if "?" in realm else "?"
+    return f"{realm}{sep}{'&'.join(params)}"
+
+
+# What the server judging PD_DOCKER_AUTH answers credentials it refuses.
+# Token services say 401 (Docker Hub, GitLab, Quay, Google) or 403
+# (GHCR). A registry checking them itself says 401 or 403 too, and
+# Amazon ECR says 400 (upstream proot-distro 5.10.2).
+_REJECTED_BY_TOKEN_SERVICE = (401, 403)
+_REJECTED_BY_REGISTRY = (400, 401, 403)
+
+
+def credentials_rejected_msg(registry: str, code: int) -> str:
+    """Return the error shown when a registry refuses PD_DOCKER_AUTH itself.
+
+    Not access to an image: the account. _check_credentials asks with no
+    repository named, so the answer is about the username and password
+    alone -- unlike auth_denied_msg, which cannot tell the two apart.
+    """
+    who = f"Registry '{registry}'" if registry else "Docker Hub"
+    return (
+        f"{who} rejected the credentials in PD_DOCKER_AUTH (HTTP {code}). "
+        f"Check the username and password. An access token may also have "
+        f"expired or lack the required permissions."
+    )
+
+
+def _check_credentials(
+    open_fn, url: str, basic_auth: str, registry: str, rejected: tuple,
+) -> None:
+    """Have PD_DOCKER_AUTH checked by the server that judges it, or raise.
+
+    *url* is that server: the token service with no scope requested, or a
+    registry that checks passwords itself at its /v2/ endpoint. This is
+    the request `docker login` makes, so every registry a Docker user
+    signs in to answers it, and its answer is about the account alone:
+    a 401 or 403 to a request naming a repository can be the password or
+    the repository, and not every registry says which. Before this check
+    a wrong password was reported as access denied to the image, and on
+    a registry that checks passwords itself, only once the pull or push
+    was already under way (upstream proot-distro 5.10.2).
+
+    A status in *rejected* raises a RuntimeError saying the credentials
+    were refused. Anything else (a rate limit, a server error, a network
+    failure) propagates as it would from the request the check comes
+    before. A 200 is all that is read from a success; the body -- a
+    token for no repository at all -- is not kept.
+    """
+    req = new_request(url, headers={**_ua(), "Authorization": basic_auth})
+    try:
+        _request_body(open_fn, req, "Checking credentials")
+    except urllib.error.HTTPError as exc:
+        if exc.code in rejected:
+            _release(exc)
+            raise RuntimeError(
+                credentials_rejected_msg(registry, exc.code)
+            ) from exc
+        raise
+
+
 def _probe_and_redeem(op, *, insecure: bool, host: str, repo: str,
                       actions: str, basic_auth: str,
                       label: "str | None" = None) -> tuple:
-    """/v2/ probe → Bearer dance shared by get_auth_token's two branches.
+    """/v2/ probe → auth dance shared by get_auth_token's two branches.
 
     Probes ``{scheme}://{host}/v2/`` (HTTPS first, stepping down to HTTP
     only for an HTTP-only registry under --allow-insecure) and answers
-    what the registry's challenge asks for:
+    what the registry's challenge asks for, as the one Authorization
+    value every subsequent request carries:
 
-      * an open registry: ``("", base)`` — no token required;
-      * a non-Bearer 401 (e.g. Basic): ``("", base)`` — the caller's next
-        request surfaces a clearer error;
-      * a Bearer challenge: the token redeemed at the realm it names.
+      * an open registry: ``("", base)`` -- nothing to send;
+      * a Basic challenge (distribution's htpasswd auth, Nexus,
+        Artifactory): ``(basic_auth, base)`` -- the registry takes the
+        credentials itself on every request; with credentials set, they
+        are checked at the /v2/ just probed first, so a wrong password
+        is reported as one before any image request (upstream
+        proot-distro 5.10.2);
+      * a Bearer challenge: ``("Bearer <token>", base)`` -- the token
+        redeemed at the realm it names, checked for the account first.
 
     *host* is the bare netloc the probe is addressed to. *label* names
     the registry in user-facing messages; None (the mirror path) derives
@@ -560,24 +757,41 @@ def _probe_and_redeem(op, *, insecure: bool, host: str, repo: str,
         except urllib.error.HTTPError as exc:
             if exc.code != 401:
                 raise
-            www_auth = exc.headers.get("WWW-Authenticate", "")
-            if not www_auth.lower().startswith("bearer "):
+            # The challenge is all there is to read; close the socket
+            # behind it before anything else raises through this frame.
+            _release(exc)
+            www_auth = exc.headers.get("WWW-Authenticate", "").strip()
+            auth_scheme, _, challenge = www_auth.partition(" ")
+            auth_scheme = auth_scheme.lower()
+            if auth_scheme == "basic":
+                # distribution's htpasswd auth, Nexus, Artifactory and the
+                # like: no token to exchange the credentials for, and the
+                # registry wants them on every request. This used to be
+                # taken for an open registry, so nothing was ever sent
+                # and the refusal that followed told the user to check
+                # credentials it had not used.
+                if basic_auth:
+                    _check_credentials(
+                        op.open, f"{base}/v2/", basic_auth, shown,
+                        _REJECTED_BY_REGISTRY,
+                    )
+                return basic_auth, base
+            if auth_scheme != "bearer":
                 return "", base
-            params = _parse_bearer_challenge(www_auth.split(" ", 1)[1])
+            params = _parse_bearer_challenge(challenge)
             realm = params.get("realm", "")
             if not realm:
                 return "", base
             _require_usable_realm(realm, shown, insecure)
             service = params.get("service", "")
-            qs_parts = []
-            if service:
-                qs_parts.append(
-                    f"service={urllib.parse.quote(service, safe='')}"
+            if basic_auth:
+                _check_credentials(
+                    op.open, _token_url(realm, service), basic_auth,
+                    shown, _REJECTED_BY_TOKEN_SERVICE,
                 )
-            qs_parts.append(f"scope=repository:{repo}:{actions}")
-            sep = "&" if "?" in realm else "?"
             token_req = new_request(
-                f"{realm}{sep}{'&'.join(qs_parts)}", headers=_ua()
+                _token_url(realm, service, f"repository:{repo}:{actions}"),
+                headers=_ua(),
             )
             if basic_auth:
                 token_req.add_header("Authorization", basic_auth)
@@ -585,7 +799,7 @@ def _probe_and_redeem(op, *, insecure: bool, host: str, repo: str,
             data = decode_json_object(
                 _request_body(op.open, token_req, what), what,
             )
-            return _grant_token(data, what), base
+            return _bearer(_grant_token(data, what)), base
         except urllib.error.URLError as exc:
             # The server speaks TLS but its certificate is untrusted. Only
             # reachable when enforcing HTTPS (the insecure opener skips
@@ -611,11 +825,14 @@ def get_auth_token(
     repo: str, registry: str = "", actions: str = "pull",
     insecure: bool = False,
 ) -> tuple:
-    """Resolve a registry's base URL and an OAuth2 token for *repo*.
+    """Resolve a registry's base URL and the credential for *repo*.
 
-    Returns ``(token, base_url)`` where *base_url* is the resolved
+    Returns ``(authorization, base_url)`` where *base_url* is the resolved
     ``scheme://registry`` that every subsequent request for this image must
-    use. *token* is empty for wide-open registries.
+    use, and *authorization* the value of the Authorization header every
+    one of them carries: ``Bearer <token>`` for a registry with a token
+    service, ``Basic <credentials>`` for one that checks passwords itself,
+    and empty when there is nothing to send (a wide-open registry).
 
     `actions` is a comma-separated list of registry actions to request,
     such as 'pull' (default), 'push', or 'pull,push'. The push flow
@@ -625,10 +842,15 @@ def get_auth_token(
     forwarded as HTTP Basic auth to the registry's token endpoint,
     enabling access to private images. PD_DOCKER_AUTH must always
     contain a colon separating the username from the password/PAT.
+    Before it is used for *repo*, whoever judges it -- the token service,
+    asked for no scope, or a Basic registry's /v2/ -- is asked whether
+    it is an account's (_check_credentials), and a refusal is a
+    RuntimeError saying the credentials are wrong. Nothing is checked
+    when nothing would be sent (upstream proot-distro 5.10.2).
 
     Without PD_DOCKER_AUTH Docker Hub uses its well-known auth endpoint for
     anonymous requests (always HTTPS). For any other registry the scheme and
-    Bearer realm are discovered with a single /v2/ probe:
+    the challenge are discovered with a single /v2/ probe:
 
       * HTTPS is tried first — even under *insecure*, so a registry serving
         an untrusted certificate is reached (cert verification is skipped
@@ -657,11 +879,17 @@ def get_auth_token(
         #    的镜像源时出现的 "Unauthorized" 错误。
         base = _resolve_registry_url()
         if base.rstrip("/").endswith("registry-1.docker.io"):
-            # 标准 Docker Hub 认证流程（官方实现）。
-            url = (
-                f"{AUTH_URL}?service=registry.docker.io"
-                f"&scope=repository:{repo}:{actions}"
-            )
+            # 标准 Docker Hub 认证流程（官方实现）。Credentials are
+            # checked first, the request `docker login` makes -- a
+            # scope-less token request -- so a wrong password stops the
+            # command before any image request.
+            if basic_auth:
+                _check_credentials(
+                    auth_opener().open, _token_url(AUTH_URL, HUB_SERVICE),
+                    basic_auth, "", _REJECTED_BY_TOKEN_SERVICE,
+                )
+            url = _token_url(AUTH_URL, HUB_SERVICE,
+                             f"repository:{repo}:{actions}")
             req = new_request(url, headers=_ua())
             if basic_auth:
                 req.add_header("Authorization", basic_auth)
@@ -674,7 +902,7 @@ def get_auth_token(
             data = decode_json_object(
                 _request_body(auth_opener().open, req, what), what,
             )
-            return _grant_token(data, what), REGISTRY_URL
+            return _bearer(_grant_token(data, what)), REGISTRY_URL
 
         # 镜像源：探测 /v2/ 发现认证要求（与自定义 registry 共用一套
         # 探测/换取逻辑，见 _probe_and_redeem）。

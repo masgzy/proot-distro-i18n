@@ -249,7 +249,7 @@ def test_get_auth_token_docker_hub(monkeypatch):
     _patch_hub(monkeypatch, fake_urlopen)
     monkeypatch.delenv("PD_DOCKER_AUTH", raising=False)
     tok, base = transport.get_auth_token("library/ubuntu")
-    assert tok == "DOCKERHUB_TKN"
+    assert tok == "Bearer DOCKERHUB_TKN"
     assert base == transport.REGISTRY_URL
     assert "scope=repository:library/ubuntu:pull" in captured["url"]
 
@@ -274,7 +274,7 @@ def test_hub_token_exchange_goes_through_the_stripping_opener(monkeypatch):
     )
     monkeypatch.setenv("PD_DOCKER_AUTH", "alice:secret")
     tok, _base = transport.get_auth_token("library/ubuntu")
-    assert tok == "T"
+    assert tok == "Bearer T"
     assert seen["url"].startswith(transport.AUTH_URL)
     assert seen["auth"] == transport.env_basic_auth()
 
@@ -314,7 +314,7 @@ def test_get_auth_token_custom_registry_challenge(monkeypatch):
     tok, base = transport.get_auth_token(
         "team/app", registry="reg.example", actions="pull,push"
     )
-    assert tok == "CUSTOM_TKN"
+    assert tok == "Bearer CUSTOM_TKN"
     assert base == "https://reg.example"
     # Probed /v2/ over HTTPS then redeemed the realm with scope+service.
     assert calls[0] == "https://reg.example/v2/"
@@ -369,8 +369,8 @@ def test_a_plaintext_realm_is_allowed_under_insecure(monkeypatch):
     tok, _base = transport.get_auth_token(
         "x/y", registry="reg.example", insecure=True
     )
-    assert tok == "T"
-    assert len(sent) == 1
+    assert tok == "Bearer T"
+    assert len(sent) == 2  # the credential check, then the token request
     assert sent[0][0].startswith("http://auth.example/t?")
     assert sent[0][1] == transport.env_basic_auth()
 
@@ -406,7 +406,7 @@ def test_a_realm_on_another_https_host_is_used(monkeypatch):
                                                  sent))
     monkeypatch.setenv("PD_DOCKER_AUTH", "alice:secret")
     tok, base = transport.get_auth_token("g/p", registry="registry.gitlab.com")
-    assert tok == "T"
+    assert tok == "Bearer T"
     assert base == "https://registry.gitlab.com"
     assert sent[0][0].startswith("https://gitlab.com/jwt/auth?")
     assert sent[0][1] == transport.env_basic_auth()
@@ -465,7 +465,8 @@ def test_a_token_no_header_can_carry_is_refused_unprinted(monkeypatch,
 def test_an_ordinary_token_is_accepted(monkeypatch):
     jwt = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln-_+/=="
     _patch_hub(monkeypatch, lambda req, *a, **k: _FakeResp({"token": jwt}))
-    assert transport.get_auth_token("library/x")[0] == jwt
+    # The return value is the full Authorization header now.
+    assert transport.get_auth_token("library/x")[0] == f"Bearer {jwt}"
 
 
 @pytest.mark.parametrize("registry", ["[:5000", "[::1", "[x]"])
@@ -549,7 +550,7 @@ def test_response_at_the_limit_is_read(monkeypatch):
     _patch_hub(monkeypatch, lambda req, *a, **k: _RawResp(payload))
     monkeypatch.delenv("PD_DOCKER_AUTH", raising=False)
     tok, _base = transport.get_auth_token("library/ubuntu")
-    assert tok == "A" * 40
+    assert tok == "Bearer " + "A" * 40
 
 
 def test_oversized_response_is_not_retried(monkeypatch):

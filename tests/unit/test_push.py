@@ -64,7 +64,7 @@ def _http_error(url, code, reason):
 
 def test_blob_exists_true_on_200(monkeypatch):
     _patch_opener(monkeypatch, lambda req, *a, **k: _FakeResp(200))
-    assert push._blob_exists("me/app", "sha256:aa", "TKN", _BASE) is True
+    assert push._blob_exists("me/app", "sha256:aa", "Bearer TKN", _BASE) is True
 
 
 def test_blob_exists_false_on_404_no_retry(monkeypatch):
@@ -76,7 +76,7 @@ def test_blob_exists_false_on_404_no_retry(monkeypatch):
         raise _http_error(req.full_url, 404, "Not Found")
 
     _patch_opener(monkeypatch, fake)
-    assert push._blob_exists("me/app", "sha256:aa", "TKN", _BASE) is False
+    assert push._blob_exists("me/app", "sha256:aa", "Bearer TKN", _BASE) is False
     assert len(calls) == 1
 
 
@@ -91,7 +91,7 @@ def test_blob_exists_retries_transient(monkeypatch):
         return _FakeResp(200)
 
     _patch_opener(monkeypatch, fake)
-    assert push._blob_exists("me/app", "sha256:aa", "TKN", _BASE) is True
+    assert push._blob_exists("me/app", "sha256:aa", "Bearer TKN", _BASE) is True
     assert len(calls) == 3
 
 
@@ -105,7 +105,7 @@ def test_blob_exists_auth_error_propagates(monkeypatch):
 
     _patch_opener(monkeypatch, fake)
     with pytest.raises(urllib.error.HTTPError) as exc:
-        push._blob_exists("me/app", "sha256:aa", "TKN", _BASE)
+        push._blob_exists("me/app", "sha256:aa", "Bearer TKN", _BASE)
     assert exc.value.code == 401
     assert len(calls) == 1
 
@@ -121,7 +121,7 @@ def test_blob_exists_uses_insecure_opener(monkeypatch):
 
     monkeypatch.setattr(push, "opener", fake_opener)
     assert push._blob_exists(
-        "me/app", "sha256:aa", "TKN", "http://reg.example", insecure=True
+        "me/app", "sha256:aa", "Bearer TKN", "http://reg.example", insecure=True
     ) is True
     assert seen["insecure"] is True
 
@@ -140,7 +140,7 @@ def test_put_manifest_retries_then_returns_digest(monkeypatch):
     _patch_opener(monkeypatch, fake)
     digest = push._put_manifest(
         "me/app", "latest", b"{}",
-        "application/vnd.oci.image.manifest.v1+json", "TKN", _BASE,
+        "application/vnd.oci.image.manifest.v1+json", "Bearer TKN", _BASE,
     )
     assert digest == "sha256:dd"
     assert len(calls) == 2
@@ -162,7 +162,7 @@ def test_upload_blob_bytes_retries_whole_session(monkeypatch):
         return _FakeResp(201)  # PUT
 
     _patch_opener(monkeypatch, fake)
-    push._upload_blob_bytes("me/app", "sha256:cc", b"data", "TKN", _BASE)
+    push._upload_blob_bytes("me/app", "sha256:cc", b"data", "Bearer TKN", _BASE)
     assert methods == ["POST", "POST", "PUT"]
 
 
@@ -175,7 +175,7 @@ def test_upload_blob_bytes_4xx_fails_fast(monkeypatch):
 
     _patch_opener(monkeypatch, fake)
     with pytest.raises(urllib.error.HTTPError) as exc:
-        push._upload_blob_bytes("me/app", "sha256:cc", b"data", "TKN", _BASE)
+        push._upload_blob_bytes("me/app", "sha256:cc", b"data", "Bearer TKN", _BASE)
     assert exc.value.code == 403
     assert calls == ["POST"]  # deterministic -> no retry
 
@@ -198,7 +198,7 @@ def test_upload_location_that_is_not_a_url_is_an_invalid_request(
 
     _patch_opener(monkeypatch, fake)
     with pytest.raises(download.InvalidRequest):
-        push._upload_blob_bytes("me/app", "sha256:cc", b"data", "TKN", _BASE)
+        push._upload_blob_bytes("me/app", "sha256:cc", b"data", "Bearer TKN", _BASE)
     assert methods == ["POST"]
 
     blob = tmp_path / "blob"
@@ -207,7 +207,7 @@ def test_upload_location_that_is_not_a_url_is_an_invalid_request(
     methods.clear()
     try:
         with pytest.raises(download.InvalidRequest):
-            push._upload_blob_fd("me/app", "sha256:cc", fd, "TKN", _BASE)
+            push._upload_blob_fd("me/app", "sha256:cc", fd, "Bearer TKN", _BASE)
     finally:
         os.close(fd)
     assert methods == ["POST"]
@@ -244,7 +244,7 @@ def test_upload_put_off_the_registry_origin_carries_no_token(
     # headers, token included. Docker's client sends nothing to another
     # origin; neither does this.
     seen = _capture_put_auth(monkeypatch, location)
-    push._upload_blob_bytes("me/app", "sha256:cc", b"data", "TKN", _BASE)
+    push._upload_blob_bytes("me/app", "sha256:cc", b"data", "Bearer TKN", _BASE)
     assert seen["url"].startswith(location)
     assert seen["auth"] is None
 
@@ -253,7 +253,7 @@ def test_upload_put_off_the_registry_origin_carries_no_token(
     fd = os.open(str(blob), os.O_RDONLY)
     try:
         seen = _capture_put_auth(monkeypatch, location)
-        push._upload_blob_fd("me/app", "sha256:cc", fd, "TKN", _BASE)
+        push._upload_blob_fd("me/app", "sha256:cc", fd, "Bearer TKN", _BASE)
     finally:
         os.close(fd)
     assert seen["url"].startswith(location)
@@ -267,7 +267,7 @@ def test_upload_put_off_the_registry_origin_carries_no_token(
 ])
 def test_upload_put_on_the_registry_keeps_the_token(monkeypatch, location):
     seen = _capture_put_auth(monkeypatch, location)
-    push._upload_blob_bytes("me/app", "sha256:cc", b"data", "TKN", _BASE)
+    push._upload_blob_bytes("me/app", "sha256:cc", b"data", "Bearer TKN", _BASE)
     assert seen["url"].startswith("https://reg.example")
     assert seen["auth"] == "Bearer TKN"
 
@@ -277,7 +277,7 @@ def test_upload_put_keeps_the_token_on_an_https_upgrade(monkeypatch):
     # sends uploads to its own https endpoint: the same server, more
     # securely, so the token goes along.
     seen = _capture_put_auth(monkeypatch, "https://reg.example/uploads/1")
-    push._upload_blob_bytes("me/app", "sha256:cc", b"data", "TKN",
+    push._upload_blob_bytes("me/app", "sha256:cc", b"data", "Bearer TKN",
                             "http://reg.example", insecure=True)
     assert seen["auth"] == "Bearer TKN"
 
@@ -322,7 +322,7 @@ def test_push_image_threads_base_and_insecure(monkeypatch):
     def fake_auth(repo, registry, actions="pull", insecure=False):
         captured["auth_insecure"] = insecure
         # HTTP-only registry resolved to an http base under --allow-insecure.
-        return "TKN", "http://reg.example"
+        return "Bearer TKN", "http://reg.example"
 
     monkeypatch.setattr(push, "get_auth_token", fake_auth)
 
@@ -380,7 +380,7 @@ def test_blob_put_carries_the_upload_timeout(monkeypatch, tmp_path):
     blob.write_bytes(b"data")
     fd = os.open(str(blob), os.O_RDONLY)
     try:
-        push._upload_blob_fd("me/app", "sha256:cc", fd, "TKN", _BASE)
+        push._upload_blob_fd("me/app", "sha256:cc", fd, "Bearer TKN", _BASE)
     finally:
         os.close(fd)
     # The session's POST keeps the opener's default; the PUT that waits
@@ -415,7 +415,7 @@ def test_push_image_keeps_docker_hub_verified(monkeypatch, ref, registry,
     def fake_auth(repo, reg, actions="pull", insecure=False):
         assert reg == registry
         seen.append(insecure)
-        return "TKN", "https://x"
+        return "Bearer TKN", "https://x"
 
     def fake_exists(repo, digest, token, base, insecure=False):
         seen.append(insecure)
@@ -455,7 +455,7 @@ def test_push_image_uploads_to_the_references_repository(monkeypatch):
 
     def fake_auth(repo, registry, actions="pull", insecure=False):
         repos.append(("auth", repo))
-        return "TKN", "https://reg.example"
+        return "Bearer TKN", "https://reg.example"
 
     def fake_blob_exists(repo, digest, token, base, insecure=False):
         repos.append(("blob", repo))

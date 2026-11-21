@@ -38,6 +38,8 @@ import tarfile
 from proot_distro import dirfd, statedir
 from proot_distro.atomic import atomic_write
 from proot_distro.constants import BASE_CACHE_DIR, PROGRAM_NAME
+from proot_distro.distro_mirror import switch_distro_mirror
+from proot_distro.settings import distro_mirror_enabled
 from proot_distro.message import (
     C, msg, log_info, log_error, crit_error, quote_path,
 )
@@ -404,6 +406,14 @@ def _run_install(
                 os.remove(tmp_archive)
             except OSError:
                 pass
+
+    # The 'distro_mirror' setting: when it is on, the freshly extracted
+    # rootfs gets its package sources switched to a Chinese mirror right
+    # here, before the first `apt update` inside can be slow. Best
+    # effort -- a failure to switch is a warning, never an install
+    # failure: the container itself is fine.
+    if distro_mirror_enabled():
+        switch_distro_mirror(rootfs_dir, install_name)
 
     log_info(_("Finished installation."))
     msg()

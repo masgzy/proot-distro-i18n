@@ -885,7 +885,7 @@ HELP_PAGES = {
     },
 
     "mirror": {
-        "usage": "mirror [OPTIONS] {ls|test|use|unset|show} [ID|URL]",
+        "usage": "mirror [OPTIONS] {ls|test|use|unset|show|distro} [ID|URL|CONTAINER]",
         "aliases": ("mir", "mr"),
         "summary": (
             "Manage built-in Docker registry mirrors. The original "
@@ -1275,7 +1275,7 @@ TOP_COMMANDS = [
     ("build", "Build an OCI image from a Dockerfile."),
     ("push", "Push a locally built image to a registry."),
     ("search", "Search Docker Hub for images."),
-    ("mirror", "Manage Docker registry mirrors (ls/test/use/unset/show)."),
+    ("mirror", "Manage Docker registry mirrors and guest package sources (ls/test/use/unset/show/distro)."),
     ("lang", "Show and set the UI language (get/use/list/reset)."),
     ("setting", "View and change user settings (put/reset/ls)."),
     ("update", "Update pd itself and the nproot runtime (--check first)."),

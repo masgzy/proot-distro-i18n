@@ -76,6 +76,7 @@ from proot_distro.helpers.docker.transport import (
     get_auth_token,
     insecure_for,
     opener,
+    rate_limited_msg,
     _ua,
 )
 from proot_distro.i18n import _
@@ -107,7 +108,10 @@ def _manifest_body(
     url = f"{base}/v2/{repo}/manifests/{ref}"
     headers = {**_ua(), "Accept": _ACCEPT_HEADER}
     if token:
-        headers["Authorization"] = f"Bearer {token}"
+        # get_auth_token now returns the full Authorization value --
+        # "Bearer <token>" from a token service, "Basic <credentials>"
+        # from a registry that checks passwords itself.
+        headers["Authorization"] = token
     req = new_request(url, headers=headers)
 
     def _attempt():
@@ -324,7 +328,7 @@ def _download_config(
     url = f"{base}/v2/{repo}/blobs/{cfg_digest}"
     headers = {**_ua()}
     if token:
-        headers["Authorization"] = f"Bearer {token}"
+        headers["Authorization"] = token
     req = new_request(url, headers=headers)
 
     def _attempt():
@@ -579,6 +583,8 @@ def _pull_layers(image_ref, rootfs_fd, arch, insecure,
                      f"layer(s) for '{image_ref}' ({arch})...")
             try:
                 log_info(_("Authenticating with registry{_arg0}...", _arg0 = auth_note()))
+                # token now holds the full Authorization value, not a bare
+                # token -- see _manifest_body/_download_config.
                 token, base = get_auth_token(
                     repo, registry, insecure=insecure
                 )
@@ -587,6 +593,10 @@ def _pull_layers(image_ref, rootfs_fd, arch, insecure,
                     if net_err.code in (401, 403):
                         raise RuntimeError(
                             auth_denied_msg(image_ref, net_err.code)
+                        ) from net_err
+                    if net_err.code == 429:
+                        raise RuntimeError(
+                            rate_limited_msg(image_ref, ref, net_err)
                         ) from net_err
                     if net_err.code == 404:
                         raise RuntimeError(
@@ -629,6 +639,10 @@ def _pull_layers(image_ref, rootfs_fd, arch, insecure,
                 if net_err.code in (401, 403):
                     raise RuntimeError(
                         auth_denied_msg(image_ref, net_err.code)
+                    ) from net_err
+                if net_err.code == 429:
+                    raise RuntimeError(
+                        rate_limited_msg(image_ref, ref, net_err)
                     ) from net_err
                 if net_err.code == 404:
                     raise RuntimeError(
@@ -701,21 +715,26 @@ def _pull_layers(image_ref, rootfs_fd, arch, insecure,
             except NETWORK_ERRORS as dl_err:
                 # Read the same way as the two nets above: an HTTPError
                 # carrying 401/403 is the registry refusing this account,
-                # and everything else is the wire. Both leave as a
-                # RuntimeError, because that is what this function
-                # promises and what both callers rely on -- `install`
-                # reports one, `build`'s FROM turns one into a BuildError.
+                # 429 its rate limit, and everything else the wire. All of
+                # them leave as a RuntimeError, because that is what this
+                # function promises and what both callers rely on --
+                # `install` reports one, `build`'s FROM turns one into a
+                # BuildError.
                 # A reset connection used to come out of the layer loop as
                 # itself, which `install` reported (URLError being an
                 # OSError) and `build` did not catch at all; a body that
                 # ended early is not even an OSError, so neither did. The
                 # blob's own integrity failure is a RuntimeError already
                 # and passes through untouched.
-                if (isinstance(dl_err, urllib.error.HTTPError)
-                        and dl_err.code in (401, 403)):
-                    raise RuntimeError(
-                        auth_denied_msg(image_ref, dl_err.code)
-                    ) from dl_err
+                if isinstance(dl_err, urllib.error.HTTPError):
+                    if dl_err.code in (401, 403):
+                        raise RuntimeError(
+                            auth_denied_msg(image_ref, dl_err.code)
+                        ) from dl_err
+                    if dl_err.code == 429:
+                        raise RuntimeError(
+                            rate_limited_msg(image_ref, ref, dl_err)
+                        ) from dl_err
                 raise RuntimeError(f"Network error: {dl_err}") from dl_err
 
         log_info(f"{short_id}: Applying layer {i + 1}/{n_layers}...")

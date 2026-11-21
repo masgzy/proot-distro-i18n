@@ -369,9 +369,10 @@ _proot_distro() {
                         '--allow-insecure[允许 HTTPS 跳过证书校验]' \
                         '--use-best[test 后自动切换到最快源]' \
                         '--no-use[test 后不提示也不切换]' \
+                        '--revert[distro: 还原备份的原始源]' \
                         '(-q --quiet)'{-q,--quiet}'[安静模式]' \
-                        '1:子动作:(ls list test use set unset clear off show)' \
-                        '2:ID 或 URL:_proot_distro_mirrors'
+                        '1:子动作:(ls list test use set unset clear off show distro cn)' \
+                        '2:ID 或 URL 或容器名:_proot_distro_mirrors'
                     ;;
 
                 # -----------------------------------------------------------

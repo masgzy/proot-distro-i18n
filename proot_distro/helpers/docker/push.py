@@ -59,6 +59,7 @@ from proot_distro.helpers.docker.transport import (
     insecure_for,
     opener,
     push_denied_msg,
+    rate_limited_msg,
     same_auth_origin,
     _ua,
 )
@@ -127,7 +128,8 @@ def _blob_exists(
     url = f"{base}/v2/{repo}/blobs/{digest}"
     headers = {**_ua()}
     if token:
-        headers["Authorization"] = f"Bearer {token}"
+        # get_auth_token now returns the full Authorization value.
+        headers["Authorization"] = token
     req = new_request(url, method="HEAD", headers=headers)
 
     def _attempt():
@@ -191,7 +193,7 @@ def _upload_blob_bytes(
     """
     headers = {**_ua()}
     if token:
-        headers["Authorization"] = f"Bearer {token}"
+        headers["Authorization"] = token
 
     def _attempt():
         # A retry re-opens the upload session: the POST yields a fresh upload
@@ -239,7 +241,7 @@ def _upload_blob_fd(
     """
     headers = {**_ua()}
     if token:
-        headers["Authorization"] = f"Bearer {token}"
+        headers["Authorization"] = token
     size = os.fstat(src_fd).st_size
 
     def _attempt():
@@ -296,7 +298,7 @@ def _put_manifest(
         "Content-Length": str(len(body)),
     }
     if token:
-        headers["Authorization"] = f"Bearer {token}"
+        headers["Authorization"] = token
     req = new_request(url, data=body, method="PUT", headers=headers)
 
     def _attempt():
@@ -308,6 +310,22 @@ def _put_manifest(
             return resp.headers.get("Docker-Content-Digest", "")
 
     return retry_http(_attempt, what=f"Uploading manifest {reference}")
+
+
+def _refusal_msg(image_ref: str, ref, exc: urllib.error.HTTPError) -> str:
+    """The message for a registry refusing the push with *exc*, or ''.
+
+    401/403 is the registry refusing this account and 429 its rate
+    limit; both become a RuntimeError carrying this message. Any other
+    HTTP error is not a refusal this can explain, and propagates as
+    itself for command_push to report as a network error (upstream
+    proot-distro 5.10.1).
+    """
+    if exc.code in (401, 403):
+        return push_denied_msg(image_ref, exc.code)
+    if exc.code == 429:
+        return rate_limited_msg(image_ref, ref, exc, action="push")
+    return ""
 
 
 def _strip_private_keys(d: dict) -> dict:
@@ -412,8 +430,9 @@ def push_image(image_ref: str, arch: str, insecure: bool = False) -> dict:
             repo, registry, actions="pull,push", insecure=insecure,
         )
     except urllib.error.HTTPError as exc:
-        if exc.code in (401, 403):
-            raise RuntimeError(push_denied_msg(image_ref, exc.code)) from exc
+        refusal = _refusal_msg(image_ref, parsed, exc)
+        if refusal:
+            raise RuntimeError(refusal) from exc
         raise
 
     n_layers = len(layers)
@@ -448,10 +467,9 @@ def push_image(image_ref: str, arch: str, insecure: bool = False) -> dict:
                 os.close(src_fd)
             bytes_uploaded += size
         except urllib.error.HTTPError as exc:
-            if exc.code in (401, 403):
-                raise RuntimeError(
-                    push_denied_msg(image_ref, exc.code)
-                ) from exc
+            refusal = _refusal_msg(image_ref, parsed, exc)
+            if refusal:
+                raise RuntimeError(refusal) from exc
             raise
 
     cfg_short = expected_cfg_digest.split(":")[-1][:12]
@@ -467,8 +485,9 @@ def push_image(image_ref: str, arch: str, insecure: bool = False) -> dict:
             )
             bytes_uploaded += len(config_bytes)
     except urllib.error.HTTPError as exc:
-        if exc.code in (401, 403):
-            raise RuntimeError(push_denied_msg(image_ref, exc.code)) from exc
+        refusal = _refusal_msg(image_ref, parsed, exc)
+        if refusal:
+            raise RuntimeError(refusal) from exc
         raise
 
     manifest_media = manifest.get("mediaType") or OCI_MANIFEST_MEDIA
@@ -480,8 +499,9 @@ def push_image(image_ref: str, arch: str, insecure: bool = False) -> dict:
             repo, tag, manifest_bytes, manifest_media, token, base, insecure,
         )
     except urllib.error.HTTPError as exc:
-        if exc.code in (401, 403):
-            raise RuntimeError(push_denied_msg(image_ref, exc.code)) from exc
+        refusal = _refusal_msg(image_ref, parsed, exc)
+        if refusal:
+            raise RuntimeError(refusal) from exc
         raise
     bytes_uploaded += len(manifest_bytes)
 

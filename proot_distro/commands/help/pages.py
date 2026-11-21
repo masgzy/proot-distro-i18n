@@ -602,7 +602,7 @@ HELP_PAGES = {
     },
 
     "mirror": {
-        "usage": "mirror [OPTIONS] {ls|test|use|unset|show} [ID|URL]",
+        "usage": "mirror [OPTIONS] {ls|test|use|unset|show|distro} [ID|URL|容器名]",
         "aliases": ("mir", "mr"),
         "summary": (
             "管理内置 Docker registry 镜像源。原版 proot-distro 把单一"
@@ -635,6 +635,8 @@ HELP_PAGES = {
              "test 以 JSON 输出（脚本友好；隐含 --no-use）。"),
             ("--reachable-only",
              "ls: 仅显示可达的镜像源（会先探测，可能较慢）。"),
+            ("--revert",
+             "distro: 还原备份的原始软件源（.pd.bak）。"),
             ("-q, --quiet",
              "安静模式。ls 时仅输出 URL 列表，每行一个。"),
         ],
@@ -648,6 +650,8 @@ HELP_PAGES = {
             f"{PROGRAM_NAME} mirror use https://my-private-mirror.com",
             f"{PROGRAM_NAME} mirror unset",
             f"{PROGRAM_NAME} mirror show",
+            f"{PROGRAM_NAME} mirror distro debian",
+            f"{PROGRAM_NAME} mirror distro debian --revert",
         ],
         "footer": [
             {
@@ -659,7 +663,13 @@ HELP_PAGES = {
                     "use / set ID|URL: 选中一个镜像源（按 id、name 或 URL）。\n"
                     "unset / clear / off: 清除当前选中，回到默认。\n"
                     "show: 仅打印当前生效 URL（脚本友好，例如 "
-                    "$(pd mirror show)）。"
+                    "$(pd mirror show)）。\n"
+                    "distro 容器名 [--revert]: 容器内软件源一键切到国内镜像"
+                    "（apt/apk/dnf/pacman/zypp/xbps/portage，适配 Debian/"
+                    "Ubuntu/Kali/Alpine/Arch/Manjaro/Fedora/Rocky/Alma/"
+                    "openSUSE/Void/Gentoo）。原文件备份为 <文件名>.pd.bak，"
+                    "--revert 还原；配合 setting distro_mirror=true "
+                    "可在 install 后自动执行。"
                 ),
             },
             {

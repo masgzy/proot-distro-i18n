@@ -59,16 +59,18 @@ def test_unknown_setting_name_is_an_error():
 # storage round-trips
 # ---------------------------------------------------------------------------
 
-def test_default_is_passthrough_on(isolated_config):
-    assert settings.passthrough_enabled() is True
+def test_default_is_passthrough_off(isolated_config):
+    # Default off since 5.10.3: a container keeps itself to itself,
+    # and a user who wants Termux binaries on the guest PATH opts in.
+    assert settings.passthrough_enabled() is False
     assert not isolated_config.joinpath("config.json").exists()
 
 
-def test_put_false_round_trip(isolated_config):
-    settings.set_setting("passthrough", "false")
-    assert settings.passthrough_enabled() is False
+def test_put_true_round_trip(isolated_config):
+    settings.set_setting("passthrough", "true")
+    assert settings.passthrough_enabled() is True
     stored = json.loads(isolated_config.joinpath("config.json").read_text())
-    assert stored["passthrough"] is False  # a real JSON boolean
+    assert stored["passthrough"] is True  # a real JSON boolean
 
 
 def test_put_normalizes_every_spelling(isolated_config):
@@ -80,8 +82,8 @@ def test_put_normalizes_every_spelling(isolated_config):
 
 def test_hand_written_string_value_is_normalized(isolated_config):
     isolated_config.joinpath("config.json").write_text(
-        json.dumps({"passthrough": "false"}))
-    assert settings.passthrough_enabled() is False
+        json.dumps({"passthrough": "true"}))
+    assert settings.passthrough_enabled() is True
 
 
 def test_hand_written_junk_value_reads_as_default(isolated_config):
@@ -89,17 +91,17 @@ def test_hand_written_junk_value_reads_as_default(isolated_config):
     # value is treated as unset and the default applies.
     isolated_config.joinpath("config.json").write_text(
         json.dumps({"passthrough": 42}))
-    assert settings.passthrough_enabled() is True
+    assert settings.passthrough_enabled() is False
 
 
 def test_corrupted_config_reads_as_default(isolated_config):
     isolated_config.joinpath("config.json").write_text("{not json")
-    assert settings.passthrough_enabled() is True
+    assert settings.passthrough_enabled() is False
 
 
 def test_language_key_is_never_touched_by_settings(isolated_config):
     config_mod.save_user_config({"language": "zh_CN"})
-    settings.set_setting("passthrough", "false")
+    settings.set_setting("passthrough", "true")
     assert config_mod.load_user_config()["language"] == "zh_CN"
 
     settings.reset_settings()  # everything this registry owns
@@ -111,9 +113,9 @@ def test_language_key_is_never_touched_by_settings(isolated_config):
 # ---------------------------------------------------------------------------
 
 def test_reset_single_setting(isolated_config):
-    settings.set_setting("passthrough", "false")
+    settings.set_setting("passthrough", "true")
     assert settings.reset_settings("passthrough") == ["passthrough"]
-    assert settings.passthrough_enabled() is True
+    assert settings.passthrough_enabled() is False
 
 
 def test_reset_unknown_name_is_an_error(isolated_config):
@@ -126,8 +128,10 @@ def test_reset_all_when_nothing_stored(isolated_config):
 
 
 def test_reset_all_removes_every_owned_key(isolated_config):
-    settings.set_setting("passthrough", "false")
-    assert settings.reset_settings() == ["passthrough"]
+    settings.set_setting("passthrough", "true")
+    settings.set_setting("distro_mirror", "true")
+    removed = settings.reset_settings()
+    assert removed == ["passthrough", "distro_mirror"]
     assert not isolated_config.joinpath("config.json").exists()
 
 
@@ -137,15 +141,15 @@ def test_reset_all_removes_every_owned_key(isolated_config):
 
 def test_list_settings_rows(isolated_config):
     rows = settings.list_settings()
-    assert [r[0] for r in rows] == ["passthrough"]
+    assert [r[0] for r in rows] == ["passthrough", "distro_mirror"]
     name, current, default, is_default, doc = rows[0]
     assert name == "passthrough"
-    assert current is True and default is True and is_default is True
+    assert current is False and default is False and is_default is True
     assert doc
 
-    settings.set_setting("passthrough", "false")
+    settings.set_setting("passthrough", "true")
     name, current, default, is_default, _doc = settings.list_settings()[0]
-    assert current is False and is_default is False
+    assert current is True and is_default is False
 
 
 def test_get_setting_unknown_name_raises_keyerror():

@@ -261,7 +261,8 @@ def download_blob(
     url = f"{base}/v2/{repo}/blobs/{digest}"
     headers = {**_ua()}
     if token:
-        headers["Authorization"] = f"Bearer {token}"
+        # get_auth_token now returns the full Authorization value.
+        headers["Authorization"] = token
     req = new_request(url, headers=headers)
 
     def _hash_tmp_fd(fd: int, hasher) -> int:

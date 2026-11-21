@@ -30,7 +30,7 @@ proot_distro/
   guestfile.py  l2s.py  shm.py  sysdata.py  session.py         Container runtime state
   arch.py  compress.py                                          CPU/emulator and zstd knowledge
   i18n.py  config.py  settings.py  autohold.py                 Fork: JSON translations, user prefs + pd setting registry (config.json), first-run apt-mark hold guard
-  mirrors.py                                                    Fork: registry mirror table + probing
+  mirrors.py  distro_mirror.py                                  Fork: registry mirror table + probing; guest package-source switcher (os-release-driven, .pd.bak backups)
   locales/<locale>.json                                         Fork: flat {source: translated} dicts, no compile step
 ```
 

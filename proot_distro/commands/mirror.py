@@ -83,8 +83,14 @@ import sys
 from typing import Optional
 
 from proot_distro.constants import PROGRAM_NAME
+from proot_distro.distro_mirror import (
+    SUPPORTED_DISTROS, revert_distro_mirror, switch_distro_mirror,
+)
 from proot_distro.i18n import _
 from proot_distro.message import C, crit_error, log_info, msg, warn
+from proot_distro.paths import (
+    container_is_installed, container_rootfs,
+)
 from proot_distro.mirrors import (
     BUILTIN_MIRRORS,
     DEFAULT_MIRROR_ID,
@@ -203,45 +209,45 @@ def _action_list(
     # ---- 顶部状态区 ----
     msg()
     msg(f"  {C['UBCYAN']}{'─' * 52}{C['RST']}")
-    msg(f"  {C['UBCYAN']}{_('Docker 镜像源管理')}{C['RST']}")
+    msg(f"  {C['UBCYAN']}{_('Docker registry mirrors')}{C['RST']}")
     msg(f"  {C['UBCYAN']}{'─' * 52}{C['RST']}")
     msg()
 
     # 生效源（env > config > default）
     if env_url:
-        msg(f"  {C['CYAN']}{_('当前生效')}{C['RST']}  "
-            f"{C['BYELLOW']}⚠ {_('环境变量覆盖')}{C['RST']}")
+        msg(f"  {C['CYAN']}{_('active')}{C['RST']}  "
+            f"{C['BYELLOW']}⚠ {_('env var overrides')}{C['RST']}")
         msg(f"  {C['BGREEN']}{env_url}{C['RST']}")
-        msg(f"  {C['YELLOW']}{_('PD_REGISTRY_URL 已设置，`mirror use`/`unset` 不会生效')}{C['RST']}")
+        msg(f"  {C['YELLOW']}{_('PD_REGISTRY_URL is set; mirror use/unset have no effect')}{C['RST']}")
     elif active:
         tag = f"{C['BGREEN']}★{C['RST']}" if active.get("id") != "custom" else f"{C['BYELLOW']}◇{C['RST']}"
-        msg(f"  {C['CYAN']}{_('当前生效')}{C['RST']}  "
+        msg(f"  {C['CYAN']}{_('active')}{C['RST']}  "
             f"{tag} {C['BGREEN']}{active.get('name', '?')} "
             f"{C['CYAN']}({active.get('id', '?')}){C['RST']}")
         msg(f"          {C['BBLUE']}{active_url}{C['RST']}")
     else:
         default = get_default_mirror()
-        msg(f"  {C['CYAN']}{_('当前生效')}{C['RST']}  "
-            f"{C['BYELLOW']}○ {_('未设置（默认: {default}）', default=default['name'])}{C['RST']}")
+        msg(f"  {C['CYAN']}{_('active')}{C['RST']}  "
+            f"{C['BYELLOW']}○ {_('not set (default: {default})', default=default['name'])}{C['RST']}")
 
     # 过滤提示
     if reachable_only:
-        msg(f"  {C['CYAN']}{_('过滤')}{C['RST']}    "
-            f"{C['BYELLOW']}{_('仅显示可达 ({n}/{total})', n=len(mirrors_to_show), total=len(all_mirrors))}{C['RST']}")
+        msg(f"  {C['CYAN']}{_('filter')}{C['RST']}    "
+            f"{C['BYELLOW']}{_('reachable only ({n}/{total})', n=len(mirrors_to_show), total=len(all_mirrors))}{C['RST']}")
 
     msg()
     msg(f"  {C['UBCYAN']}{'─' * 52}{C['RST']}")
     msg()
 
     if not mirrors_to_show:
-        msg(f"  {C['YELLOW']}{_('未找到可达的镜像源。')}{C['RST']}")
+        msg(f"  {C['YELLOW']}{_('no reachable mirror found.')}{C['RST']}")
         msg()
         return 1
 
     # ---- 内置镜像源列表 ----
     builtin_to_show = [m for m in mirrors_to_show if m["id"] in builtin_ids]
     if builtin_to_show:
-        msg(f"  {C['BCYAN']}{_('内置镜像源')} ({len(builtin_to_show)}){C['RST']}")
+        msg(f"  {C['BCYAN']}{_('built-in mirrors')} ({len(builtin_to_show)}){C['RST']}")
         msg()
         for m in builtin_to_show:
             _print_mirror_entry(m, active_url, env_url)
@@ -250,7 +256,7 @@ def _action_list(
     # ---- 用户自定义镜像源列表 ----
     user_to_show = [m for m in mirrors_to_show if m["id"] not in builtin_ids]
     if user_to_show:
-        msg(f"  {C['BMAGENTA']}{_('用户自定义镜像源')} ({len(user_to_show)}){C['RST']}")
+        msg(f"  {C['BMAGENTA']}{_('user-defined mirrors')} ({len(user_to_show)}){C['RST']}")
         msg(f"  {C['MAGENTA']}{USER_MIRRORS_FILE}{C['RST']}")
         msg()
         for m in user_to_show:
@@ -259,16 +265,16 @@ def _action_list(
 
     # ---- 底部操作提示 ----
     msg(f"  {C['UBCYAN']}{'─' * 52}{C['RST']}")
-    msg(f"  {C['BCYAN']}{_('快速操作')}{C['RST']}")
-    msg(f"    {C['GREEN']}{PROGRAM_NAME} mirror test{C['RST']}            {_('测试所有镜像源')}")
-    msg(f"    {C['GREEN']}{PROGRAM_NAME} mirror test --use-best{C['RST']}    {_('自动切换到最快源')}")
-    msg(f"    {C['GREEN']}{PROGRAM_NAME} mirror use <ID>{C['RST']}        {_('切换到指定镜像源')}")
-    msg(f"    {C['GREEN']}{PROGRAM_NAME} mirror show{C['RST']}            {_('查看当前生效 URL')}")
+    msg(f"  {C['BCYAN']}{_('quick start')}{C['RST']}")
+    msg(f"    {C['GREEN']}{PROGRAM_NAME} mirror test{C['RST']}            {_('test every mirror')}")
+    msg(f"    {C['GREEN']}{PROGRAM_NAME} mirror test --use-best{C['RST']}    {_('switch to the fastest')}")
+    msg(f"    {C['GREEN']}{PROGRAM_NAME} mirror use <ID>{C['RST']}        {_('switch to one mirror')}")
+    msg(f"    {C['GREEN']}{PROGRAM_NAME} mirror show{C['RST']}            {_('show the active URL')}")
     msg()
 
     # ---- 用户镜像源文件提示 ----
     if not user_mirrors:
-        msg(f"  {C['IWHITE']}{_('提示: 可在 {file} 添加自定义镜像源', file=USER_MIRRORS_FILE)}{C['RST']}")
+        msg(f"  {C['IWHITE']}{_('tip: add your own mirrors in {file}', file=USER_MIRRORS_FILE)}{C['RST']}")
         msg()
 
     return 0
@@ -345,10 +351,11 @@ def _action_test(
 
         msg()
         msg(f"  {C['UBCYAN']}{'─' * 52}{C['RST']}")
-        msg(f"  {C['UBCYAN']}{_('探测结果（按延迟升序）')}{C['RST']}")
+        msg(f"  {C['UBCYAN']}{_('probe results (sorted by latency)')}{C['RST']}")
         msg(f"  {C['UBCYAN']}{'─' * 52}{C['RST']}")
         msg()
-        headers = (_("状态"), _("ID"), _("名称"), _("延迟"), _("详情"))
+        headers = (_("state"), _("ID"), _("name"), _("latency"),
+                   _("details"))
         rows = []
         for m, ok, lat, detail in results:
             if ok:
@@ -368,11 +375,11 @@ def _action_test(
         ok_count = sum(1 for r in results if r[1])
         msg()
         color = C["BGREEN"] if ok_count > 0 else C["BRED"]
-        msg(f"  {C['CYAN']}{_('可用: {ok}/{total}', ok=ok_count, total=len(results))}{C['RST']}"
+        msg(f"  {C['CYAN']}{_('reachable: {ok}/{total}', ok=ok_count, total=len(results))}{C['RST']}"
             f"  {color}{'●' * ok_count}{'○' * (len(results) - ok_count)}{C['RST']}")
         if ok_count == 0:
             msg()
-            warn(_("所有镜像源均不可达，请检查网络。"))
+            warn(_("no mirror is reachable; check the network."))
             return 1
 
         # Pick the fastest reachable mirror (results are already sorted
@@ -679,14 +686,43 @@ def command_mirror(args) -> None:
         rc = _action_unset()
     elif action == "show":
         rc = _action_show()
+    elif action in ("distro", "cn"):
+        # 容器内软件源一键切换（国内镜像）。target 是容器名。
+        rc = _action_distro(
+            target or "", revert=bool(getattr(args, "revert", False)),
+        )
     else:
         msg()
         crit_error(_("Unknown mirror sub-action: '{action}'. "
-                     "Available: ls, test, use, unset, show",
+                     "Available: ls, test, use, unset, show, distro",
                      action=action))
         rc = 1
     if rc:
         sys.exit(rc)
+
+
+def _action_distro(target: str, revert: bool) -> int:
+    """``mirror distro <容器> [--revert]``：切源 / 还原。"""
+    if not target:
+        msg()
+        crit_error(_("a container name is required, e.g. '{example}'.",
+                     example=f"{PROGRAM_NAME} mirror distro debian"))
+        msg()
+        log_info(_("supported distros: {supported}",
+                   supported="; ".join(SUPPORTED_DISTROS)))
+        msg()
+        return 1
+    if not container_is_installed(target):
+        msg()
+        crit_error(_("container '{name}' is not installed.", name=target))
+        msg()
+        return 1
+    rootfs = container_rootfs(target)
+    if revert:
+        ok = revert_distro_mirror(rootfs, target)
+    else:
+        ok = switch_distro_mirror(rootfs, target)
+    return 0 if ok else 1
 
 
 __all__ = ("command_mirror",)

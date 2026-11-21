@@ -1,4 +1,4 @@
-name: Publish to PyPI
+name: 发布到 PyPI 并附上 Release 产物
 
 on:
   push:
@@ -7,73 +7,72 @@ on:
 
 jobs:
   build:
-    name: Build distribution
+    name: 构建 sdist 与 wheel
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v7
 
-      - name: Set up Python
+      - name: 安装 Python
         uses: actions/setup-python@v7
         with:
           python-version: '3.x'
 
-      - name: Install build tools
+      - name: 安装构建工具
         run: pip install build
 
-
-      - name: Build sdist and wheel
+      - name: 构建 sdist 与 wheel
         run: python -m build
 
-      - name: Store artifacts
+      - name: 暂存构建产物
         uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
 
   publish:
-    name: Publish to PyPI
+    name: 发布到 PyPI（trusted publishing）
     needs: build
     runs-on: ubuntu-latest
     environment:
       name: pypi
       url: https://pypi.org/p/proot-distro-i18n
     permissions:
-      id-token: write
-      contents: write     # the GitHub Release upload below
-    # PyPI trusted publishing must be configured ON PyPI first
-    # (account -> pending publisher: owner=masgzy,
-    # repo=proot-distro-i18n, workflow=publish.yml, environment=pypi).
-    # Until that one-time manual step is done the exchange fails with
-    # "Trusted publishing exchange failure" -- tolerate it so a tag
-    # push stays green; the GitHub Release wheel is the install channel
-    # meanwhile.
-    continue-on-error: true
+      id-token: write    # PyPI trusted publishing 的 OIDC 交换
+      contents: write    # 下面的 GitHub Release 产物上传
+    # PyPI 侧已配置好 trusted publishing（pending publisher:
+    # owner=masgzy, repo=proot-distro-i18n, workflow=publish.yml,
+    # environment=pypi）。发布失败即任务失败，红灯必须被看到：
+    # GitHub Release 的 wheel 是兜底安装通道，但 PyPI 才是正门。
 
     steps:
-      - name: Retrieve artifacts
+      - name: 取回构建产物
         uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
 
-      - name: Publish
+      - name: 发布到 PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
 
-      - name: Attach dist/ to the GitHub Release
-        # The wheel/sdist built here are the user-facing install path
-        # (zero-build pip install from the Release page); the gh CLI
-        # token ships with every workflow, contents:write is implied by
-        # no explicit restriction above -- fallback: the release is
-        # created manually when this step cannot.
+      - name: 把 dist/ 附到 GitHub Release
+        # wheel/sdist 是用户直接可装的产物（Release 页免构建
+        # pip install）。release note 用仓库里 tag 对应的提交信息；
+        # release 尚不存在时由本步骤创建，note 说明构建内容。
         run: |
           set -eux
           TAG="${GITHUB_REF_NAME}"
+          NOTES=$(printf '%s\n' \
+            "proot-distro-i18n ${TAG}" \
+            "" \
+            "- PyPI：\`pip install proot-distro-i18n\`（或从本页下载 wheel/sdist 后 \`pip install ./proot_distro_i18n-*.whl\`）" \
+            "- 源码安装：\`pip install git+https://github.com/masgzy/proot-distro-i18n.git@${TAG}\`" \
+            "- 变更明细见对应提交与 README 的更新日志章节")
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
           else
             gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
-              --title "$TAG" --notes "Automated dist/ upload for $TAG."
+              --title "proot-distro-i18n ${TAG}" --notes "$NOTES"
           fi
         env:
           GH_TOKEN: ${{ github.token }}

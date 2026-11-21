@@ -19,10 +19,23 @@
 #
 
 # Architecture: ANSI color constants and a minimal msg() helper. Colors are
-# enabled only when stderr is a TTY and PD_FORCE_NO_COLORS is unset. The C
+# enabled only when stderr is a TTY and no disabling variable is set. The C
 # dict maps symbolic names to escape sequences so callers don't deal with
 # raw ANSI codes. Every entry starts with _RST so transitions implicitly
 # reset attributes.
+#
+# Palette: Catppuccin (https://catppuccin.com/palette/). Mocha by default,
+# Latte on a light terminal -- CLI_THEME=dark|light overrides, COLORFGBG
+# is probed when it is not set. The semantic hues are the official values:
+# green #a6e3a1 / peach #fab387 / red #f38ba8 / blue #89b4fa / sky #89dceb
+# / yellow #f9e2af / mauve #cba6f7 / pink #f5c2e7 (Mocha; Latte's darker
+# counterparts below). The 24-bit sequences are only used when the
+# terminal advertises truecolor (COLORTERM); anything else -- TERM=xterm,
+# tmux without truecolor, a redirect -- falls back to the same hues as
+# the nearest of the 16 base ANSI colors, so the semantic mapping (red
+# errors, green success, cyan info) survives every level of degradation.
+# NO_COLOR, CLICOLOR=0 and PD_FORCE_NO_COLORS disable color outright;
+# PD_FORCE_COLORS (or FORCE_COLOR) forces it on for pipes and CI.
 #
 # tty_safe_for_writes() lets callers detect when stderr's TTY has been
 # taken over by another process for interactive input — e.g., the pinentry
@@ -58,58 +71,177 @@ _MAGENTA   = "\033[35m"
 _CYAN      = "\033[36m"
 _WHITE     = "\033[37m"
 
-_COLORS = {
-    "RST":     _RST,
+# --- Catppuccin palettes (hex -> 24-bit SGR sequences) -----------------------
 
-    "RED": _RST + _RED,
-    "BRED": _RST + _BOLD + _RED,
-    "IRED": _RST + _ITALIC + _RED,
-    "URED": _RST + _UNDERLINE + _RED,
-    "UBRED": _RST + _UNDERLINE + _BOLD + _RED,
-
-    "GREEN": _RST + _GREEN,
-    "BGREEN": _RST + _BOLD + _GREEN,
-    "IGREEN": _RST + _ITALIC + _GREEN,
-    "UGREEN": _RST + _UNDERLINE + _GREEN,
-    "UBGREEN": _RST + _UNDERLINE + _BOLD + _GREEN,
-
-    "YELLOW": _RST + _YELLOW,
-    "BYELLOW": _RST + _BOLD + _YELLOW,
-    "IYELLOW": _RST + _ITALIC + _YELLOW,
-    "UYELLOW": _RST + _UNDERLINE + _YELLOW,
-    "UBYELLOW": _RST + _UNDERLINE + _BOLD + _YELLOW,
-
-    "BLUE": _RST + _BLUE,
-    "BBLUE": _RST + _BOLD + _BLUE,
-    "IBLUE": _RST + _ITALIC + _BLUE,
-    "UBLUE": _RST + _UNDERLINE + _BLUE,
-    "UBBLUE": _RST + _UNDERLINE + _BOLD + _BLUE,
-
-    "MAGENTA": _RST + _MAGENTA,
-    "BMAGENTA": _RST + _BOLD + _MAGENTA,
-    "IMAGENTA": _RST + _ITALIC + _MAGENTA,
-    "UMAGENTA": _RST + _UNDERLINE + _MAGENTA,
-    "UBMAGENTA": _RST + _UNDERLINE + _BOLD + _MAGENTA,
-
-    "CYAN": _RST + _CYAN,
-    "BCYAN": _RST + _BOLD + _CYAN,
-    "ICYAN": _RST + _ITALIC + _CYAN,
-    "UCYAN": _RST + _UNDERLINE + _CYAN,
-    "UBCYAN": _RST + _UNDERLINE + _BOLD + _CYAN,
-
-    "WHITE": _RST + _WHITE,
-    "BWHITE": _RST + _BOLD + _WHITE,
-    "IWHITE": _RST + _ITALIC + _WHITE,
-    "UWHITE": _RST + _UNDERLINE + _WHITE,
-    "UBWHITE": _RST + _UNDERLINE + _BOLD + _WHITE,
+# (Mocha) the dark flavor; see https://catppuccin.com/palette/ for the
+# full 26-color set -- these are the ten this CLI speaks.
+_MOCHA = {
+    "mauve":   (203, 166, 247),  # #cba6f7  titles, emphasis
+    "text":    (205, 214, 244),  # #cdd6f4  body
+    "subtext": (166, 173, 200),  # #a6adc8  secondary
+    "green":   (166, 227, 161),  # #a6e3a1  success
+    "peach":   (250, 179, 135),  # #fab387  warning
+    "red":     (243, 139, 168),  # #f38ba8  error
+    "blue":    (137, 180, 250),  # #89b4fa  paths, URLs
+    "yellow":  (249, 226, 175),  # #f9e2af  numbers, counts
+    "sky":     (137, 220, 235),  # #89dceb  info
+    "pink":    (245, 194, 231),  # #f5c2e7  keywords
 }
+
+# (Latte) the light flavor, for a terminal on a light background.
+_LATTE = {
+    "mauve":   (136, 57, 239),   # #8839ef
+    "text":    (76, 79, 105),    # #4c4f69
+    "subtext": (108, 111, 133),  # #6c6f85
+    "green":   (64, 160, 43),    # #40a02b
+    "peach":   (254, 100, 11),   # #fe640b
+    "red":     (210, 15, 57),    # #d20f39
+    "blue":    (30, 102, 245),   # #1e66f5
+    "yellow":  (223, 142, 29),   # #df8e1d
+    "sky":     (4, 165, 229),    # #04a5e5
+    "pink":    (234, 118, 203),  # #ea76cb
+}
+
+# The 16-color fallback, used whenever the terminal has not advertised
+# truecolor. One base hue per semantic color, mirroring the mapping the
+# palette entries were chosen for.
+_BASE16 = {
+    "mauve": _MAGENTA, "text": _WHITE, "subtext": _WHITE,
+    "green": _GREEN, "peach": _YELLOW, "red": _RED,
+    "blue": _BLUE, "yellow": _YELLOW, "sky": _CYAN, "pink": _MAGENTA,
+}
+
+_ATTRIBUTES = (("bold", _BOLD), ("italic", _ITALIC),
+               ("underline", _UNDERLINE))
+
+
+def _sgr(rgb, attrs) -> str:
+    """The escape sequence that resets, applies *attrs*, then *rgb*.
+
+    *rgb* is an (r, g, b) tuple from the Catppuccin palettes, rendered
+    as 24-bit color -- or, on the 16-color fallback, a ready-made base
+    sequence from _BASE16 that is appended as it is.
+    """
+    seq = _RST
+    for name, code in _ATTRIBUTES:
+        if name in attrs:
+            seq += code
+    if rgb is not None:
+        if isinstance(rgb, tuple):
+            seq += f"\033[38;2;{rgb[0]};{rgb[1]};{rgb[2]}m"
+        else:
+            seq += rgb
+    return seq
+
+
+def _detect_theme() -> str:
+    """'dark' or 'light', from CLI_THEME, else COLORFGBG, else dark.
+
+    COLORFGBG is 'foreground;background' (e.g. Termux's '15;0'). Only
+    the background half decides: colors 0-6 and 8 are dark backgrounds,
+    7 and 9-15 are light ones. Terminals that send nothing stay on the
+    dark palette, the one most of this CLI's users will be on.
+    """
+    override = os.environ.get("CLI_THEME", "").strip().lower()
+    if override in ("dark", "light"):
+        return override
+    fgbg = os.environ.get("COLORFGBG", "")
+    try:
+        bg = int(fgbg.split(";")[-1])
+    except (ValueError, IndexError):
+        return "dark"
+    return "dark" if bg in (0, 1, 2, 3, 4, 5, 6, 8) else "light"
+
+
+def _truecolor_enabled() -> bool:
+    return "truecolor" in os.environ.get("COLORTERM", "").lower() or \
+        "24bit" in os.environ.get("COLORTERM", "").lower()
+
+
+def _semantic_colors() -> dict:
+    """Base hue per semantic name, palette or 16-color fallback."""
+    if _truecolor_enabled():
+        palette = _LATTE if _detect_theme() == "light" else _MOCHA
+        return palette
+    return _BASE16
+
+
+def _build_colors() -> dict:
+    """The C table: every symbolic name the CLI uses, mapped to a sequence.
+
+    Composite names carry their attributes explicitly; the hue comes from
+    _semantic_colors(), so a truecolor terminal gets the Catppuccin
+    palette and every other terminal the matching base hue.
+    """
+    palette = _semantic_colors()
+    table = {"RST": _RST}
+    for name, attrs in (
+        ("RED", ()), ("GREEN", ()), ("YELLOW", ()), ("BLUE", ()),
+        ("MAGENTA", ()), ("CYAN", ()), ("WHITE", ()),
+        ("BRED", ("bold",)), ("IRED", ("italic",)),
+        ("URED", ("underline",)), ("UBRED", ("underline", "bold")),
+        ("BGREEN", ("bold",)), ("IGREEN", ("italic",)),
+        ("UGREEN", ("underline",)), ("UBGREEN", ("underline", "bold")),
+        ("BYELLOW", ("bold",)), ("IYELLOW", ("italic",)),
+        ("UYELLOW", ("underline",)), ("UBYELLOW", ("underline", "bold")),
+        ("BBLUE", ("bold",)), ("IBLUE", ("italic",)),
+        ("UBLUE", ("underline",)), ("UBBLUE", ("underline", "bold")),
+        ("BMAGENTA", ("bold",)), ("IMAGENTA", ("italic",)),
+        ("UMAGENTA", ("underline",)),
+        ("UBMAGENTA", ("underline", "bold")),
+        ("BCYAN", ("bold",)), ("ICYAN", ("italic",)),
+        ("UCYAN", ("underline",)), ("UBCYAN", ("underline", "bold")),
+        ("BWHITE", ("bold",)), ("IWHITE", ("italic",)),
+        ("UWHITE", ("underline",)), ("UBWHITE", ("underline", "bold")),
+    ):
+        # Which semantic name does this symbolic color stand for? The
+        # base names map one-to-one; the composite ones keep their hue.
+        semantic = {
+            "RED": "red", "GREEN": "green", "YELLOW": "yellow",
+            "BLUE": "blue", "MAGENTA": "pink", "CYAN": "sky",
+            "WHITE": "text",
+        }.get(name)
+        if semantic is None:
+            for base, sem in (
+                ("RED", "red"), ("GREEN", "green"), ("YELLOW", "yellow"),
+                ("BLUE", "blue"), ("MAGENTA", "pink"), ("CYAN", "sky"),
+                ("WHITE", "text"),
+            ):
+                if base in name:
+                    semantic = sem
+                    break
+        table[name] = _sgr(palette.get(semantic), attrs)
+    return table
+
+
+_COLORS = _build_colors()
 _EMPTY = {k: "" for k in _COLORS}
 
 
 def _init_colors() -> dict:
-    if sys.stderr.isatty() and not os.environ.get("PD_FORCE_NO_COLORS"):
-        return _COLORS
-    return _EMPTY
+    """The C table for this run, or its no-color counterpart.
+
+    NO_COLOR is the community convention (https://no-color.org/), present
+    means disabled; CLICOLOR=0 agrees with it; PD_FORCE_NO_COLORS is this
+    program's own switch. Any of the four wins over everything. PD_FORCE_COLORS
+    and FORCE_COLOR turn color on for a pipe or a CI log, where the TTY
+    probe below would otherwise disable it.
+    """
+    env = os.environ
+    if (env.get("NO_COLOR") is not None
+            or env.get("CLICOLOR", "") == "0"
+            or env.get("PD_FORCE_NO_COLORS")):
+        return _EMPTY
+    forced = bool(env.get("PD_FORCE_COLORS")
+                  or (env.get("FORCE_COLOR")
+                      and env.get("FORCE_COLOR") != "0"))
+    try:
+        is_tty = sys.stderr.isatty()
+    except (AttributeError, OSError, ValueError):
+        is_tty = False
+    if not (is_tty or forced):
+        return _EMPTY
+    return _COLORS
 
 
 C = _init_colors()

@@ -535,12 +535,18 @@ def _mirror(sub):
     p._pd_command = "mirror"
     p.add_argument(
         "mirror_action", nargs="?", default="ls",
-        metavar="{ls,test,use,unset,show}",
-        choices=["ls", "list", "test", "use", "set", "unset", "clear", "off", "show"],
+        metavar="{ls,test,use,unset,show,distro}",
+        choices=["ls", "list", "test", "use", "set", "unset", "clear", "off",
+                 "show", "distro", "cn"],
     )
     p.add_argument(
         "target", nargs="?", default=None,
-        metavar="ID|URL",
+        metavar="ID|URL|容器名",
+    )
+    # `distro` action switch:
+    p.add_argument(
+        "--revert", dest="revert", action="store_true",
+        help="`distro`: restore the backed-up original sources (.pd.bak)",
     )
     p.add_argument(
         "-t", "--timeout", type=float, default=6.0, metavar="SECONDS",

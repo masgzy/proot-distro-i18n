@@ -221,6 +221,11 @@ def test_image_env_blocked_membership():
     assert "TERM" in login_env.IMAGE_ENV_BLOCKED
     assert "COLORTERM" in login_env.IMAGE_ENV_BLOCKED
     assert "ANDROID_ROOT" in login_env.IMAGE_ENV_BLOCKED
+    # The Firefox baseline (upstream proot-distro 5.10.3) is the
+    # launcher's to set, never an image's.
+    assert "MOZ_FAKE_NO_SANDBOX" in login_env.IMAGE_ENV_BLOCKED
+    assert "MOZ_SHM_NO_SEALS" in login_env.IMAGE_ENV_BLOCKED
+    assert "PULSE_SERVER" in login_env.IMAGE_ENV_BLOCKED
     assert "FOO" not in login_env.IMAGE_ENV_BLOCKED
 
 
