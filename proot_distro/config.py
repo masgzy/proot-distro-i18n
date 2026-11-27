@@ -46,7 +46,9 @@ import json
 import os
 
 from proot_distro import dirfd
-from proot_distro.constants import IS_TERMUX, PROGRAM_NAME, TERMUX_PREFIX
+from proot_distro.constants import (
+    IS_TERMUX, PROGRAM_NAME, TERMUX_HOME, TERMUX_PREFIX,
+)
 from proot_distro.statedir import read_state_file
 
 __all__ = (

@@ -155,7 +155,8 @@ def _render_value(value) -> str:
 def _action_list() -> int:
     """One line per setting plus its description."""
     msg()
-    msg(_("Current settings (stored in {path}):", path=CONFIG_FILE))
+    msg(_("Current settings (stored in {path}):",
+          path=config_mod.effective_config_file()))
     for name, current, default, is_default, doc in list_settings():
         marker = "" if is_default else f"  {_('← changed from default')}"
         msg(f"  {name:<14} {_render_value(current):<6}"
