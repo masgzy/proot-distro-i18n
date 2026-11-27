@@ -3,6 +3,7 @@
 
 import os
 import shutil
+from types import SimpleNamespace
 
 import pytest
 
@@ -313,3 +314,28 @@ def test_nproot_env_passthrough_does_not_pin_the_backend(monkeypatch):
     _login_command._nproot_env_passthrough(env)
     assert "NPROOT_BACKEND" not in env
     assert env["NPROOT_DEBUG"] == "1"
+
+
+def test_backend_pin_ignores_a_stale_host_backend(monkeypatch):
+    # The passthrough no longer copies NPROOT_BACKEND; the pin also
+    # removes one an older pd (or a stray export) left in the dict.
+    monkeypatch.setenv("NPROOT_BACKEND", "ptrace")
+    monkeypatch.delenv("PDI18N_BACKEND", raising=False)
+    env = {"NPROOT_BACKEND": "ptrace"}
+    _login_command._pin_nproot_backend(SimpleNamespace(backend=None), env)
+    assert "NPROOT_BACKEND" not in env
+
+
+def test_backend_pin_honors_pdi18n_backend(monkeypatch):
+    monkeypatch.delenv("NPROOT_BACKEND", raising=False)
+    monkeypatch.setenv("PDI18N_BACKEND", "proto")
+    env = {}
+    _login_command._pin_nproot_backend(SimpleNamespace(backend=None), env)
+    assert env["NPROOT_BACKEND"] == "proto"
+
+
+def test_backend_pin_refuses_an_invalid_value(monkeypatch):
+    monkeypatch.setenv("PDI18N_BACKEND", "bogus")
+    env = {}
+    _login_command._pin_nproot_backend(SimpleNamespace(backend=None), env)
+    assert "NPROOT_BACKEND" not in env

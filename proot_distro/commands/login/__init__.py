@@ -335,6 +335,37 @@ def _nproot_env_passthrough(env: dict) -> None:
             env[var] = val
 
 
+def _pin_nproot_backend(args, env: dict) -> None:
+    """Pin the launcher's backend from --backend / PDI18N_BACKEND.
+
+    A plain `pd sh` asks for nproot's default (auto -> proto).  A host
+    NPROOT_BACKEND is deliberately not consulted here: the NPROOT_*
+    passthrough used to copy one, and a `NPROOT_BACKEND=ptrace` left
+    exported from a --backend test forced every session onto the ptrace
+    backend, which dies with SIGSEGV on the device.  Only the explicit
+    channels pin it, and an invalid value is refused rather than
+    forwarded.
+    """
+    backend = getattr(args, "backend", None) or os.environ.get(
+        "PDI18N_BACKEND"
+    )
+    if backend and backend not in ("auto", "proto", "ptrace"):
+        warn(_("ignoring invalid nproot backend '{backend}'; "
+               "expected auto, proto or ptrace.", backend=backend))
+        backend = None
+    if backend:
+        env["NPROOT_BACKEND"] = backend
+        log_info(_("nproot backend: {backend} (pinned).", backend=backend))
+        if backend == "ptrace" and IS_TERMUX:
+            warn(_("the ptrace backend can crash on some Android kernels; "
+                   "use --backend auto (or proto) if this session dies."))
+    else:
+        # A stale NPROOT_BACKEND from the host environment must not
+        # reach the launcher: pd's default is auto, and a forced
+        # ptrace is not what a plain `pd sh` asked for.
+        env.pop("NPROOT_BACKEND", None)
+
+
 def _build_termux_env(container_name, extra_env, minimal, isolated):
     """Env dict for termux-type containers."""
     env: dict = {}
@@ -714,24 +745,7 @@ def _login_with_rootfs(container_name: str, args, lock,
     # pin that choice.  Older nproot binaries ignore the variable, so
     # passing it is always safe.  `--get-proot-cmd` users must export
     # NPROOT_BACKEND themselves; a printed command cannot carry env.
-    backend = getattr(args, "backend", None) or os.environ.get(
-        "PDI18N_BACKEND"
-    )
-    if backend and backend not in ("auto", "proto", "ptrace"):
-        warn(_("ignoring invalid nproot backend '{backend}'; "
-               "expected auto, proto or ptrace.", backend=backend))
-        backend = None
-    if backend:
-        child_env["NPROOT_BACKEND"] = backend
-        log_info(_("nproot backend: {backend} (pinned).", backend=backend))
-        if backend == "ptrace" and IS_TERMUX:
-            warn(_("the ptrace backend can crash on some Android kernels; "
-                   "use --backend auto (or proto) if this session dies."))
-    else:
-        # A stale NPROOT_BACKEND from the host environment must not
-        # reach the launcher: pd's default is auto, and a forced
-        # ptrace is not what a plain `pd sh` asked for.
-        child_env.pop("NPROOT_BACKEND", None)
+    _pin_nproot_backend(args, child_env)
     if IS_TERMUX and dist_type != "termux":
         # Always pin PROOT_L2S_DIR to a fixed path and create the
         # directory upfront. Without this the first session lets proot
