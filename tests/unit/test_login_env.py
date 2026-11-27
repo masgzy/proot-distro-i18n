@@ -301,3 +301,15 @@ def test_container_runtime_is_best_effort(builders, monkeypatch):
     env = _login_command._build_termux_env("box", [], minimal=False,
                                            isolated=False)
     assert "PD_CONTAINER_RUNTIME" not in env
+
+
+def test_nproot_env_passthrough_does_not_pin_the_backend(monkeypatch):
+    # NPROOT_BACKEND is a launcher decision: --backend / PDI18N_BACKEND
+    # own it. A stale host export must not turn every `pd sh` into a
+    # forced ptrace session (the proto default is the point of nproot).
+    monkeypatch.setenv("NPROOT_BACKEND", "ptrace")
+    monkeypatch.setenv("NPROOT_DEBUG", "1")
+    env = {}
+    _login_command._nproot_env_passthrough(env)
+    assert "NPROOT_BACKEND" not in env
+    assert env["NPROOT_DEBUG"] == "1"
