@@ -356,3 +356,109 @@ def register_android_ids_at(etc_fd: int) -> None:
         _append_at(
             etc_fd, "gshadow", f"aid_{gname}:*::root,aid_{username_result}\n"
         )
+
+
+_PASSWD_READ_CAP = 1 << 20   # 真实 passwd 从未超过几十 KiB；防呆上限
+
+
+def _read_passwd_at(etc_fd: int) -> "str | None":
+    """Slurp <etc>/passwd, or None when it is not a readable plain file.
+
+    O_NOFOLLOW by way of dirfd.open_regular_at, so a passwd that is a
+    link to a host file is reported as absent rather than parsed. A file
+    past the cap is treated as absent too: nobody's passwd is that big,
+    and the caller heals by appending -- appending to a monstrosity is
+    exactly what a sanity cap is here to refuse.
+    """
+    try:
+        fd, _st = dirfd.open_regular_at(etc_fd, "passwd", os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > _PASSWD_READ_CAP:
+                return None
+            chunks.append(chunk)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return b"".join(chunks).decode("utf-8", errors="replace")
+
+
+def ensure_guest_passwd(root_fd: int) -> "str | None":
+    """Heal a container's etc/passwd before a login; None when intact.
+
+    Two historical containers land here. The first is every rootfs
+    installed before the pwd.getpwuid() fallback: on a real Android
+    device that call raised KeyError and register_android_ids_at()
+    returned before appending anything, so the guest carries no entry
+    for the Termux uid. The second is any install whose root line got
+    lost along the way -- glibc then answers getpwuid(0) with NULL and
+    the session runs under "I have no name!" while musl images on the
+    CI smoke pass the very same check. `pd update` refreshes binaries,
+    never an installed rootfs, so the heal has to happen at login time.
+
+    Runs on the same O_NOFOLLOW discipline as install: one open of
+    <rootfs>/etc, everything below addressed as (fd, name). Best effort
+    throughout; the return value names what was appended (for the
+    caller's one-line log) or None when nothing was missing or nothing
+    could be checked.
+    """
+    try:
+        uid = os.getuid()
+    except Exception:
+        return None
+
+    etc_fd = open_etc(root_fd)
+    if etc_fd is None:
+        return None
+    try:
+        passwd = _read_passwd_at(etc_fd)
+        if passwd is None:
+            return None
+
+        missing = []
+        has_root = False
+        has_uid = False
+        for line in passwd.splitlines():
+            fields = line.split(":")
+            if len(fields) < 3:
+                continue
+            if fields[0] == "root" and fields[2] == "0":
+                has_root = True
+            if fields[2] == str(uid):
+                has_uid = True
+
+        if not has_root:
+            missing.append("root")
+        if not has_uid:
+            missing.append(f"uid {uid}")
+        if not missing:
+            return None
+
+        for name in ("passwd", "shadow"):
+            _chmod_at(etc_fd, name)
+
+        if not has_root:
+            # The line every distro's passwd starts with; appended at the
+            # end because NSS answers by scan order, not position.
+            if not _append_at(etc_fd, "passwd",
+                              "root:x:0:0:root:/root:/bin/bash\n",
+                              create=True):
+                return None
+            _append_at(etc_fd, "shadow",
+                       "root:*:18446:0:99999:7:::\n")
+
+        if not has_uid:
+            register_android_ids_at(etc_fd)
+
+        return "missing " + " and ".join(missing)
+    finally:
+        os.close(etc_fd)

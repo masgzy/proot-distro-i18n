@@ -450,5 +450,6 @@
   "{short_id}: Layer {index}/{n_layers} already cached, skipping.": "{short_id}：层 {index}/{n_layers} 已缓存，跳过。",
   "{short_id}: Caching layer {index}/{n_layers}{size}...": "{short_id}：正在缓存层 {index}/{n_layers}{size}...",
   "the {requested} mirror does not carry this distro; falling back to the {actual} mirror.": "{requested}不镜像此发行版；已回退到{actual}。",
-  "unknown mirror provider '{provider}'. Available: {providers}.": "未知的镜像提供方 '{provider}'。可选：{providers}。"
+  "unknown mirror provider '{provider}'. Available: {providers}.": "未知的镜像提供方 '{provider}'。可选：{providers}。",
+  "Repairing guest /etc/passwd ({what}).": "正在修复容器 /etc/passwd（缺失：{what}）。"
 }

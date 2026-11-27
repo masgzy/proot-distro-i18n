@@ -204,6 +204,59 @@ fi
 
 PD rm alpine >/dev/null 2>&1 || true
 
+# T8: debian (glibc) — the on-device repro surface the smoke never
+# reached. T5-T7 run alpine/musl only: musl answers getpwuid straight
+# from /etc/passwd, while glibc walks NSS, which is exactly where the
+# real-device report ("I have no name!" from a debian guest) lives.
+# The on-device symptom was on an *old* install — pd update refreshes
+# binaries, never the rootfs — so the heal must be proven here too.
+echo "== T8a: install debian (glibc; the on-device repro surface) =="
+if PD install debian >"$LOG/debian-install.log" 2>&1; then
+    ok T8a
+else
+    bad T8a
+    tail -30 "$LOG/debian-install.log"
+fi
+
+DEBIAN_ROOTFS="$PREFIX/var/lib/proot-distro/containers/debian/rootfs"
+
+echo "== T8b: no 'I have no name!' in a glibc guest =="
+OUT=$(PD login debian -- sh -c 'id -un' 2>>"$LOG/login.err")
+echo "debian guest name=$OUT"
+[ -n "$OUT" ] && [ "$OUT" != "I have no name!" ] \
+    && ok T8b || bad T8b
+
+echo "== T8c: the login-time heal repairs a damaged passwd =="
+# Simulate a legacy container: the root line and the Termux uid line
+# are both gone (what pre-5.10.5 devices ended up with). The next
+# login must put them back, or whoami keeps failing.
+if [ -f "$DEBIAN_ROOTFS/etc/passwd" ]; then
+    GUEST_UID=$(PD login debian -- sh -c 'id -u' 2>>"$LOG/login.err")
+    awk -F: -v u="$GUEST_UID" '$1 != "root" && $3 != u' \
+        "$DEBIAN_ROOTFS/etc/passwd" > "$DEBIAN_ROOTFS/etc/passwd.new" \
+        && mv "$DEBIAN_ROOTFS/etc/passwd.new" "$DEBIAN_ROOTFS/etc/passwd"
+    OUT=$(PD login debian -- sh -c 'id -un' 2>>"$LOG/login.err")
+    echo "after damage: name=$OUT"
+    [ -n "$OUT" ] && [ "$OUT" != "I have no name!" ] \
+        && ok T8c || bad T8c
+else
+    bad T8c   # rootfs not where the runtime says it is: no real heal ran
+fi
+
+echo "== T8d: apt update inside the glibc guest (DNS end to end) =="
+# The on-device report was apt failing inside debian; same judgement
+# as T7f: an environment-level network failure on the runner is not a
+# regression.
+if OUT=$(PD login debian -- apt-get update 2>&1); then
+    ok T8d
+else
+    echo "$OUT" | tail -10
+    echo "$OUT" | grep -qi "temporary failure\|network is unreachable\|could not resolve" \
+        && ok T8d || bad T8d
+fi
+
+PD rm debian >/dev/null 2>&1 || true
+
 echo
 echo "RESULT: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" = 0 ]

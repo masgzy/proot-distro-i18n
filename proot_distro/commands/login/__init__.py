@@ -64,6 +64,7 @@ from proot_distro.paths import (
 )
 
 from proot_distro.helpers.resolv import refresh_guest_dns
+from proot_distro.helpers.rootfs import ensure_guest_passwd
 from proot_distro.commands.login.env import (
     ANDROID_HOST_ENV_VARS, identity_env_pairs, image_env_pairs,
     inject_termux_profile,
@@ -599,6 +600,18 @@ def _login_with_rootfs(container_name: str, args, lock,
     # （带管理标记）；客人自己接管过的 resolv.conf 不动。best-effort，
     # 失败不影响会话。
     refresh_guest_dns(rootfs_fd)
+
+    # 同一类会话前自愈（真机 Termux）：历史版本在真机上注册 uid 时
+    # 静默失败（pwd.getpwuid KeyError），旧容器的 passwd 缺当前 uid
+    # 条目，root 行也可能缺失——glibc 对 getpwuid(0) 返回 NULL，整
+    # 个会话顶着 "I have no name!"。`pd update` 只换二进制不碰已装
+    # rootfs，所以这一刀必须在 login 里补。补一次即永久生效（条目
+    # 齐全时零开销、零输出）。best-effort，失败不影响会话。
+    if IS_TERMUX:
+        _healed = ensure_guest_passwd(rootfs_fd)
+        if _healed:
+            log_info(_("Repairing guest /etc/passwd ({what}).",
+                       what=_healed))
 
     # Every session writes the snippet, so what `su -` re-exports is what
     # *this* session was handed: written only by a default-mode Termux
