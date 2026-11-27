@@ -511,6 +511,16 @@ def _login_with_rootfs(container_name: str, args, lock,
                        container_fd: int, rootfs_fd: int) -> None:
     rootfs = container_rootfs(container_name)
 
+    # 自愈必须走在 _resolve_login_user 之前：那条路径按 /etc/passwd
+    # 解析登录用户，passwd 缺 root 行时 crit_error 退出（'no user
+    # root defined'），排在它后面的修复永远轮不到执行。补一次即永久
+    # 生效（条目齐全时零开销、零输出）。best-effort，失败不影响会话。
+    if IS_TERMUX:
+        _healed = ensure_guest_passwd(rootfs_fd)
+        if _healed:
+            log_info(_("Repairing guest /etc/passwd ({what}).",
+                       what=_healed))
+
     dist_type = _detect_dist_type(rootfs, rootfs_fd)
 
     login_user = getattr(args, "user", "root") or "root"
@@ -600,18 +610,6 @@ def _login_with_rootfs(container_name: str, args, lock,
     # （带管理标记）；客人自己接管过的 resolv.conf 不动。best-effort，
     # 失败不影响会话。
     refresh_guest_dns(rootfs_fd)
-
-    # 同一类会话前自愈（真机 Termux）：历史版本在真机上注册 uid 时
-    # 静默失败（pwd.getpwuid KeyError），旧容器的 passwd 缺当前 uid
-    # 条目，root 行也可能缺失——glibc 对 getpwuid(0) 返回 NULL，整
-    # 个会话顶着 "I have no name!"。`pd update` 只换二进制不碰已装
-    # rootfs，所以这一刀必须在 login 里补。补一次即永久生效（条目
-    # 齐全时零开销、零输出）。best-effort，失败不影响会话。
-    if IS_TERMUX:
-        _healed = ensure_guest_passwd(rootfs_fd)
-        if _healed:
-            log_info(_("Repairing guest /etc/passwd ({what}).",
-                       what=_healed))
 
     # Every session writes the snippet, so what `su -` re-exports is what
     # *this* session was handed: written only by a default-mode Termux
