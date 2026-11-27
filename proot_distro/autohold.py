@@ -134,12 +134,19 @@ def maybe_auto_hold() -> None:
             return
 
         msg()
-        msg(f"{C['YELLOW']}{_('Detected: this pip-installed {prog} build '
-              'overwrites the official apt package entry point.', prog=_PKG)}"
-            f"{C['RST']}")
-        msg(f"{C['GREEN']}{_('Running: apt-mark hold {pkg} — so `apt upgrade` '
-              'will not overwrite it with the official version.', pkg=_PKG)}"
-            f"{C['RST']}")
+        # 注意：f-string 表达式里不能跨行拼接字符串字面量（Python
+        # 3.12/PEP 701 才放开，3.10 直接 SyntaxError），msgid 先拼好
+        # 再进 _()，颜色码用普通加法拼接。
+        msg(C["YELLOW"]
+            + _("Detected: this pip-installed {prog} build "
+                "overwrites the official apt package entry point.",
+                prog=_PKG)
+            + C["RST"])
+        msg(C["GREEN"]
+            + _("Running: apt-mark hold {pkg} — so `apt upgrade` "
+                "will not overwrite it with the official version.",
+                pkg=_PKG)
+            + C["RST"])
         msg(_("To restore the official version later:"))
         msg(f"  {C['CYAN']}apt-mark unhold {_PKG} && "
             f"apt install --reinstall {_PKG}{C['RST']}")
