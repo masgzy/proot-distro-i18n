@@ -643,6 +643,12 @@ HELP_PAGES = {
              "ls: 仅显示可达的镜像源（会先探测，可能较慢）。"),
             ("--revert",
              "distro: 还原备份的原始软件源（.pd.bak）。"),
+            ("--mirror [PROVIDER]",
+             "distro: 指定国内镜像提供方——tuna（清华，默认）/ bfsu"
+             "（北外）/ nju（南大）/ ustc（中科大）/ cernet（教育网"
+             "就近调度）/ aliyun（阿里云）/ huawei（华为云）/ tencent"
+             "（腾讯云）。所选站不镜像该发行版时自动回退到覆盖完整的"
+             "站点并给出提示。"),
             ("-q, --quiet",
              "安静模式。ls 时仅输出 URL 列表，每行一个。"),
         ],
@@ -657,6 +663,7 @@ HELP_PAGES = {
             f"{PROGRAM_NAME} mirror unset",
             f"{PROGRAM_NAME} mirror show",
             f"{PROGRAM_NAME} mirror distro debian",
+            f"{PROGRAM_NAME} mirror distro debian --mirror ustc",
             f"{PROGRAM_NAME} mirror distro debian --revert",
         ],
         "footer": [
@@ -670,10 +677,12 @@ HELP_PAGES = {
                     "unset / clear / off: 清除当前选中，回到默认。\n"
                     "show: 仅打印当前生效 URL（脚本友好，例如 "
                     "$(pd mirror show)）。\n"
-                    "distro 容器名 [--revert]: 容器内软件源一键切到国内镜像"
-                    "（apt/apk/dnf/pacman/zypp/xbps/portage，适配 Debian/"
-                    "Ubuntu/Kali/Alpine/Arch/Manjaro/Fedora/Rocky/Alma/"
-                    "openSUSE/Void/Gentoo）。原文件备份为 <文件名>.pd.bak，"
+                    "distro 容器名 [--mirror 提供方] [--revert]: 容器内软件"
+                    "源一键切到国内镜像（apt/apk/dnf/pacman/zypp/xbps/"
+                    "portage，适配 Debian/Ubuntu/Kali/Alpine/Arch/Manjaro/"
+                    "Fedora/Rocky/Alma/openSUSE/Void/Gentoo），默认清华 TUNA，"
+                    "--mirror 可选北外/南大/中科大/CERNET/阿里云/华为云/"
+                    "腾讯云。原文件备份为 <文件名>.pd.bak，"
                     "--revert 还原；配合 setting distro_mirror=true "
                     "可在 install 后自动执行。"
                 ),

@@ -67,6 +67,70 @@ else:
 
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
+# Termux 上的用户级回退：$PREFIX/etc 坐在 pkg 管的地盘上，pip 装的
+# pd、root 残留的目录或只读 overlay 都能把主路径变成“不可写”——实测
+# `setting put` 就死在 Errno 5。家园目录（~/.config）永远是用户自己的；
+# 主路径不可写时写入改道到这里，读则两条路径都看（主优先），
+# 旧安装的配置不丢，新写入也不再崩。两个常量都在导入期定死（不随
+# HOME 的运行期变化），同一条纪律。
+if IS_TERMUX:
+    FALLBACK_CONFIG_FILE = os.path.join(
+        os.environ.get("XDG_CONFIG_HOME")
+        or os.path.join(TERMUX_HOME, ".config"),
+        PROGRAM_NAME, "config.json")
+else:
+    FALLBACK_CONFIG_FILE = ""   # 桌面上没有回退（XDG 本来就是用户自己的）
+
+
+def _config_writable(path: str) -> bool:
+    """*path* 所在目录现在能否写入（探针式的诚实答案）。
+
+    开目录拿描述符、试写进一个随机临时名再删除——存在权限/只读
+    overlay/不可达都会在这里如实返回 False。探测代价一次 O_CREAT
+    + unlink，只在写入路径上花。
+    """
+    dir_fd = _open_config_dir(path, create=True)
+    if dir_fd is None:
+        return False
+    probe = f".wtest.{os.getpid()}.{os.urandom(4).hex()}.tmp"
+    try:
+        try:
+            fd, _st = dirfd.open_new_at(dir_fd, probe, 0o600, readable=True)
+        except OSError:
+            return False
+        try:
+            os.close(fd)
+        finally:
+            dirfd.unlink_quietly(dir_fd, probe)
+        return True
+    finally:
+        os.close(dir_fd)
+
+
+def effective_config_file() -> str:
+    """写入应当去的 config.json 路径（主路径不可写时落到用户级）。
+
+    主路径在 Termux 上是 $PREFIX/etc/proot-distro/config.json。
+    不可写（Errno 5 的根因）时改道 ~/.config/proot-distro/config.json
+    ——家园目录不受 pkg 管辖，setting put 不再因系统路径拒写而崩。
+    桌面上没有回退（XDG 本来就是用户自己的）。
+    """
+    if not FALLBACK_CONFIG_FILE:
+        return CONFIG_FILE
+    if _config_writable(CONFIG_FILE):
+        return CONFIG_FILE
+    return FALLBACK_CONFIG_FILE
+
+
+def config_candidates_for_read() -> tuple:
+    """读 config.json 的候选路径（主路径优先，回退在后）。
+
+    写入改道后配置可能存在任一路径上；两处都读，主路径胜出。
+    """
+    if not FALLBACK_CONFIG_FILE or CONFIG_FILE == FALLBACK_CONFIG_FILE:
+        return (CONFIG_FILE,)
+    return (CONFIG_FILE, FALLBACK_CONFIG_FILE)
+
 
 # ---------------------------------------------------------------------------
 # 硬化 I/O：配置目录在 Termux 上坐在客人可写的 $PREFIX 里
@@ -252,10 +316,11 @@ def load_user_config() -> dict:
     上坐在客人可写的 $PREFIX 里，链接与 FIFO 都不会被判为可读的
     常规文件。
     """
-    data = read_json_in_config(CONFIG_FILE)
-    if data is None:
-        return {}
-    return data if isinstance(data, dict) else {}
+    for path in config_candidates_for_read():
+        data = read_json_in_config(path)
+        if data is not None:
+            return data if isinstance(data, dict) else {}
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -283,9 +348,27 @@ def save_user_config(update: dict, *, remove_keys: tuple = ()) -> dict:
         for key in remove_keys:
             data.pop(key, None)
 
-        if not write_json_in_config(CONFIG_FILE, data):
-            raise OSError(  # 让调用方以 OSError 的方式报错，和以前一致
-                5, "cannot write " + CONFIG_FILE)  # errno.EIO
+        # 写入目标：主路径可写则写主路径（旧配置原位更新），否则
+        # 改道用户级回退路径（Errno 5 的根治——见
+        # effective_config_file）。改道时先并入回退路径上已有的键
+        # （若有），不丢用户早前的设置。
+        target = effective_config_file()
+        if target != CONFIG_FILE:
+            existing = read_json_in_config(target)
+            if isinstance(existing, dict):
+                for key, value in existing.items():
+                    data.setdefault(key, value)
+
+        if not write_json_in_config(target, data):
+            # 让调用方以 OSError 的方式报错，和以前一致；文案走 _() 以
+            # 便随界面语言翻译，并把原因（目录不可达/不可写）点名。
+            from proot_distro.i18n import _
+
+            raise OSError(  # errno.EIO
+                5,
+                _("cannot write {path}: the configuration directory is "
+                  "not reachable or not writable.", path=target),
+            )
     return data
 
 

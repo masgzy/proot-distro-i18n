@@ -251,6 +251,57 @@ def write_hosts(rootfs: str, *, root_fd=None) -> None:
         os.close(etc_fd)
 
 
+def _termux_username(uid: int) -> "str | None":
+    """The Termux account name to register for *uid*, or None when the
+    whole registration should be skipped (uid 0 root needs no entry).
+
+    The host lookup first: on a regular Linux box -- CI, a debootstrap
+    bootstrap, a desktop run of the test suite -- ``pwd.getpwuid`` is
+    the right answer. On real Android there is no ``/etc/passwd`` at
+    all, and the one Termux itself maintains (``$PREFIX/etc/passwd``)
+    is not wired into ``pwd``'s search path for a pip-installed ``pd``
+    -- ``pwd.getpwuid`` raised KeyError, the old code returned early,
+    and the guest was left without any passwd entry for the app uid:
+    the "I have no name!" prompt. The fallback derives a stable,
+    collision-free name from the uid itself (``u<uid>`` inside the
+    Android app-uid range, matching what Termux's own passwd spells
+    there; ``aid_<uid>`` outside it), so the entry is always written.
+    """
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        pass
+    except Exception:
+        # A damaged host nsswitch: fall through to the derived name.
+        pass
+    if uid == 0:
+        return "root"
+    if uid >= 10000:
+        # The Android app-uid range: Termux's own passwd spells these
+        # "u10123". Matches its convention when we cannot read it.
+        return f"u{uid}"
+    # System/aid range: "aid_radio"-style names are Android's, but a
+    # plain uid spelling is unambiguous and needs no table.
+    return f"aid_{uid}"
+
+
+def _termux_groupname(gid: int) -> "str | None":
+    """The group name to register for *gid*; same policy as
+    _termux_username (host table first, derived fallback, and the
+    ``aid_<gid>`` spelling outside the app-uid range)."""
+    try:
+        return grp.getgrgid(gid).gr_name
+    except KeyError:
+        pass
+    except Exception:
+        pass
+    if gid == 0:
+        return "root"
+    if gid >= 10000:
+        return f"u{gid}"
+    return f"aid_{gid}"
+
+
 def register_android_ids_at(etc_fd: int) -> None:
     """Add the Termux Android UID/GID entries to passwd/shadow/group/gshadow.
 
@@ -268,8 +319,11 @@ def register_android_ids_at(etc_fd: int) -> None:
     try:
         uid = os.getuid()
         gid = os.getgid()
-        username_result = pwd.getpwuid(uid).pw_name
     except Exception:
+        return
+
+    username_result = _termux_username(uid)
+    if username_result is None:
         return
 
     if not _append_at(
@@ -291,9 +345,8 @@ def register_android_ids_at(etc_fd: int) -> None:
             all_gids.append(g)
 
     for g in all_gids:
-        try:
-            gname = grp.getgrgid(g).gr_name
-        except KeyError:
+        gname = _termux_groupname(g)
+        if gname is None:
             continue
         _append_at(
             etc_fd, "group", f"aid_{gname}:x:{g}:root,aid_{username_result}\n",

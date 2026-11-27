@@ -17,18 +17,28 @@ from proot_distro import distro_mirror as dm
 # rewrite rules (pure functions)
 # ---------------------------------------------------------------------------
 
-def test_apt_domains_move_to_aliyun_paths_intact():
+def test_apt_domains_move_to_mirror_paths_intact():
     text = (
         "deb http://deb.debian.org/debian trixie main\n"
         "deb https://deb.debian.org/debian-security trixie-security main\n"
         "deb http://ports.ubuntu.com/ubuntu-ports noble main\n"
     )
+    # 默认提供方是清华 TUNA。
     out = dm._rewrite_for_family("apt", text)
-    assert "https://mirrors.aliyun.com/debian trixie" in out
-    assert "https://mirrors.aliyun.com/debian-security" in out
-    assert "https://mirrors.aliyun.com/ubuntu-ports" in out
+    assert "https://mirrors.tuna.tsinghua.edu.cn/debian trixie" in out
+    assert "https://mirrors.tuna.tsinghua.edu.cn/debian-security" in out
+    assert "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports" in out
     # the suites and components were not touched
     assert "trixie main" in out and "noble main" in out
+
+
+def test_apt_domains_honor_the_chosen_provider():
+    # --mirror aliyun：换家不换路径，suite/components 原样。
+    text = "deb http://deb.debian.org/debian trixie main\n"
+    out = dm._rewrite_for_family("apt", text, provider="aliyun")
+    assert "https://mirrors.aliyun.com/debian trixie" in out
+    out = dm._rewrite_for_family("apt", text, provider="ustc")
+    assert "https://mirrors.ustc.edu.cn/debian trixie" in out
 
 
 def test_apt_no_known_domain_means_no_change():
@@ -40,19 +50,19 @@ def test_alpine_repositories():
     text = ("https://dl-cdn.alpinelinux.org/alpine/v3.24/main\n"
             "https://dl-cdn.alpinelinux.org/alpine/v3.24/community\n")
     out = dm._rewrite_for_family("alpine", text)
-    assert out.count("https://mirrors.aliyun.com/alpine/v3.24/") == 2
+    assert out.count("https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.24/") == 2
 
 
 def test_arch_mirrorlist_is_rewritten():
     out = dm._rewrite_for_family("arch", "Server = https://geo.example/$repo/os/$arch\n")
-    assert "Server = https://mirrors.aliyun.com/archlinux/$repo/os/$arch" in out
+    assert "Server = https://mirrors.tuna.tsinghua.edu.cn/archlinux/$repo/os/$arch" in out
 
 
 def test_manjaro_uses_the_stable_branch():
     out = dm._rewrite_for_family("manjaro", "# anything\n")
     # Manjaro 的仓库布局是 <mirror>/manjaro/<branch>/$repo/$arch——
     # 没有 /os/（那是 Arch 的层级；照抄它切完后 pacman 全部 404）。
-    assert "mirrors.aliyun.com/manjaro/stable/$repo/$arch" in out
+    assert "mirrors.tuna.tsinghua.edu.cn/manjaro/stable/$repo/$arch" in out
     assert "/os/$arch" not in out
 
 
@@ -63,27 +73,35 @@ def test_rocky_mirrorlist_commented_and_baseurl_enabled():
         "# baseurl=http://dl.rockylinux.org/$contentdir/$releasever/BaseOS/$basearch/os/\n"
         "gpgkey=https://dl.rockylinux.org/$contentdir/RPM-GPG-KEY-Rocky-9\n"
     )
+    # 默认清华不镜像 rocky：回退链落到华为云。
     out = dm._rewrite_for_family("rocky", text)
     assert "# mirrorlist=https://mirrors.rockylinux.org/" in out
-    assert "baseurl=https://mirrors.aliyun.com/rockylinux/$releasever/BaseOS/" in out
+    assert "baseurl=https://repo.huaweicloud.com/rockylinux/$releasever/BaseOS/" in out
     # $contentdir maps onto the mirror root
-    assert "gpgkey=https://mirrors.aliyun.com/rockylinux/RPM-GPG-KEY-Rocky-9" in out
+    assert "gpgkey=https://repo.huaweicloud.com/rockylinux/RPM-GPG-KEY-Rocky-9" in out
     # the commented mirrorlist survives for the revert story
     assert "mirrors.rockylinux.org" in out
 
 
-def test_almalinux_repo_uses_aliyun():
+def test_rocky_honors_an_explicit_provider_that_carries_it():
+    text = "# baseurl=http://dl.rockylinux.org/$contentdir/$releasever/BaseOS/$basearch/os/\n"
+    out = dm._rewrite_for_family("rocky", text, provider="aliyun")
+    assert "baseurl=https://mirrors.aliyun.com/rockylinux/$releasever/BaseOS/" in out
+
+
+def test_almalinux_repo_default_falls_back():
     text = ("mirrorlist=https://mirrors.almalinux.org/mirrorlist/9/baseos\n"
             "# baseurl=https://repo.almalinux.org/almalinux/$releasever/BaseOS/$basearch/os/\n")
+    # 默认清华不镜像 almalinux：回退链的华为云接手。
     out = dm._rewrite_for_family("almalinux", text)
-    assert "https://mirrors.aliyun.com/almalinux/$releasever/BaseOS/" in out
+    assert "https://repo.huaweicloud.com/almalinux/$releasever/BaseOS/" in out
 
 
-def test_fedora_repo_is_rewritten_around_aliyun():
+def test_fedora_repo_is_rewritten_around_tuna():
     text = ("[fedora]\n"
             "metalink=https://mirrors.fedoraproject.org/metalink?repo=fedora-$releasever\n")
     out = dm._rewrite_for_family("fedora", text)
-    assert "baseurl=https://mirrors.aliyun.com/fedora/releases/$releasever/" in out
+    assert "baseurl=https://mirrors.tuna.tsinghua.edu.cn/fedora/releases/$releasever/" in out
     assert "gpgcheck=1" in out
 
 
@@ -116,7 +134,7 @@ def test_fedora_leaves_unknown_repo_files_alone():
 def test_suse_and_void_domain_rules():
     out = dm._rewrite_for_family(
         "suse", "https://download.opensuse.org/tumbleweed/repo/oss/\n")
-    assert "https://mirrors.aliyun.com/opensuse/tumbleweed/repo/oss/" in out
+    assert "https://mirrors.tuna.tsinghua.edu.cn/opensuse/tumbleweed/repo/oss/" in out
     out = dm._rewrite_for_family(
         "void", "repository=https://repo-default.voidlinux.org/current/aarch64\n")
     assert "https://mirrors.tuna.tsinghua.edu.cn/voidlinux/current/aarch64" in out
@@ -129,6 +147,24 @@ def test_gentoo_make_conf():
     text = 'GENTOO_MIRRORS="https://distfiles.gentoo.org"\n'
     out = dm._rewrite_for_family("gentoo", text)
     assert "distfiles.gentoo.org" not in out
+
+
+def test_provider_registry_and_fallbacks():
+    # 8 家提供方全部注册，默认清华。
+    ids = dm.mirror_provider_ids()
+    assert len(ids) == 8
+    assert dm.DEFAULT_MIRROR_PROVIDER == "tuna"
+    assert dm.mirror_provider_host("tuna") == "mirrors.tuna.tsinghua.edu.cn"
+    # 回退链：清华不镜像 rocky 时落到华为云。
+    chosen, fell_back = dm.resolve_provider_for_family(None, "rocky")
+    assert chosen == "huawei" and fell_back is True
+    chosen, fell_back = dm.resolve_provider_for_family(None, "apt")
+    assert chosen == "tuna" and fell_back is False
+    # 选了不镜像该家族的站也走回退链。
+    chosen, fell_back = dm.resolve_provider_for_family("bfsu", "manjaro")
+    assert fell_back is True
+    assert dm.mirror_provider_supports("bfsu", "manjaro") is False
+    assert dm.mirror_provider_label("tuna") == "清华大学（TUNA）"
 
 
 # ---------------------------------------------------------------------------
@@ -185,12 +221,12 @@ def debian_rootfs(tmp_path):
 def test_switch_rewrites_and_backs_up(debian_rootfs):
     assert dm.switch_distro_mirror(str(debian_rootfs), "box") is True
     listing = (debian_rootfs / "etc/apt/sources.list").read_text()
-    assert "https://mirrors.aliyun.com/debian trixie" in listing
+    assert "https://mirrors.tuna.tsinghua.edu.cn/debian trixie" in listing
     bak = debian_rootfs / "etc/apt/sources.list.pd.bak"
     assert bak.exists()
     assert "http://deb.debian.org/debian trixie" in bak.read_text()
     sources = (debian_rootfs / "etc/apt/sources.list.d/bookworm.sources")
-    assert "https://mirrors.aliyun.com/debian" in sources.read_text()
+    assert "https://mirrors.tuna.tsinghua.edu.cn/debian" in sources.read_text()
     assert (debian_rootfs / "etc/apt/sources.list.d/bookworm.sources.pd.bak").exists()
 
 
@@ -244,12 +280,20 @@ def test_switch_without_etc_is_a_noop(tmp_path):
     assert dm.switch_distro_mirror(str(rootfs), "box") is False
 
 
-def test_switch_is_idempotent_when_already_on_aliyun(debian_rootfs):
+def test_switch_honors_provider_argument(debian_rootfs):
+    # switch_distro_mirror(provider=...) 直通 _rewrite_for_family。
+    assert dm.switch_distro_mirror(
+        str(debian_rootfs), "box", provider="aliyun") is True
+    assert "https://mirrors.aliyun.com/debian trixie" in (
+        debian_rootfs / "etc/apt/sources.list").read_text()
+
+
+def test_switch_is_idempotent_when_already_on_mirror(debian_rootfs):
     assert dm.switch_distro_mirror(str(debian_rootfs), "box") is True
     # switched sources contain no known upstream domain any more —
     # 重复执行是幂等成功，不是失败。
     assert dm.switch_distro_mirror(str(debian_rootfs), "box") is True
-    assert "mirrors.aliyun.com" in (
+    assert "mirrors.tuna.tsinghua.edu.cn" in (
         debian_rootfs / "etc/apt/sources.list").read_text()
 
 
@@ -279,7 +323,7 @@ def test_alpine_repositories_are_discovered_and_switched(tmp_path):
         "https://dl-cdn.alpinelinux.org/alpine/v3.20/community\n")
     assert dm.switch_distro_mirror(str(rootfs), "alp") is True
     text = (rootfs / "etc/apk/repositories").read_text()
-    assert text.count("https://mirrors.aliyun.com/alpine/v3.20/") == 2
+    assert text.count("https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.20/") == 2
     assert (rootfs / "etc/apk/repositories.pd.bak").exists()
 
 
@@ -313,16 +357,19 @@ def test_two_files_in_one_directory_do_not_ebadf(tmp_path):
     (rootfs / "etc/apt/sources.list.d/b.list").write_text(
         "deb http://security.ubuntu.com/ubuntu noble-security main\n")
     assert dm.switch_distro_mirror(str(rootfs), "ub") is True
-    assert "aliyun.com" in (rootfs / "etc/apt/sources.list.d/a.list").read_text()
-    assert "aliyun.com" in (rootfs / "etc/apt/sources.list.d/b.list").read_text()
+    assert "tuna.tsinghua.edu.cn" in (rootfs / "etc/apt/sources.list.d/a.list").read_text()
+    assert "tuna.tsinghua.edu.cn" in (rootfs / "etc/apt/sources.list.d/b.list").read_text()
 
 
 def test_domain_replacement_respects_boundaries():
     # 子串替换会把 deb.debian.org.attacker.cn “成功”换成
-    # mirrors.aliyun.com.attacker.cn——边界必须锁死。
+    # mirrors.tuna...attacker.cn——边界必须锁死。
+    rules = dm._pair_rules(
+        dm._FAMILY_DOMAINS["apt"],
+        "https://mirrors.tuna.tsinghua.edu.cn")
     text = ("deb http://deb.debian.org.attacker.cn/ bookworm main\n"
             "deb http://deb.debian.org/debian bookworm main\n")
-    out = dm._replace_domains(text, dm._DOMAIN_RULES["apt"])
+    out = dm._replace_domains(text, rules)
     assert "deb.debian.org.attacker.cn" in out       # 恶意后缀域名原样保留
-    assert "mirrors.aliyun.com.attacker.cn" not in out
-    assert "https://mirrors.aliyun.com/debian bookworm" in out
+    assert "mirrors.tuna.tsinghua.edu.cn.attacker.cn" not in out
+    assert "https://mirrors.tuna.tsinghua.edu.cn/debian bookworm" in out

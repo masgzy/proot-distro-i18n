@@ -414,13 +414,16 @@ def _extract_oci(tf, member_map, rootfs_fd, dist_arch):
         layer_fd = open_verified_layer(digest)
 
         if layer_fd is not None:
-            log_info(f"{short_id}: Layer {i + 1}/{n_layers} already cached, "
-                     f"skipping.")
+            log_info(_("{short_id}: Layer {index}/{n_layers} already cached, "
+                        "skipping.",
+                        short_id=short_id, index=i + 1,
+                        n_layers=n_layers))
         else:
             # Absent, or present with content that no longer hashes to its
             # digest — either way the archive in hand is the better copy.
-            log_info(f"{short_id}: Caching layer "
-                     f"{i + 1}/{n_layers}{size_str}...")
+            log_info(_("{short_id}: Caching layer {index}/{n_layers}{size}...",
+                        short_id=short_id, index=i + 1,
+                        n_layers=n_layers, size=size_str))
             layer_fd = _oci_cache_layer(tf, member_map, digest)
 
         log_info(_("{short_id}: Applying layer {index}/{n_layers}...", short_id = short_id, index = i + 1, n_layers = n_layers))

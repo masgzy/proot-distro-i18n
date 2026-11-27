@@ -319,6 +319,72 @@ def opendir_under(root: str, parts, *, create: bool = False,
         os.close(root_fd)
 
 
+def _planted_here(parent_fd: int) -> bool:
+    """True when this process -- or a guest running under its uid, which
+    on Termux is every container process -- could have written into the
+    directory *parent_fd* refers to.
+
+    The rule is the ownership/mode of the parent itself: our own uid
+    owns the app prefix, the container roots and everything below them;
+    root (we run as root) writes anywhere; a world- or group-writable
+    directory takes entries from strangers. Anything else -- /, /data
+    and their peers on Android, /etc on desktop -- is written only by
+    the platform, and a symlink standing there was planted by whoever
+    owns that directory, not by a guest we are walking away from.
+    """
+    try:
+        st = os.fstat(parent_fd)
+    except OSError:
+        return True  # cannot tell: assume the worst
+    if st.st_uid == os.getuid():
+        return True
+    if os.getuid() == 0:
+        return True
+    if st.st_mode & stat.S_IWOTH:
+        return True
+    if st.st_mode & stat.S_IWGRP:
+        try:
+            ours = {os.getgid()} | set(os.getgroups())
+        except OSError:
+            return True
+        if st.st_gid in ours:
+            return True
+    return False
+
+
+def _platform_alias_fd(src: int, name: str, exc: "OSError"):
+    """A directory fd through a symlink the platform itself maintains,
+    or None when this refusal must stay a refusal.
+
+    Android aliases the app data tree -- /data/data is a compatibility
+    symlink to /data/user/0 on modern releases (which of the two is
+    the real directory depends on the release) -- so a walk that starts
+    at the filesystem root, as config.py's does, meets a symlink no
+    hostile guest could have placed: its parent (/data) is owned by the
+    platform and writable by nobody under our uid. Following *that*
+    link is as safe as the directory it names. Every walk below the
+    app-owned prefix keeps refusing symlinks outright, because there
+    the parent is writable by our uid and a planted link cannot be told
+    apart from a platform one.
+    """
+    if exc.errno not in REFUSED:
+        return None
+    try:
+        st = lstat_at(src, name)
+    except OSError:
+        return None
+    if not stat.S_ISLNK(st.st_mode):
+        return None
+    if _planted_here(src):
+        return None
+    try:
+        # O_DIRECTORY on the follow: an alias to a non-directory must
+        # keep raising, not quietly become one.
+        return os.open(name, _O_RD_DIR, dir_fd=src)
+    except OSError:
+        return None
+
+
 def descend_at(dir_fd: int, parts, *, create: bool = False,
                mode: int = None) -> int:
     """Open the directory *parts* names under dir_fd. Descriptor, or raises.
@@ -355,6 +421,11 @@ def descend_at(dir_fd: int, parts, *, create: bool = False,
                 except FileExistsError:
                     pass            # lost a race with another writer
                 nxt = opendir_at(src, part)
+            except OSError as exc:
+                aliased = _platform_alias_fd(src, part, exc)
+                if aliased is None:
+                    raise
+                nxt = aliased
             if fd is not None:
                 os.close(fd)
             fd = nxt

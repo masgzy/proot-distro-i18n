@@ -419,8 +419,8 @@ def _run_install(
         clear_bar()
         log_error(_("Failed to install: {exc}", exc = exc))
         log_error(
-            "See 'proot-distro install --help' on how to install "
-            "distribution image."
+            _("See '{prog} install --help' on how to install "
+              "distribution image.", prog=PROGRAM_NAME)
         )
         _cleanup()
         sys.exit(1)

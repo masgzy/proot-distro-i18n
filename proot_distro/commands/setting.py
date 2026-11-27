@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import sys
 
-from proot_distro.config import CONFIG_FILE
+from proot_distro import config as config_mod
 from proot_distro.constants import PROGRAM_NAME
 from proot_distro.i18n import _
 from proot_distro.message import crit_error, log_info, msg
@@ -90,12 +90,20 @@ def _action_put(item, value) -> int:
         _usage_hint()
         msg()
         return 1
+    except OSError as exc:
+        # 配置文件写不进去（目录不可达/不可写）：一条干净的错误行，
+        # 而不是整段 traceback。曾经 set_setting 把 OSError 一路抛到
+        # cli.main，用户看到的是六层调用栈。
+        msg()
+        crit_error(str(exc))
+        msg()
+        return 1
     msg()
     log_info(_("{item} set to {value} (was {old}); saved to {path}.",
                item=item, value=_render_value(new),
                old=(_("unset (default)") if old is None
                     else _render_value(old)),
-               path=CONFIG_FILE))
+               path=config_mod.effective_config_file()))
     log_info(_("Settings apply to new sessions: the next "
                "'{cmd} login' or '{cmd} run' picks this up.",
                cmd=PROGRAM_NAME))
@@ -111,6 +119,12 @@ def _action_reset(item) -> int:
         msg()
         crit_error(str(exc))
         _usage_hint()
+        msg()
+        return 1
+    except OSError as exc:
+        # 与 _action_put 同一条纪律：存储层拒写时给出干净的错误行。
+        msg()
+        crit_error(str(exc))
         msg()
         return 1
     msg()

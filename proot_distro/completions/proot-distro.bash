@@ -341,9 +341,12 @@ _proot_distro() {
             case "${prev}" in
                 -t|--timeout)
                     return ;;
+                --mirror)
+                    COMPREPLY=($(compgen -W "tuna bfsu nju ustc cernet aliyun huawei tencent" -- "${cur}"))
+                    return ;;
             esac
             if [[ "${cur}" == -* ]]; then
-                COMPREPLY=($(compgen -W "-t --timeout --allow-insecure --use-best --no-use -q --quiet -h --help" -- "${cur}"))
+                COMPREPLY=($(compgen -W "-t --timeout --allow-insecure --use-best --no-use --revert --mirror -q --quiet -h --help" -- "${cur}"))
             else
                 # 第一个位置参数: 子动作; 第二个: ID|URL
                 # 简化: 如果当前词是已知动作, 补动作; 否则补镜像 ID

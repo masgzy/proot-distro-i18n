@@ -555,6 +555,13 @@ def _mirror(sub):
         help="`distro`: restore the backed-up original sources (.pd.bak)",
     )
     p.add_argument(
+        "--mirror", dest="mirror_provider", default=None,
+        metavar="PROVIDER",
+        help="`distro`: pick the mirror provider "
+             "(tuna|bfsu|nju|ustc|cernet|aliyun|huawei|tencent; "
+             "default tuna)",
+    )
+    p.add_argument(
         "-t", "--timeout", type=float, default=6.0, metavar="SECONDS",
     )
     p.add_argument(

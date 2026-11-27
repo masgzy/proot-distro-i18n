@@ -443,6 +443,7 @@ complete -c proot-distro -f -n '__fish_seen_subcommand_from mirror'     -a 'show
 complete -c proot-distro -f -n '__fish_seen_subcommand_from mirror'     -a 'distro' -d '容器内软件源一键切国内镜像'
 complete -c proot-distro -f -n '__fish_seen_subcommand_from mirror'     -a 'cn' -d '容器内软件源一键切国内镜像（同 distro）'
 complete -c proot-distro -f -n "__fish_seen_subcommand_from mirror; and __fish_seen_subcommand_from distro"     -l revert -d '还原备份的原始源'
+complete -c proot-distro -f -n "__fish_seen_subcommand_from mirror; and __fish_seen_subcommand_from distro"     -l mirror -r -a 'tuna bfsu nju ustc cernet aliyun huawei tencent' -d '选择国内镜像提供方（默认清华 TUNA）'
 complete -c proot-distro -f -n '__fish_seen_subcommand_from mirror'     -a 'daocloud 1panel-live 1ms xuanyuan xuanyuan-run netease tencent docker-cn docker-hub'     -d '内置镜像源 ID'
 complete -c proot-distro -f -n '__fish_seen_subcommand_from mirror'     -s t -l timeout -r -d '探测超时（秒，默认 6）'
 complete -c proot-distro -f -n '__fish_seen_subcommand_from mirror'     -l allow-insecure -d '允许 HTTPS 跳过证书校验'

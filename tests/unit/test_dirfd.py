@@ -646,3 +646,56 @@ def test_remove_tree_survives_a_tree_deeper_than_the_stack(tmp_path):
         # Never leave one behind: pytest's own tmp_path cleanup is
         # shutil.rmtree, which is exactly what cannot remove it.
         dirfd.remove_tree(str(root))
+
+
+def test_planted_here_false_for_platform_owned_parent():
+    """/etc on every sane Linux install is owned by root and writable by
+    nobody under an ordinary uid: a symlink standing there is planted by
+    the platform, not by a guest we are walking away from. (When the
+    suite itself runs as root, every directory is "ours"; skip.)"""
+    if os.getuid() == 0:
+        pytest.skip("run as root: every parent is writable by root")
+    fd = dirfd.opendir("/etc")
+    try:
+        assert dirfd._planted_here(fd) is False
+    finally:
+        os.close(fd)
+
+
+def test_planted_here_true_for_own_parent(tmp_path):
+    fd = dirfd.opendir(str(tmp_path))
+    try:
+        assert dirfd._planted_here(fd) is True
+    finally:
+        os.close(fd)
+
+
+def test_platform_alias_fd_refuses_a_non_symlink(tmp_path):
+    """Only a genuine symlink can be followed; a regular file that fails
+    the O_NOFOLLOW|O_DIRECTORY open for some other reason must not turn
+    into a followed alias."""
+    fd = dirfd.opendir(str(tmp_path))
+    try:
+        (tmp_path / "plain").write_text("x")
+        exc = OSError(errno.ELOOP, "too many levels of symbolic links")
+        assert dirfd._platform_alias_fd(fd, "plain", exc) is None
+        # A non-refusal errno never even looks at the entry.
+        exc = OSError(errno.EACCES, "permission denied")
+        assert dirfd._platform_alias_fd(fd, "plain", exc) is None
+    finally:
+        os.close(fd)
+
+
+def test_platform_alias_fd_refuses_our_own_directory(tmp_path):
+    """A symlink planted in a directory writable by our uid -- the
+    situation every container-rootfs walk meets -- keeps being refused
+    outright: a planted link cannot be told apart from a platform one
+    there, so none of them is followed."""
+    fd = dirfd.opendir(str(tmp_path))
+    try:
+        exc = OSError(errno.ELOOP, "too many levels of symbolic links")
+        # tmp_path is owned by the test uid: _planted_here is True, so
+        # the alias resolution never happens, symlink or not.
+        assert dirfd._platform_alias_fd(fd, "anything", exc) is None
+    finally:
+        os.close(fd)

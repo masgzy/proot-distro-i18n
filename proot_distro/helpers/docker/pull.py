@@ -292,10 +292,12 @@ def _resolve_single_manifest(
     and empty for a tag: a tag names no content, so there is nothing a
     later cache hit could check the manifest against.
     """
-    log_info(f"Authenticating with registry{auth_note()}...")
+    log_info(_("Authenticating with registry{note}...",
+                note=auth_note()))
     token, base = get_auth_token(ref.repo, ref.registry, insecure=insecure)
 
-    log_info(f"Fetching manifest for '{image_ref}'...")
+    log_info(_("Fetching manifest for '{image_ref}'...",
+                image_ref=image_ref))
     if ref.digest:
         manifest, documents = _resolve_pinned(
             image_ref, ref.digest, arch,
@@ -307,7 +309,7 @@ def _resolve_single_manifest(
     manifest = _get_manifest(ref.repo, ref.tag, token, base, insecure)
     if _is_index(manifest):
         digest = _child_digest(manifest, arch, image_ref)
-        log_info(f"Fetching {arch} manifest...")
+        log_info(_("Fetching {arch} manifest...", arch=arch))
         manifest = _get_manifest(ref.repo, digest, token, base, insecure)
 
     return manifest, token, base, {}
@@ -551,8 +553,9 @@ def _cached_pin(image_ref: str, ref, arch: str) -> tuple:
             image_config = _parse_config(require_data_digest(
                 fetch(cfg_digest), cfg_digest, what="Image config blob"))
     except RuntimeError:
-        warn(f"The cached manifest for '{image_ref}' ({arch}) does not "
-             f"verify against its digest; fetching it again.")
+        warn(_("The cached manifest for '{image_ref}' ({arch}) does not "
+              "verify against its digest; fetching it again.",
+              image_ref=image_ref, arch=arch))
         return None, {}
     return manifest, image_config
 
@@ -577,10 +580,13 @@ def _pull_layers(image_ref, rootfs_fd, arch, insecure,
         usable.update(_usable_cached_layers(layers))
         missing = sum(1 for layer in layers if layer["digest"] not in usable)
         if not missing:
-            log_info(f"Image '{image_ref}' ({arch}) is cached.")
+            log_info(_("Image '{image_ref}' ({arch}) is cached.",
+                        image_ref=image_ref, arch=arch))
         else:
-            log_info(f"Downloading {missing} missing "
-                     f"layer(s) for '{image_ref}' ({arch})...")
+            log_info(_("Downloading {missing} missing layer(s) for "
+                        "'{image_ref}' ({arch})...",
+                        missing=missing, image_ref=image_ref,
+                        arch=arch))
             try:
                 log_info(_("Authenticating with registry{_arg0}...", _arg0 = auth_note()))
                 # token now holds the full Authorization value, not a bare
@@ -600,17 +606,21 @@ def _pull_layers(image_ref, rootfs_fd, arch, insecure,
                         ) from net_err
                     if net_err.code == 404:
                         raise RuntimeError(
-                            f"Image not found: '{image_ref}' does not "
-                            f"exist on the registry."
+                            _("Image not found: '{image_ref}' does not "
+                              "exist on the registry.",
+                              image_ref=image_ref)
                         ) from net_err
-                log_error(f"{missing} of {len(layers)} layer(s) for "
-                          f"'{image_ref}' ({arch}) are not in the local "
-                          f"cache.")
+                log_error(_("{missing} of {total} layer(s) for "
+                            "'{image_ref}' ({arch}) are not in the local "
+                            "cache.",
+                            missing=missing, total=len(layers),
+                            image_ref=image_ref, arch=arch))
                 raise RuntimeError(
-                    f"Network error: {net_err}\n"
-                    f"Tip: run '{PROGRAM_NAME} mirror test' to check "
-                    f"mirror reachability and switch to a faster one "
-                    f"with '{PROGRAM_NAME} mirror use <ID>'."
+                    _("Network error: {err}\n"
+                      "Tip: run '{prog} mirror test' to check mirror "
+                      "reachability and switch to a faster one with "
+                      "'{prog} mirror use <ID>'.",
+                      err=net_err, prog=PROGRAM_NAME)
                 ) from net_err
     else:
         # 缓存未命中 — 必须从 registry 拉取 manifest。
@@ -646,16 +656,18 @@ def _pull_layers(image_ref, rootfs_fd, arch, insecure,
                     ) from net_err
                 if net_err.code == 404:
                     raise RuntimeError(
-                        f"Image not found: '{image_ref}' does not exist "
-                        f"on the registry."
+                        _("Image not found: '{image_ref}' does not exist "
+                          "on the registry.",
+                          image_ref=image_ref)
                     ) from net_err
             log_error(_("No cached manifest found for '{image_ref}' ({arch}).",
                         image_ref = image_ref, arch = arch))
             raise RuntimeError(
-                f"Network error: {net_err}\n"
-                f"Tip: run '{PROGRAM_NAME} mirror test' to check "
-                f"mirror reachability and switch to a faster one "
-                f"with '{PROGRAM_NAME} mirror use <ID>'."
+                _("Network error: {err}\n"
+                  "Tip: run '{prog} mirror test' to check mirror "
+                  "reachability and switch to a faster one with "
+                  "'{prog} mirror use <ID>'.",
+                  err=net_err, prog=PROGRAM_NAME)
             ) from net_err
         if not ref.digest:
             image_config = _fetch_config_blob(
@@ -700,14 +712,18 @@ def _pull_layers(image_ref, rootfs_fd, arch, insecure,
         layer_fd = usable.get(digest)
         owned = layer_fd is None
         if not owned:
-            log_info(f"{short_id}: Layer {i + 1}/{n_layers} already cached, "
-                     f"skipping download.")
+            log_info(_("{short_id}: Layer {index}/{n_layers} already "
+                        "cached, skipping download.",
+                        short_id=short_id, index=i + 1,
+                        n_layers=n_layers))
         else:
             size = layer.get("size", 0)
             size_str = (f" ({fmt_size(size)})"
                         if isinstance(size, int) and size > 0 else "")
-            log_info(f"{short_id}: Downloading layer "
-                     f"{i + 1}/{n_layers}{size_str}...")
+            log_info(_("{short_id}: Downloading layer "
+                        "{index}/{n_layers}{size}...",
+                        short_id=short_id, index=i + 1,
+                        n_layers=n_layers, size=size_str))
             try:
                 layer_fd = download_blob(
                     repo, digest, token or "", base, insecure, size=size
@@ -735,9 +751,12 @@ def _pull_layers(image_ref, rootfs_fd, arch, insecure,
                         raise RuntimeError(
                             rate_limited_msg(image_ref, ref, dl_err)
                         ) from dl_err
-                raise RuntimeError(f"Network error: {dl_err}") from dl_err
+                raise RuntimeError(_("Network error: {err}",
+                                     err=dl_err)) from dl_err
 
-        log_info(f"{short_id}: Applying layer {i + 1}/{n_layers}...")
+        log_info(_("{short_id}: Applying layer {index}/{n_layers}...",
+                    short_id=short_id, index=i + 1,
+                    n_layers=n_layers))
         try:
             apply_layer(layer_fd, rootfs_fd, digest=digest)
         finally:

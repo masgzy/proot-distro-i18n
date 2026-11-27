@@ -420,7 +420,8 @@ def push_image(image_ref: str, arch: str, insecure: bool = False) -> dict:
             f"rebuild the image."
         )
 
-    log_info(_("Authenticating with registry{_arg0}...", _arg0 = auth_note()))
+    log_info(_("Authenticating with registry{note}...",
+                note=auth_note()))
     try:
         # Resolve the scheme/base for this registry. Under --allow-insecure a
         # bad certificate is tolerated and an HTTP-only registry falls back to
@@ -444,8 +445,10 @@ def push_image(image_ref: str, arch: str, insecure: bool = False) -> dict:
 
         try:
             if _blob_exists(repo, digest, token, base, insecure):
-                log_info(f"{short_id}: Layer {i + 1}/{n_layers} already "
-                         f"exists on registry, skipping upload.")
+                log_info(_("{short_id}: Layer {index}/{n_layers} already "
+                        "exists on registry, skipping upload.",
+                        short_id=short_id, index=i + 1,
+                        n_layers=n_layers))
                 continue
 
             # The registry hashes what we PUT and rejects a mismatch with
@@ -457,8 +460,10 @@ def push_image(image_ref: str, arch: str, insecure: bool = False) -> dict:
             src_fd = open_required_layer(digest)
             try:
                 size = os.fstat(src_fd).st_size
-                log_info(f"{short_id}: Uploading layer {i + 1}/{n_layers} "
-                         f"({fmt_size(size)})...")
+                log_info(_("{short_id}: Uploading layer {index}/{n_layers} "
+                        "({size})...",
+                        short_id=short_id, index=i + 1,
+                        n_layers=n_layers, size=fmt_size(size)))
                 _upload_blob_fd(
                     repo, digest, src_fd, token, base, insecure,
                     label=short_id,
@@ -475,11 +480,13 @@ def push_image(image_ref: str, arch: str, insecure: bool = False) -> dict:
     cfg_short = expected_cfg_digest.split(":")[-1][:12]
     try:
         if _blob_exists(repo, expected_cfg_digest, token, base, insecure):
-            log_info(f"{cfg_short}: Image config already exists on "
-                     f"registry, skipping upload.")
+            log_info(_("{short_id}: Image config already exists on "
+                        "registry, skipping upload.",
+                        short_id=cfg_short))
         else:
-            log_info(f"{cfg_short}: Uploading image config "
-                     f"({fmt_size(len(config_bytes))})...")
+            log_info(_("{short_id}: Uploading image config ({size})...",
+                        short_id=cfg_short,
+                        size=fmt_size(len(config_bytes))))
             _upload_blob_bytes(
                 repo, expected_cfg_digest, config_bytes, token, base, insecure,
             )
@@ -492,8 +499,8 @@ def push_image(image_ref: str, arch: str, insecure: bool = False) -> dict:
 
     manifest_media = manifest.get("mediaType") or OCI_MANIFEST_MEDIA
     manifest_bytes = canonical_json(_strip_private_keys(manifest))
-    log_info(f"Uploading manifest for tag '{tag}' "
-             f"({fmt_size(len(manifest_bytes))})...")
+    log_info(_("Uploading manifest for tag '{tag}' ({size})...",
+              tag=tag, size=fmt_size(len(manifest_bytes))))
     try:
         registry_digest = _put_manifest(
             repo, tag, manifest_bytes, manifest_media, token, base, insecure,

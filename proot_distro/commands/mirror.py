@@ -85,6 +85,7 @@ from typing import Optional
 from proot_distro.constants import PROGRAM_NAME
 from proot_distro.distro_mirror import (
     SUPPORTED_DISTROS, revert_distro_mirror, switch_distro_mirror,
+    mirror_provider_ids,
 )
 from proot_distro.i18n import _
 from proot_distro.locking import ContainerLock
@@ -692,6 +693,7 @@ def command_mirror(args) -> None:
         # 容器内软件源一键切换（国内镜像）。target 是容器名。
         rc = _action_distro(
             target or "", revert=bool(getattr(args, "revert", False)),
+            provider=getattr(args, "mirror_provider", None),
         )
     else:
         msg()
@@ -703,8 +705,9 @@ def command_mirror(args) -> None:
         sys.exit(rc)
 
 
-def _action_distro(target: str, revert: bool) -> int:
-    """``mirror distro <容器> [--revert]``：切源 / 还原。"""
+def _action_distro(target: str, revert: bool,
+                   provider: "str | None" = None) -> int:
+    """``mirror distro <容器> [--mirror 提供方] [--revert]``。"""
     if not target:
         msg()
         crit_error(_("a container name is required, e.g. '{example}'.",
@@ -712,6 +715,14 @@ def _action_distro(target: str, revert: bool) -> int:
         msg()
         log_info(_("supported distros: {supported}",
                    supported="; ".join(SUPPORTED_DISTROS)))
+        msg()
+        return 1
+    if provider is not None and provider not in mirror_provider_ids():
+        msg()
+        crit_error(_("unknown mirror provider '{provider}'. "
+                     "Available: {providers}.",
+                     provider=provider,
+                     providers=", ".join(mirror_provider_ids())))
         msg()
         return 1
     # 曾经漏了这层校验：``mirror distro ../..`` 的原始 ValueError 会
@@ -732,7 +743,7 @@ def _action_distro(target: str, revert: bool) -> int:
         if revert:
             ok = revert_distro_mirror(rootfs, target)
         else:
-            ok = switch_distro_mirror(rootfs, target)
+            ok = switch_distro_mirror(rootfs, target, provider=provider)
     return 0 if ok else 1
 
 

@@ -218,7 +218,7 @@ _COLORS = _build_colors()
 _EMPTY = {k: "" for k in _COLORS}
 
 
-def _init_colors() -> dict:
+def _init_colors(stream: str = "stderr") -> dict:
     """The C table for this run, or its no-color counterpart.
 
     NO_COLOR is the community convention (https://no-color.org/), present
@@ -226,6 +226,10 @@ def _init_colors() -> dict:
     program's own switch. Any of the four wins over everything. PD_FORCE_COLORS
     and FORCE_COLOR turn color on for a pipe or a CI log, where the TTY
     probe below would otherwise disable it.
+
+    *stream* picks which stream's TTY-ness decides (stderr by default,
+    "stdout" for the data-printing commands: their output is piped in
+    the classic `pd version | grep` even while stderr sits on a terminal).
     """
     env = os.environ
     if (env.get("NO_COLOR") is not None
@@ -235,8 +239,9 @@ def _init_colors() -> dict:
     forced = bool(env.get("PD_FORCE_COLORS")
                   or (env.get("FORCE_COLOR")
                       and env.get("FORCE_COLOR") != "0"))
+    probe_fd = sys.stdout if stream == "stdout" else sys.stderr
     try:
-        is_tty = sys.stderr.isatty()
+        is_tty = probe_fd.isatty()
     except (AttributeError, OSError, ValueError):
         is_tty = False
     if not (is_tty or forced):
@@ -245,6 +250,12 @@ def _init_colors() -> dict:
 
 
 C = _init_colors()
+
+# stdout 变体：数据输出命令（version 的版块）自己打印到 stdout，
+# stderr 的 TTY 探测管不到它们——`pd version | grep` 的经典场景里
+# stdout 是管道而 stderr 还在终端上，两者必须各自回答。开关与
+# _init_colors 同一套，只是 TTY 探测看 stdout。
+C_OUT = _init_colors(stream="stdout")
 
 
 def tty_safe_for_writes() -> bool:

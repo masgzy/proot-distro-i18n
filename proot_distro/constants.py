@@ -102,8 +102,13 @@ MANIFEST_CACHE_DIR = os.path.join(BASE_CACHE_DIR, "oci_manifests")
 # Defaults
 # ---------------------------------------------------------------------------
 
-DEFAULT_PRIMARY_NS = "8.8.8.8"
-DEFAULT_SECONDARY_NS = "8.8.4.4"
+# 静态兜底 DNS。上游 proot-distro 写的是 8.8.8.8/8.8.4.4，其 UDP 53
+# 在国内网络常被黑洞，是容器里 apt/apk 解析失败的根因（见
+# helpers/resolv.py）。本 fork 面向中文用户，静态兜底换成在 53 端口
+# 公网直发的阿里公共 DNS 与腾讯 DNSPod；宿主 resolv.conf 能读到时优
+# 先跟宿主，这两个只在所有探测都落空时兜底。
+DEFAULT_PRIMARY_NS = "223.5.5.5"    # AliDNS 阿里公共 DNS
+DEFAULT_SECONDARY_NS = "119.29.29.29"  # DNSPod 腾讯公共 DNS
 
 if IS_TERMUX:
     DEFAULT_PATH_ENV = (

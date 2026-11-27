@@ -196,3 +196,85 @@ def test_refresh_missing_etc_is_quiet(tmp_path):
         resolv.refresh_guest_dns(fd)
     finally:
         os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# Android probes (new): getprop properties and the default-route gateway,
+# and the CN-usable static fallback.
+# ---------------------------------------------------------------------------
+
+def test_android_prop_nameservers_parse_valid_props(monkeypatch):
+    calls = []
+
+    class FakeResult:
+        def __init__(self, out):
+            self.stdout = out
+
+    def fake_run(cmd, capture_output, text, timeout, check):
+        calls.append(cmd)
+        return FakeResult(
+            "0.0.0.0\n" if cmd[1] == "net.dns2" else "192.168.43.1\n")
+
+    monkeypatch.setattr(resolv.subprocess, "run", fake_run)
+    monkeypatch.setattr(resolv.os, "access",
+                        lambda p, m: p == "/system/bin/getprop")
+    # getprop returns "0.0.0.0" for every unset prop; only the first
+    # probe's value is real. The 0.0.0.0 answers must be dropped.
+    assert resolv._android_prop_nameservers() == ["192.168.43.1"]
+    assert len(calls) == len(resolv._ANDROID_DNS_PROPS)
+
+
+def test_android_prop_nameservers_without_getprop(monkeypatch):
+    # shutil is imported inside the function (lazy), so the patch
+    # targets the module it lives in, not proot_distro.helpers.resolv.
+    monkeypatch.setattr(resolv.os, "access", lambda p, m: False)
+    import shutil
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    assert resolv._android_prop_nameservers() == []
+
+
+def test_default_route_gateway_reads_proc_net_route(tmp_path):
+    route = tmp_path / "route"
+    # The kernel prints the gateway as the little-endian u32 in hex:
+    # 192.168.1.1 is 0101A8C0 in /proc/net/route.
+    # Destination 00000000 is the default route; the second line (a
+    # non-default route) is skipped; a 00000000 gateway is dropped.
+    route.write_text(
+        "Iface\tDestination\tGateway\tFlags\n"
+        "wlan0\t00000000\t0101A8C0\t0003\n"
+        "wlan0\tC0A80000\t00000000\t0001\n")
+    import builtins
+    real_open = builtins.open
+
+    def fake_open(path, *a, **k):
+        if str(path) == "/proc/net/route":
+            return real_open(route)
+        return real_open(path, *a, **k)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(builtins, "open", fake_open)
+        assert resolv._default_route_gateway() == ["192.168.1.1"]
+
+
+def test_default_route_gateway_offline_or_ipv6():
+    import builtins
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(builtins, "open",
+                   lambda *a, **k: (_ for _ in ()).throw(OSError(2, "no")))
+        assert resolv._default_route_gateway() == []
+
+
+def test_static_fallback_is_cn_usable():
+    # The upstream 8.8.8.8/8.8.4.4 pair is blackholed on UDP 53 in the
+    # CN networks this fork targets; the static fallback must be the
+    # AliDNS/DNSPod pair.
+    assert (DEFAULT_PRIMARY_NS, DEFAULT_SECONDARY_NS) == \
+        ("223.5.5.5", "119.29.29.29")
+
+
+def test_legacy_upstream_template_is_also_managed():
+    # An install made by upstream (or the fork before 5.10.4) wrote the
+    # 8.8.8.8/8.8.4.4 template; login's refresh must recognize it as
+    # our file so it gets rewritten to the current decision.
+    assert resolv.is_managed_resolv_conf(
+        "nameserver 8.8.8.8\nnameserver 8.8.4.4\n")

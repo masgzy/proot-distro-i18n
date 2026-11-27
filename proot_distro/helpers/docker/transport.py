@@ -69,6 +69,7 @@ import urllib.parse
 import urllib.request
 
 from proot_distro.constants import PROGRAM_NAME, PROGRAM_VERSION
+from proot_distro.i18n import _
 from proot_distro.message import quote_path
 from proot_distro.helpers.download import (
     NETWORK_ERRORS,
@@ -426,33 +427,36 @@ def _http_registry_reachable(registry: str, timeout: float = 6.0) -> bool:
 def auth_denied_msg(image_ref: str, code: int) -> str:
     """Return a descriptive error string for 401/403 registry responses."""
     if os.environ.get("PD_DOCKER_AUTH"):
-        return (
-            f"Access denied to '{image_ref}' (HTTP {code}). "
-            f"Check that PD_DOCKER_AUTH=username:password is correct "
-            f"and the account has pull access to the image."
+        return _(
+            "Access denied to '{image_ref}' (HTTP {code}). Check that "
+            "PD_DOCKER_AUTH=username:password is correct and the account "
+            "has pull access to the image.",
+            image_ref=image_ref, code=code,
         )
     # Public image got 401/403 — most likely the mirror is misbehaving
     # or the image name is wrong. Don't tell the user it's "private"
     # because that's misleading for official images like 'ubuntu'.
-    return (
-        f"Access denied to '{image_ref}' (HTTP {code}). "
-        f"This is a public image — the mirror may not have it cached, "
-        f"or the image name may be wrong.\n"
-        f"Try: 1) {PROGRAM_NAME} mirror test --use-best  (switch to a working mirror)\n"
-        f"      2) Use full reference like 'library/ubuntu:latest' or 'ubuntu:24.04'\n"
-        f"      3) For private images, set PD_DOCKER_AUTH=username:password"
+    return _(
+        "Access denied to '{image_ref}' (HTTP {code}). This is a public "
+        "image — the mirror may not have it cached, or the image name "
+        "may be wrong.\n"
+        "Try: 1) {prog} mirror test --use-best  (switch to a working mirror)\n"
+        "      2) Use full reference like 'library/ubuntu:latest' or "
+        "'ubuntu:24.04'\n"
+        "      3) For private images, set PD_DOCKER_AUTH=username:password",
+        image_ref=image_ref, code=code, prog=PROGRAM_NAME,
     )
 
 
 def _wait_text(seconds: float) -> str:
     """A Retry-After, rounded to what a person would say."""
     if not math.isfinite(seconds) or seconds >= 86400:
-        return "more than a day"
+        return _("more than a day")
     if seconds >= 5400:
-        return f"about {round(seconds / 3600)} hours"
+        return _("about {n} hours", n=round(seconds / 3600))
     if seconds >= 90:
-        return f"about {round(seconds / 60)} minutes"
-    return f"{math.ceil(seconds)} seconds"
+        return _("about {n} minutes", n=round(seconds / 60))
+    return _("{n} seconds", n=math.ceil(seconds))
 
 
 def _relays_docker_hub(registry: str, exc: urllib.error.HTTPError) -> bool:
@@ -497,60 +501,73 @@ def rate_limited_msg(
     """
     pulling = action == "pull"
     registry = ref.registry
-    who = f"Registry '{registry}'" if registry else "Docker Hub"
-    text = (
-        f"{who} refused to {'serve' if pulling else 'accept'} "
-        f"'{image_ref}' (HTTP 429 Too Many Requests): its rate limit is "
-        f"reached"
+    who = _("Registry '{registry}'", registry=registry) if registry \
+        else _("Docker Hub")
+    verb = _("serve") if pulling else _("accept")
+    text = _(
+        "{who} refused to {verb} '{image_ref}' (HTTP 429 Too Many "
+        "Requests): its rate limit is reached",
+        who=who, verb=verb, image_ref=image_ref,
     )
     wait = retry_after(exc)
-    when = f"in {_wait_text(wait)}" if wait else "later"
+    when = (_("in {t}", t=_wait_text(wait)) if wait
+            else _("later"))
     if os.environ.get("PD_DOCKER_AUTH"):
-        return f"{text} for the account in PD_DOCKER_AUTH. Try again {when}."
-    hub_account = (
-        f"set PD_DOCKER_AUTH=username:password to {action} with a Docker "
-        f"Hub account, which has a limit of its own"
+        return _("{text} for the account in PD_DOCKER_AUTH. Try again "
+                 "{when}.", text=text, when=when)
+    hub_account = _(
+        "set PD_DOCKER_AUTH=username:password to {action} with a Docker "
+        "Hub account, which has a limit of its own",
+        action=action,
     )
     if not registry:
-        why = (
-            "Docker Hub limits anonymous pulls per network address, which "
-            "mobile and shared networks give to many people at once. "
-            if pulling else ""
-        )
-        return f"{text}. {why}Try again {when}, or {hub_account}."
+        why = _(
+            "Docker Hub limits anonymous pulls per network address, "
+            "which mobile and shared networks give to many people at "
+            "once. "
+        ) if pulling else ""
+        return _("{text} {why}Try again {when}, or {hub_account}.",
+                 text=text, why=why, when=when, hub_account=hub_account)
     if _relays_docker_hub(registry, exc):
-        shared = (
-            f"{text}. '{registry}' passes requests on to Docker Hub, and "
-            f"everyone using it anonymously shares one Docker Hub limit."
+        shared = _(
+            "{text}. '{registry}' passes requests on to Docker Hub, and "
+            "everyone using it anonymously shares one Docker Hub limit.",
+            text=text, registry=registry,
         )
         if not pulling:
-            return f"{shared} Try again {when}, or {hub_account}."
+            return _("{shared} Try again {when}, or {hub_account}.",
+                     shared=shared, when=when, hub_account=hub_account)
         hub_ref = ref._replace(registry="").canonical
-        return (
-            f"{shared} If the image is published on Docker Hub too, "
-            f"install it from there: '{hub_ref}'. Otherwise try again "
-            f"{when}, or {hub_account}."
+        return _(
+            "{shared} If the image is published on Docker Hub too, "
+            "install it from there: '{hub_ref}'. Otherwise try again "
+            "{when}, or {hub_account}.",
+            shared=shared, hub_ref=hub_ref, when=when,
+            hub_account=hub_account,
         )
-    return (
-        f"{text}. Try again {when}, or set "
-        f"PD_DOCKER_AUTH=username:password to {action} with an account; "
-        f"registries usually allow signed-in users more."
+    return _(
+        "{text}. Try again {when}, or set "
+        "PD_DOCKER_AUTH=username:password to {action} with an account; "
+        "registries usually allow signed-in users more.",
+        text=text, when=when, action=action,
     )
 
 
 def push_denied_msg(image_ref: str, code: int) -> str:
     """Return a context-sensitive error string for 401/403 on push."""
     if os.environ.get("PD_DOCKER_AUTH"):
-        return (
-            f"Push denied for '{image_ref}' (HTTP {code}). "
-            f"Check that PD_DOCKER_AUTH=username:password is correct "
-            f"and the account has push access to the repository."
+        return _(
+            "Push denied for '{image_ref}' (HTTP {code}). Check that "
+            "PD_DOCKER_AUTH=username:password is correct and the account "
+            "has push access to the repository.",
+            image_ref=image_ref, code=code,
         )
-    return (
-        f"Push denied for '{image_ref}' (HTTP {code}). "
-        f"Set PD_DOCKER_AUTH=username:password to authenticate, or, "
-        f"for self-hosted registries that allow anonymous push, check "
-        f"the registry configuration."
+    return _(
+        "Push denied for '{image_ref}' (HTTP {code}). Set "
+        "PD_DOCKER_AUTH=username:password to authenticate, or, for "
+        "self-hosted registries that allow anonymous push, check the "
+        "registry configuration.",
+        image_ref=image_ref, code=code,
     )
 
 
@@ -928,5 +945,5 @@ def auth_note(prefix_space: bool = True) -> str:
     """Return ' (user credentials)' or ' (anonymous)' for log lines."""
     head = " " if prefix_space else ""
     if os.environ.get("PD_DOCKER_AUTH"):
-        return f"{head}(user credentials)"
-    return f"{head}(anonymous)"
+        return f"{head}{_('(user credentials)')}"
+    return f"{head}{_('(anonymous)')}"

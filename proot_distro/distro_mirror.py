@@ -74,7 +74,11 @@ from proot_distro.i18n import _
 from proot_distro.message import log_error, log_info, msg, warn
 
 __all__ = (
-    "SUPPORTED_DISTROS", "revert_distro_mirror", "switch_distro_mirror",
+    "DEFAULT_MIRROR_PROVIDER", "SUPPORTED_DISTROS",
+    "mirror_provider_host", "mirror_provider_ids",
+    "mirror_provider_label", "mirror_provider_supports",
+    "resolve_provider_for_family", "revert_distro_mirror",
+    "switch_distro_mirror",
 )
 _BAK_SUFFIX = ".pd.bak"
 _TMP_SUFFIX = ".pd.tmp"
@@ -85,21 +89,144 @@ _TMP_SUFFIX = ".pd.tmp"
 _UNIQUE_TMP = ".{pid}.{rnd}"
 
 # ---------------------------------------------------------------------------
-# 镜像源表：家族 -> (镜像显示名, 文本替换规则)。
-# 规则一律整段 "scheme://origin" -> "scheme://mirror/路径"，保持镜像站
-# 与官方源的目录同构，只动主机名与协议，不重排 suite/components。
+# 镜像源提供方：8 家站点，一个注册表。
+#
+# 所有站点均于 2026-11-21 逐目录 HEAD 探测核对（debian / debian-security
+# / ubuntu / ubuntu-ports / kali / alpine / archlinux / manjaro / fedora
+# / rockylinux / almalinux / opensuse / voidlinux / gentoo），布局一致的
+# 才进表；个别站点缺哪个家族，表里就是 None，切换时会落到别家并说明。
+#
+# CERNET（mirrors.cernet.edu.cn）是教育网联合镜像站（MirrorZ）：按
+# 请求来源网络 302 就近调度到成员站点，路径布局与各成员一致，apt/apk/
+# dnf/pacman 跟随重定向没有额外代价。
+#
 # ---------------------------------------------------------------------------
 
-_ALIYUN = "mirrors.aliyun.com"
-_TUNA = "mirrors.tuna.tsinghua.edu.cn"
+# id -> (中文显示名, 主机名)。默认清华（用户指定 distro 默认清华源）。
+_MIRROR_HOSTS = {
+    "tuna":    ("清华大学（TUNA）", "mirrors.tuna.tsinghua.edu.cn"),
+    "bfsu":    ("北京外国语大学", "mirrors.bfsu.edu.cn"),
+    "nju":     ("南京大学", "mirrors.nju.edu.cn"),
+    "ustc":    ("中国科学技术大学", "mirrors.ustc.edu.cn"),
+    "cernet":  ("教育网联合镜像站（CERNET，就近调度）",
+                "mirrors.cernet.edu.cn"),
+    "aliyun":  ("阿里云", "mirrors.aliyun.com"),
+    "huawei":  ("华为云", "repo.huaweicloud.com"),
+    "tencent": ("腾讯云", "mirrors.cloud.tencent.com"),
+}
+
+DEFAULT_MIRROR_PROVIDER = "tuna"
+
+# 家族 -> 每个提供方上的 URL 前缀（"" = 与官方路径同构，直接换主机名；
+# None = 该站不镜像此家族）。apt 一栏覆盖 debian/ubuntu/kali 的全部
+# 官方域名（含 ubuntu-ports、debian-security）。
+_PROVIDER_FAMILIES = {
+    "tuna": {
+        "apt": "", "alpine": "", "suse": "/opensuse", "arch": "/archlinux",
+        "manjaro": "/manjaro", "fedora": "", "rocky": None,
+        "almalinux": None, "void": "/voidlinux", "gentoo": "/gentoo",
+    },
+    "bfsu": {
+        "apt": "", "alpine": "", "suse": "/opensuse", "arch": "/archlinux",
+        "manjaro": None, "fedora": "", "rocky": None,
+        "almalinux": None, "void": "/voidlinux", "gentoo": "/gentoo",
+    },
+    "nju": {
+        "apt": "", "alpine": "", "suse": "/opensuse", "arch": "/archlinux",
+        "manjaro": "/manjaro", "fedora": "", "rocky": None,
+        "almalinux": "/almalinux", "void": "/voidlinux", "gentoo": "/gentoo",
+    },
+    "ustc": {
+        "apt": "", "alpine": "", "suse": "/opensuse", "arch": "/archlinux",
+        "manjaro": "/manjaro", "fedora": "", "rocky": None,
+        "almalinux": None, "void": None, "gentoo": "/gentoo",
+    },
+    "cernet": {
+        "apt": "", "alpine": "", "suse": "/opensuse", "arch": "/archlinux",
+        "manjaro": "/manjaro", "fedora": "", "rocky": "/rockylinux",
+        "almalinux": "/almalinux", "void": "/voidlinux", "gentoo": "/gentoo",
+    },
+    "aliyun": {
+        "apt": "", "alpine": "", "suse": "/opensuse", "arch": "/archlinux",
+        "manjaro": "/manjaro", "fedora": "", "rocky": "/rockylinux",
+        "almalinux": "/almalinux", "void": None, "gentoo": None,
+    },
+    "huawei": {
+        "apt": "", "alpine": "", "suse": "/opensuse", "arch": "/archlinux",
+        "manjaro": "/manjaro", "fedora": "", "rocky": "/rockylinux",
+        "almalinux": "/almalinux", "void": "/voidlinux", "gentoo": "/gentoo",
+    },
+    "tencent": {
+        "apt": "", "alpine": "", "suse": "/opensuse", "arch": "/archlinux",
+        "manjaro": "/manjaro", "fedora": "", "rocky": None,
+        "almalinux": "/almalinux", "void": None, "gentoo": "/gentoo",
+    },
+}
+
+# 请求的提供方不镜像某家族时的回退链：默认（清华）→ 华为云（实测唯一
+# 8 家全覆盖的商业站）→ CERNET（教育网聚合，同样全覆盖）。每条家族都
+# 在链上找得到归宿，切换永不因“选了北外装 Manjaro”而无源可用。
+_PROVIDER_FALLBACKS = ("huawei", "cernet")
+
+_MIRROR_PROVIDER_IDS = tuple(_MIRROR_HOSTS)
 
 
-def _pair_rules(domains, mirror):
-    """http(s)://<每个官方域名> -> https://<镜像> 的替换对。"""
+def mirror_provider_ids() -> tuple:
+    """可选择的镜像提供方 id（展示顺序即此顺序，默认清华排首位）。"""
+    return _MIRROR_PROVIDER_IDS
+
+
+def mirror_provider_label(provider_id: str) -> str:
+    """提供方的中文显示名；未知 id 返回中性占位。"""
+    entry = _MIRROR_HOSTS.get(provider_id)
+    return entry[0] if entry else provider_id
+
+
+def mirror_provider_host(provider_id: str) -> "str | None":
+    """提供方主机名；未知 id 返回 None。"""
+    entry = _MIRROR_HOSTS.get(provider_id)
+    return entry[1] if entry else None
+
+
+def mirror_provider_supports(provider_id: str, family: str) -> bool:
+    """该提供方是否镜像这个家族（apt/alpine/arch/...）。"""
+    families = _PROVIDER_FAMILIES.get(provider_id)
+    return bool(families) and families.get(family) is not None
+
+
+def _family_prefix(provider_id: str, family: str) -> str:
+    """该提供方上此家族的 URL 前缀；不镜像时为 None。"""
+    families = _PROVIDER_FAMILIES.get(provider_id)
+    if not families:
+        return None
+    return families.get(family)
+
+
+def resolve_provider_for_family(provider_id: "str | None", family: str):
+    """为 *family* 选出实际使用的提供方。
+
+    返回 ``(provider_id, fell_back)``。*provider_id* 为 None 时取默认
+    （清华）。所请求的站点不镜像该家族时按 ``_PROVIDER_FALLBACKS``
+    落到别家（fell_back=True，调用方负责把“选了 A、用了 B”讲清楚）；
+    链上全都没有（不可能发生——每条家族都被至少两家覆盖）时退回默认
+    提供方本身。
+    """
+    requested = provider_id or DEFAULT_MIRROR_PROVIDER
+    if mirror_provider_supports(requested, family):
+        return requested, False
+    for candidate in (DEFAULT_MIRROR_PROVIDER,) + _PROVIDER_FALLBACKS:
+        if candidate != requested and \
+                mirror_provider_supports(candidate, family):
+            return candidate, True
+    return DEFAULT_MIRROR_PROVIDER, True
+
+
+def _pair_rules(domains, mirror_base):
+    """http(s)://<每个官方域名> -> <mirror_base> 的替换对。"""
     rules = []
     for domain in domains:
-        rules.append((f"http://{domain}", f"https://{mirror}"))
-        rules.append((f"https://{domain}", f"https://{mirror}"))
+        rules.append((f"http://{domain}", mirror_base))
+        rules.append((f"https://{domain}", mirror_base))
     return rules
 
 
@@ -109,27 +236,19 @@ _APT_DOMAINS = [
     "http.kali.org",
 ]
 
-_DOMAIN_RULES: dict = {
-    "apt": _pair_rules(_APT_DOMAINS, _ALIYUN),
-    "alpine": _pair_rules(["dl-cdn.alpinelinux.org"], _ALIYUN),
-    "suse": _pair_rules(["download.opensuse.org"], f"{_ALIYUN}/opensuse"),
-    "void": _pair_rules(
-        ["repo-default.voidlinux.org", "repo.voidlinux.org",
-         "alpha.de.repo.voidlinux.org"], f"{_TUNA}/voidlinux",
-    ),
-}
+_ALPINE_DOMAINS = ["dl-cdn.alpinelinux.org"]
+_SUSE_DOMAINS = ["download.opensuse.org"]
+_VOID_DOMAINS = [
+    "repo-default.voidlinux.org", "repo.voidlinux.org",
+    "alpha.de.repo.voidlinux.org",
+]
 
-_MIRROR_LABEL = {
-    "apt": "阿里云",
-    "alpine": "阿里云",
-    "suse": "阿里云",
-    "void": "清华大学",
-    "arch": "阿里云",
-    "manjaro": "阿里云",
-    "fedora": "阿里云",
-    "rocky": "阿里云",
-    "almalinux": "阿里云",
-    "gentoo": "清华大学",
+# 家族的官方域名清单（域替换型家族）。
+_FAMILY_DOMAINS = {
+    "apt": _APT_DOMAINS,
+    "alpine": _ALPINE_DOMAINS,
+    "suse": _SUSE_DOMAINS,
+    "void": _VOID_DOMAINS,
 }
 
 # os-release 的 ID -> 家族。ID_LIKE 兜底走 _FAMILY_BY_LIKE。
@@ -449,26 +568,35 @@ def _switchable_name(prefix: str, name: str) -> bool:
     return False
 
 
-def _rewrite_for_family(family: str, text: str, filename: str = "") -> "str | None":
+def _rewrite_for_family(family: str, text: str, filename: str = "",
+                        provider: "str | None" = None) -> "str | None":
     """The switched text for *family*, or None when nothing matched.
 
     *filename* 供需要按文件区分处理的家族（Fedora）判断自己面对
-    的是哪一个 repo 文件。
+    的是哪一个 repo 文件；*provider* 是镜像提供方 id（None = 默认
+    清华，见 ``resolve_provider_for_family``）。
     """
-    if family in _DOMAIN_RULES:
-        rules = _DOMAIN_RULES[family]
+    chosen, _fell_back = resolve_provider_for_family(provider, family)
+    host = mirror_provider_host(chosen)
+    if host is None:
+        return None
+    prefix = _family_prefix(chosen, family)
+    mirror_base = f"https://{host}{prefix}"
+
+    if family in _FAMILY_DOMAINS:
+        rules = _pair_rules(_FAMILY_DOMAINS[family], mirror_base)
         if not any(old in text for old, _new in rules):
             return None
         return _replace_domains(text, rules)
     if family in ("arch", "manjaro"):
         if family == "arch":
             # Arch 官方布局：<mirror>/archlinux/$repo/os/$arch。
-            server = f"https://{_ALIYUN}/archlinux/$repo/os/$arch"
+            server = f"{mirror_base}/$repo/os/$arch"
         else:
             # Manjaro 的仓库布局与 Arch 不同：<mirror>/manjaro/<branch>/
             # $repo/$arch——没有 /os/（那是 Arch 的目录层级）。曾经照抄
             # Arch 的 /os/，切完后 pacman 全部 404。
-            server = f"https://{_ALIYUN}/manjaro/stable/$repo/$arch"
+            server = f"{mirror_base}/stable/$repo/$arch"
         body = (
             f"# 由 proot-distro-i18n 切换到国内镜像（{server}）\n"
             f"# 原始文件已备份为 mirrorlist{_BAK_SUFFIX}\n"
@@ -476,7 +604,7 @@ def _rewrite_for_family(family: str, text: str, filename: str = "") -> "str | No
         )
         return body
     if family == "fedora":
-        return _rewrite_fedora(text, filename)
+        return _rewrite_fedora(text, filename, provider=chosen)
     if family in ("rocky", "almalinux"):
         bases = (
             [f"https://dl.rockylinux.org/$contentdir",
@@ -485,8 +613,7 @@ def _rewrite_for_family(family: str, text: str, filename: str = "") -> "str | No
             else [f"https://repo.almalinux.org/almalinux",
                   f"http://repo.almalinux.org/almalinux"]
         )
-        mirror = f"https://{_ALIYUN}/rockylinux" if family == "rocky" \
-            else f"https://{_ALIYUN}/almalinux"
+        mirror = mirror_base
         out = []
         touched = False
         for line in text.splitlines():
@@ -512,9 +639,18 @@ def _rewrite_for_family(family: str, text: str, filename: str = "") -> "str | No
             return None
         return "\n".join(out) + "\n"
     if family == "gentoo":
+        # GENTOO_MIRRORS 惯例写两个（portage 择优选）：所选提供方 +
+        # 一个也镜像 gentoo 的回退站；所选站不镜像 gentoo 时（阿里云）
+        # resolve 已经换了，这里拿到的一定是镜像它的那家。
+        secondary_id = next(
+            (pid for pid in (DEFAULT_MIRROR_PROVIDER,) + _PROVIDER_FALLBACKS
+             if pid != chosen and mirror_provider_supports(pid, "gentoo")),
+            DEFAULT_MIRROR_PROVIDER,
+        )
+        secondary_host = mirror_provider_host(secondary_id) or host
         mirror_line = (
-            f'GENTOO_MIRRORS="https://{_TUNA}/gentoo '
-            f'https://{_ALIYUN}/gentoo"'
+            f'GENTOO_MIRRORS="{mirror_base} '
+            f'https://{secondary_host}/gentoo"'
         )
         out = []
         replaced = False
@@ -534,7 +670,8 @@ def _rewrite_for_family(family: str, text: str, filename: str = "") -> "str | No
 # Fedora 专属适配器（逐文件）
 # ---------------------------------------------------------------------------
 
-def _rewrite_fedora(text: str, filename: str) -> "str | None":
+def _rewrite_fedora(text: str, filename: str,
+                   provider: "str | None" = None) -> "str | None":
     """Fedora 的逐文件重写：只处理本程序能映射的那两个官方 repo。
 
     曾经的实现是“文件里出现 fedoraproject.org 就整文件换成一段
@@ -546,8 +683,15 @@ def _rewrite_fedora(text: str, filename: str) -> "str | None":
       （其余文件一律不动）；
     * 生成的段沿用该文件自己的 repo id 与官方密钥路径
       （``file:///etc/pki/rpm-gpg/...``，镜像站不必可信赖地托管密钥）；
-    * updates 走 fedora-updates 布局，base 走 releases 布局。
+    * updates 走 fedora-updates 布局，base 走 releases 布局；
+    * *provider* 决定镜像主机（默认清华），两个布局对每个提供方
+      都是 ``<mirror>/fedora/...`` 同构。
     """
+    chosen, _fell_back = resolve_provider_for_family(provider, "fedora")
+    host = mirror_provider_host(chosen)
+    if host is None:
+        return None
+    label = mirror_provider_label(chosen)
     ids = [line.strip()[1:-1].strip().lower()
            for line in text.splitlines()
            if line.strip().startswith("[") and line.strip().endswith("]")]
@@ -562,19 +706,19 @@ def _rewrite_fedora(text: str, filename: str) -> "str | None":
         return None
     updates = repo_id in ("fedora-updates", "updates")
     if updates:
-        base = (f"https://{_ALIYUN}/fedora/updates/$releasever/"
+        base = (f"https://{host}/fedora/updates/$releasever/"
                 f"Everything/$basearch/Packages/")
         name = "Fedora $releasever - Updates - $basearch"
         key = ("file:///etc/pki/rpm-gpg/"
                "RPM-GPG-KEY-fedora-$releasever-primary")
     else:
-        base = (f"https://{_ALIYUN}/fedora/releases/$releasever/"
+        base = (f"https://{host}/fedora/releases/$releasever/"
                 f"Everything/$basearch/os/")
         name = "Fedora $releasever - $basearch"
         key = ("file:///etc/pki/rpm-gpg/"
                "RPM-GPG-KEY-fedora-$releasever-primary")
     body = (
-        f"#{repo_id}（由 proot-distro-i18n 切换到阿里云镜像）\n"
+        f"#{repo_id}（由 proot-distro-i18n 切换到{label}镜像）\n"
         f"[{repo_id}]\n"
         f"name={name}\n"
         f"baseurl={base}\n"
@@ -588,7 +732,8 @@ def _rewrite_fedora(text: str, filename: str) -> "str | None":
 
 def switch_distro_mirror(rootfs: str, container_name: str,
                          dist_names: "set | None" = None, *,
-                         root_fd: int = None) -> bool:
+                         root_fd: int = None,
+                         provider: "str | None" = None) -> bool:
     """Switch *container_name*'s package sources to a Chinese mirror.
 
     *rootfs* is the container's rootfs path; *dist_names* is the set of
@@ -597,6 +742,9 @@ def switch_distro_mirror(rootfs: str, container_name: str,
     *root_fd* 是调用方钉住的 rootfs 描述符（install 在持有描述符的
     try 块里直接传，避免闭锁后按名字重解一次客人可换的路径）；
     None 时才按名字打开。
+    *provider* 是镜像提供方 id（``tuna``/``bfsu``/``nju``/``ustc``/
+    ``cernet``/``aliyun``/``huawei``/``tencent``）；None 时取默认清华。
+    所选站不镜像此家族时按回退链落到别家，并提示"选了 A、用了 B"。
 
     Returns True when at least one source file was rewritten **or
     nothing needed doing**（已指向国内镜像的重复执行是幂等成功，
@@ -632,7 +780,14 @@ def switch_distro_mirror(rootfs: str, container_name: str,
                    "skipping the switch."))
             return False
 
-        label = _MIRROR_LABEL.get(family, "国内")
+        chosen, fell_back = resolve_provider_for_family(provider, family)
+        label = mirror_provider_label(chosen)
+        if fell_back:
+            warn(_("the {requested} mirror does not carry this distro; "
+                   "falling back to the {actual} mirror.",
+                   requested=mirror_provider_label(
+                       provider or DEFAULT_MIRROR_PROVIDER),
+                   actual=label))
         log_info(_("switching {container}'s package sources to the "
                    "{label} mirror...",
                    container=container_name, label=label))
@@ -645,7 +800,8 @@ def switch_distro_mirror(rootfs: str, container_name: str,
                 original = _read_at(target_fd, name)
                 if original is None:
                     continue
-                rewritten = _rewrite_for_family(family, original, name)
+                rewritten = _rewrite_for_family(family, original, name,
+                                                 provider=chosen)
                 if rewritten is None or rewritten == original:
                     continue
                 if not _backup_at(target_fd, name, original):

@@ -39,10 +39,17 @@
 
 1. ``pd setting put dns <ip[,ip...]>`` ——用户显式固定（最多 3 个，
    见下）；
-2. 否则**宿主的 resolv.conf**：Termux 上先看 ``$PREFIX/etc/resolv.conf``
-   再看 ``/etc/resolv.conf``，桌面直接看 ``/etc/resolv.conf``；读出的
-   nameserver 逐个用 ``ipaddress`` 校验后采用；
-3. 都没有才落回静态默认（8.8.8.8/8.8.4.4，上游的旧值）。
+2. 否则**宿主自己的解析配置**，逐级下探：
+
+   * Termux 上 ``$PREFIX/etc/resolv.conf``，其次宿主 ``/etc/resolv.conf``
+     （跟 Termux/桌面各自的实际布局对应）；
+   * Android 系统属性（``getprop net.dns1`` 等，老 ROM 与部分 OEM
+     上有效）；
+   * IPv4 默认路由的网关（``/proc/net/route``）：Wi-Fi 下路由器
+     几乎总在 53 端口上跑一个转发器；
+3. 都没有才落回静态默认（阿里公共 DNS + 腾讯 DNSPod，见
+   constants.py：本 fork 面向中文网络，Google 8.8.8.8 的 UDP 53
+   在国内常被黑洞，正是旧版 apk/apt 解析失败的根因）。
 
 写入带标记行（``_MANAGED_PREFIX``）；``login`` 在每次会话开始时按
 当前决策**刷新**客人的 resolv.conf，但只刷自己写的文件——一旦
@@ -60,6 +67,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import subprocess
 
 from proot_distro import dirfd
 from proot_distro.constants import (
@@ -89,19 +97,42 @@ _MAX_NS = 3
 _READ_LIMIT = 64 * 1024
 
 # 旧版（无标记行）安装写进客人的静态模板，刷新时同样识别为"我们的"。
+# 两代都认：新静态默认（223.5.5.5/119.29.29.29）与上游继承的旧值
+# （8.8.8.8/8.8.4.4）——升级后 login 才能把旧版装出的容器也刷新掉。
 _LEGACY_TEMPLATE = (
     f"nameserver {DEFAULT_PRIMARY_NS}\n"
     f"nameserver {DEFAULT_SECONDARY_NS}\n"
 )
+_LEGACY_UPSTREAM_TEMPLATE = (
+    "nameserver 8.8.8.8\n"
+    "nameserver 8.8.4.4\n"
+)
+
+# Android 系统属性里可能带 nameserver 的那几个（老 ROM / 部分 OEM）。
+# 逐个读 ``getprop``，值要么是 IP 要么为空，无效值静默丢弃。
+_ANDROID_DNS_PROPS = (
+    "net.dns1", "net.dns2",
+    "dhcp.wlan0.dns1", "dhcp.wlan0.dns2",
+    "net.rmnet0.dns1", "net.rmnet0.dns2",
+)
+
+# getprop 的候选路径：宿主 Termux 的 PATH 不一定带 /system/bin。
+_GETPROPS = ("/system/bin/getprop", "/system/xbin/getprop")
 
 
 def host_nameservers() -> list:
     """宿主当前在用的 nameserver 列表（已校验，最多 3 个）。
 
-    Termux 上优先 ``$PREFIX/etc/resolv.conf``（termux 环境自带的解析
-    配置），其次宿主的 ``/etc/resolv.conf``；桌面 Linux 上就一个候选。
-    第一个能读出合法 nameserver 的文件胜出。读入封顶 64 KiB——
-    ``/etc/resolv.conf`` 正常不过百来字节，再多就是异常输入。
+    Termux 上按序下探，第一个读出合法 nameserver 的来源胜出：
+
+    1. ``$PREFIX/etc/resolv.conf``（termux 环境自带的解析配置）；
+    2. Android 系统属性 ``net.dns1`` 等（``getprop``，老 ROM 与部分
+       OEM 上有效；新 Android 常为空）；
+    3. IPv4 默认路由的网关（Wi-Fi 路由器几乎总跑 53 端口的转发器）；
+
+    桌面 Linux 上读宿主的 ``/etc/resolv.conf``。读入封顶 64 KiB
+    ——``/etc/resolv.conf`` 正常不过百来字节，再多就是异常输入。
+    每一级都拿不到才交给静态默认（见 effective_nameservers）。
     """
     for path in _candidate_paths():
         text = _read_host_file(path)
@@ -110,6 +141,11 @@ def host_nameservers() -> list:
         servers = _parse_nameservers(text)
         if servers:
             return servers[:_MAX_NS]
+    if IS_TERMUX:
+        for probe in (_android_prop_nameservers, _default_route_gateway):
+            servers = probe()
+            if servers:
+                return servers[:_MAX_NS]
     return []
 
 
@@ -146,6 +182,78 @@ def _parse_nameservers(text: str) -> list:
     return out[:_MAX_NS]
 
 
+def _android_prop_nameservers() -> list:
+    """Android 系统属性里的 nameserver（老 ROM / 部分 OEM 上有效）。
+
+    新 Android 的 ``net.dns*`` 通常为空（解析走 netd，可能还是
+    DNS-over-TLS），所以这只是第二梯队的探针：读出来就用，读不出来
+    不吭声。``getprop`` 从绝对路径里挑（PATH 不一定带 /system/bin），
+    每次调用限时 2 秒——一个版本探测不该让安装卡住。
+    """
+    import shutil
+
+    binary = next(
+        (path for path in _GETPROPS if os.access(path, os.X_OK)),
+        shutil.which("getprop"),
+    )
+    if not binary:
+        return []
+    servers = []
+    for prop in _ANDROID_DNS_PROPS:
+        try:
+            result = subprocess.run(
+                [binary, prop], capture_output=True, text=True,
+                timeout=2, check=False,
+            )
+            value = (result.stdout or "").strip()
+        except (OSError, ValueError, subprocess.SubprocessError):
+            continue
+        if not value or value == "0.0.0.0":
+            continue
+        try:
+            token = str(ipaddress.ip_address(value))
+        except ValueError:
+            continue
+        if token not in servers:
+            servers.append(token)
+    return servers[:_MAX_NS]
+
+
+def _default_route_gateway() -> list:
+    """IPv4 默认路由的网关（一个 nameserver 候选，Wi-Fi 场景几乎总对）。
+
+    ``/proc/net/route`` 的 Gateway 字段是网络字节序的小端十六进制
+    （``C0A80101`` = 192.168.1.1）；Destination 全零的那行是默认路由。
+    路由器几乎总在 53 端口跑一个转发器，蜂窝网络的网关也常是运营商
+    DNS。只取一条（多网卡时取第一条默认路由即可）；0.0.0.0 与解析
+    不出的值全部丢弃。IPv6-only 的网络探不到——那种环境本来也该由
+    用户 ``pd setting put dns`` 显式固定。
+    """
+    try:
+        with open("/proc/net/route", "r", encoding="utf-8",
+                  errors="replace") as fh:
+            lines = fh.read(_READ_LIMIT).splitlines()
+    except OSError:
+        return []
+    for line in lines[1:]:
+        fields = line.split()
+        if len(fields) < 3 or fields[1].lower() != "00000000":
+            continue
+        try:
+            raw = bytes.fromhex(fields[2].zfill(8))
+        except ValueError:
+            continue
+        token = ".".join(str(b) for b in raw[::-1])
+        if token == "0.0.0.0":
+            continue
+        try:
+            ipaddress.ip_address(token)
+        except ValueError:
+            continue
+        return [token]
+    return []
+
+
 def effective_nameservers() -> list:
     """最终写给客人的 nameserver 列表（``dns`` 设置 > 宿主 > 静态默认）。"""
     from proot_distro.settings import get_setting
@@ -172,13 +280,13 @@ def resolv_conf_text(servers=None) -> str:
 
 
 def is_managed_resolv_conf(text) -> bool:
-    """这份内容是否是本程序管理的 resolv.conf（标记行或旧静态模板）。"""
+    """这份内容是否是本程序管理的 resolv.conf（标记行或旧静态模板）."""
     if not isinstance(text, str):
         return False
     if text.startswith(_MANAGED_PREFIX):
         return True
-    # 兼容旧版安装写入的无标记静态模板。
-    return text == _LEGACY_TEMPLATE
+    # 兼容旧版安装写入的无标记静态模板（两代静态默认都认）。
+    return text in (_LEGACY_TEMPLATE, _LEGACY_UPSTREAM_TEMPLATE)
 
 
 def refresh_guest_dns(rootfs_fd: int) -> None:

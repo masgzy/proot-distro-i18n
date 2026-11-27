@@ -45,6 +45,7 @@ import sys
 from proot_distro.arch import find_proot_bin
 from proot_distro.constants import PROGRAM_VERSION
 from proot_distro.i18n import _, get_language
+from proot_distro.message import C_OUT
 
 __all__ = ("command_version", "build_hash")
 
@@ -156,10 +157,11 @@ def command_version(args=None) -> None:
     output of `list` / `ps` -- msg() would land on stderr and break
     `pd version | grep build` pipelines.
     """
-    _emit(_("{name} {version} (build {hash})",
-            name=FORK_NAME, version=PROGRAM_VERSION, hash=build_hash()))
+    _emit(f"{C_OUT['UBMAGENTA']}"
+          f"{_('{name} {version} (build {hash})', name=FORK_NAME, version=PROGRAM_VERSION, hash=build_hash())}"
+          f"{C_OUT['RST']}")
     _emit()
-    _emit(_("Python version: {value}", value=platform.python_version()))
-    _emit(_runtime_display())
-    _emit(_("UI language: {value}", value=get_language()))
-    _emit(_("Source code: {value}", value=FORK_URL))
+    _emit(f"{C_OUT['BCYAN']}{_('Python version: {value}', value=platform.python_version())}{C_OUT['RST']}")
+    _emit(f"{C_OUT['BCYAN']}{_runtime_display()}{C_OUT['RST']}")
+    _emit(f"{C_OUT['BCYAN']}{_('UI language: {value}', value=get_language())}{C_OUT['RST']}")
+    _emit(f"{C_OUT['BBLUE']}{_('Source code: {value}', value=FORK_URL)}{C_OUT['RST']}")
